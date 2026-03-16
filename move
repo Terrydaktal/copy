@@ -19,6 +19,12 @@ class Colors:
     ENDC = "\033[0m"
 
 
+class CoreutilsArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def log(msg, level="INFO"):
     if level == "ERROR":
         print(f"{Colors.FAIL}ERROR: {msg}{Colors.ENDC}", file=sys.stderr)
@@ -463,7 +469,7 @@ def _copy_path_to_backup(path, backup_path, use_sudo):
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    parser = CoreutilsArgumentParser(
         prog="move",
         description="Standalone rsync move with preview/progress (path-only).",
     )
@@ -495,7 +501,7 @@ def main():
 
     if args.extra:
         log("Unexpected extra path arguments. If using '*', quote it (e.g. 'src/*').", "ERROR")
-        return 2
+        return 1
 
     source_input = args.source
     source = source_input
@@ -1086,12 +1092,12 @@ def main():
                     if rc_move == 0:
                         log("Move complete.")
                         return 0
-                    log("Move completed with warnings: some source files vanished during transfer (rsync exit 24).", "WARN")
-                    log("This is expected on active trees (e.g., browser cache, temp files). Re-run move to converge.", "WARN")
-                    return 0
+                    log("Move failed: some source files vanished during transfer (rsync exit 24).", "ERROR")
+                    log("Re-run move to converge once the source tree is stable.", "ERROR")
+                    return 1
                 log(f"Move failed: rsync exited with status {rc_move}.", "ERROR")
                 _remove_path_recursive(stage_path, use_sudo=use_sudo)
-                return rc_move
+                return 1
             if backup_requested:
                 if overwrite_target_kind == "file":
                     log(f"Backing up existing file: {overwrite_target_path}")
@@ -1117,11 +1123,11 @@ def main():
             log("Move complete.")
             return 0
         if rc_move == 24:
-            log("Move completed with warnings: some source files vanished during transfer (rsync exit 24).", "WARN")
-            log("This is expected on active trees (e.g., browser cache, temp files). Re-run move to converge.", "WARN")
-            return 0
+            log("Move failed: some source files vanished during transfer (rsync exit 24).", "ERROR")
+            log("Re-run move to converge once the source tree is stable.", "ERROR")
+            return 1
         log(f"Move failed: rsync exited with status {rc_move}.", "ERROR")
-        return rc_move
+        return 1
     except Exception as e:
         log(f"Move failed: {e}", "ERROR")
         return 1
