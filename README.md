@@ -42,6 +42,13 @@ Inputs:
   - `-f`, `-r`, `--force-rename`: force rename-style merge when rename target exists
   - `-b`, `--backup`: create a timestamped backup of destination content before merge/overwrite
 
+Behavior detail:
+- `copy` uses `rsync --size-only`.
+- If destination has the same relative file name and same file size, `copy` updates metadata from source without rewriting file content.
+- If file size differs, file content is overwritten from source.
+- `copy` always performs an rsync dry-run preview first.
+- For simple non-merge, non-overwrite, non-backup, non-`source/*` operations, execution uses native `cp -a` for speed.
+
 Outputs:
 - Terminal:
   - mode summary line (Overwrite/Copy/Merge/Backup/File/Dir)
@@ -60,6 +67,14 @@ Purpose:
 - Moves a source file or directory to destination using `rsync -aH --remove-source-files`.
 - Uses the same preview/confirmation flow as `copy`.
 - Cleans up empty source directories after successful transfer.
+
+Behavior detail:
+- `move` uses `rsync --size-only`.
+- If destination has the same relative file name and same file size, `move` updates destination metadata from source without rewriting file content.
+- If file size differs, destination file content is overwritten from source.
+- Source trailing slash behaves like normal `mv` (same as no trailing slash). Use `source/*` to move directory contents only.
+- `move` always performs an rsync dry-run preview first.
+- For simple non-merge, non-overwrite, non-backup, non-`source/*` operations, execution uses native `mv` for speed.
 
 Inputs:
 - Positional:
@@ -127,6 +142,9 @@ Recommended safe workflow for important data:
 
 # Use sudo for protected locations
 ./copy --sudo /root/input /mnt/shared/output/
+
+# Same-name + same-size files get metadata synced without rewriting file data
+./copy /data/source_dir/ /data/target_dir/
 ```
 
 ## Notes

@@ -282,7 +282,10 @@ def _run_move(src_path, dst_path, planned_bytes, use_sudo):
     cmd = [
         "rsync",
         "-aH",
+        "--size-only",
         "--remove-source-files",
+    ]
+    cmd += [
         "--info=progress2,stats2,name0",
         src_path,
         dst_path,
@@ -527,7 +530,9 @@ def main():
     if not dst_mnt:
         return 1
 
-    src_user_had_trailing = source.endswith("/") or source_glob_contents
+    # Match normal mv semantics: trailing slash alone should not switch to
+    # "contents mode"; only an explicit "/*" should do that.
+    source_contents_mode = bool(source_glob_contents)
     dest_tail_raw = os.path.basename((destination or "").rstrip("/"))
     destination_is_dir_ref = destination.endswith("/") or dest_tail_raw in ("", ".", "..")
 
@@ -545,17 +550,17 @@ def main():
                 merge_child_into_parent = True
             else:
                 source_already_in_destination = True
-                if overwrite and not src_user_had_trailing and not destination_is_dir_ref:
+                if overwrite and not source_contents_mode and not destination_is_dir_ref:
                     overwrite_parent_from_child = True
                     source_already_in_destination = False
-                elif force and not src_user_had_trailing and not destination_is_dir_ref and not overwrite:
+                elif force and not source_contents_mode and not destination_is_dir_ref and not overwrite:
                     force_parent_from_child = True
                     source_already_in_destination = False
 
     rename_style_existing_dir_target = bool(
         src_obj_kind == "dir"
         and dst_obj_kind == "dir_existing"
-        and not src_user_had_trailing
+        and not source_contents_mode
         and not destination_is_dir_ref
         and os.path.basename(src_mnt.rstrip("/")) != os.path.basename(dst_mnt.rstrip("/"))
     )
@@ -576,7 +581,7 @@ def main():
         overwrite
         and src_obj_kind == "dir"
         and dst_obj_kind == "file_existing_for_dir"
-        and not src_user_had_trailing
+        and not source_contents_mode
     ):
         overwrite_replace_file_target = True
 
@@ -647,7 +652,7 @@ def main():
         overwrite
         and src_obj_kind == "dir"
         and dst_obj_kind in ("dir", "dir_existing")
-        and not src_user_had_trailing
+        and not source_contents_mode
         and not merge_child_into_parent
         and not source_already_in_destination
     ):
@@ -665,19 +670,19 @@ def main():
     else:
         # For a directory rename (src dir -> non-existent dst path), rsync needs
         # source contents mode to materialize exactly at the new destination path.
-        if (overwrite_rename_dir_target or overwrite_replace_file_target) and not src_user_had_trailing:
+        if (overwrite_rename_dir_target or overwrite_replace_file_target) and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
             rename_dir_to_new_path = True
-        elif force_merge_dir_target and not src_user_had_trailing:
+        elif force_merge_dir_target and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
-        elif dst_obj_kind == "dir_new" and not src_user_had_trailing:
+        elif dst_obj_kind == "dir_new" and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
             rename_dir_to_new_path = True
         # If destination would place the source directory back onto itself
         # (e.g. src=poo/poo, dst=poo), merge source contents into destination.
-        elif merge_child_into_parent and not src_user_had_trailing:
+        elif merge_child_into_parent and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
-        elif src_user_had_trailing:
+        elif source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
         else:
             src_path = src_mnt.rstrip("/")
@@ -770,6 +775,7 @@ def main():
         add_files = 0
         mod_files = 0
         change_preview = []
+        has_itemized_changes = False
     else:
         pre_dst_path = dst_path
         preflight_tmpdir = None
@@ -786,6 +792,9 @@ def main():
             pre_cmd = [
                 "rsync",
                 "-anH",
+                "--size-only",
+            ]
+            pre_cmd += [
                 "--itemize-changes",
                 "--out-format=%i\t%l\t%n",
                 "--stats",
@@ -820,6 +829,7 @@ def main():
         add_files = 0
         mod_files = 0
         change_preview = []
+        has_itemized_changes = False
         for raw in pre_out.splitlines():
             if "\t" not in raw:
                 continue
@@ -830,10 +840,11 @@ def main():
             name = (parts[2] or "").strip()
             if not item or not name:
                 continue
+            has_itemized_changes = True
             if item.startswith(">f+"):
                 add_files += 1
                 change_preview.append(("new_file", name))
-            elif item.startswith(">f"):
+            elif item.startswith(">f") or item.startswith(".f") or item.startswith(".L"):
                 mod_files += 1
                 change_preview.append(("mod_file", name))
             elif item.startswith("cd+"):
@@ -841,6 +852,8 @@ def main():
             elif item.startswith("cL+"):
                 add_files += 1
                 change_preview.append(("new_file", name))
+            elif item.startswith(".d"):
+                change_preview.append(("mod_dir", name.rstrip("/") + "/"))
 
     if dst_obj_kind in ("dir", "dir_existing", "dir_new"):
         dst_preview_root = (dst_path.rstrip("/") or dst_path) + "/"
@@ -1035,7 +1048,7 @@ def main():
     print(f"Planned transfer bytes: {planned_bytes:,} ({_format_bytes_binary(str(planned_bytes), decimals=2)})")
     print("")
 
-    no_changes_planned = bool(source_already_in_destination or (planned_bytes == 0 and not change_preview))
+    no_changes_planned = bool(source_already_in_destination or (planned_bytes == 0 and not has_itemized_changes))
     if no_changes_planned:
         log("No changes detected; nothing to move.")
         return 0
@@ -1049,9 +1062,22 @@ def main():
         log("No changes: source is already in destination directory.")
         return 0
 
+    use_native_move = bool(
+        not source_contents_mode
+        and not backup_requested
+        and not overwrite
+        and not force
+        and not mode_merge
+        and not mode_overwrite
+        and not overwrite_target_path
+    )
+
     if use_sudo:
         run_command(["sudo", "-v"])
-    log(f"Starting rsync move: {source_input} -> {destination}...")
+    if use_native_move:
+        log(f"Starting move (native mv backend): {source_input} -> {destination}...")
+    else:
+        log(f"Starting rsync move: {source_input} -> {destination}...")
     start_ts = time.time()
     try:
         if backup_requested and backup_source_path and not overwrite_target_path:
@@ -1115,9 +1141,20 @@ def main():
                     log(f"Overwriting existing directory: {overwrite_target_path}")
                 if not _remove_path_recursive(overwrite_target_path, use_sudo=use_sudo):
                     return 1
+        if use_native_move:
+            mv_res = run_command(["mv", "--", src_mnt, dst_mnt], check=False, sudo=use_sudo)
+            mv_rc = getattr(mv_res, "returncode", 0)
+            if mv_rc == 0:
+                log("Move complete.")
+                return 0
+            log(f"Move failed: mv exited with status {mv_rc}.", "ERROR")
+            mv_err = (getattr(mv_res, "stderr", "") or "").strip()
+            if mv_err:
+                log(mv_err, "ERROR")
+            return 1
         rc_move = _run_move(src_path, dst_path, planned_bytes, use_sudo)
         if rc_move in (0, 24) and src_obj_kind == "dir":
-            remove_root = (not src_user_had_trailing) or rename_dir_to_new_path
+            remove_root = (not source_contents_mode) or rename_dir_to_new_path
             _cleanup_source_dirs(src_mnt, remove_root=remove_root, use_sudo=use_sudo)
         if rc_move == 0:
             log("Move complete.")
