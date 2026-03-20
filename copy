@@ -15,6 +15,7 @@ class Colors:
     OKGREEN = "\033[92m"
     WARNING = "\033[93m"
     FAIL = "\033[91m"
+    WHITE = "\033[97m"
     DIM = "\033[90m"
     ENDC = "\033[0m"
 
@@ -25,13 +26,29 @@ class CoreutilsArgumentParser(argparse.ArgumentParser):
         self.exit(1, f"{self.prog}: error: {message}\n")
 
 
+TRANSFER_MODE = "copy"
+
+
+def _set_transfer_mode(mode):
+    global TRANSFER_MODE
+    TRANSFER_MODE = "move" if str(mode).lower() == "move" else "copy"
+
+
+def _mode_word():
+    return "move" if TRANSFER_MODE == "move" else "copy"
+
+
+def _mode_word_cap():
+    return _mode_word().capitalize()
+
+
 def log(msg, level="INFO"):
     if level == "ERROR":
         print(f"{Colors.FAIL}ERROR: {msg}{Colors.ENDC}", file=sys.stderr)
     elif level == "WARN":
         print(f"{Colors.WARNING}WARNING: {msg}{Colors.ENDC}", file=sys.stderr)
     else:
-        print(f"{Colors.OKBLUE}copy: {msg}{Colors.ENDC}")
+        print(f"{Colors.OKBLUE}{_mode_word()}: {msg}{Colors.ENDC}")
 
 
 def _fmt_hms(total_seconds):
@@ -135,105 +152,6 @@ def _resolve_destination_for_dir(value, allow_existing_file=False):
     return p, "dir_new"
 
 
-def _remove_path_recursive(path, use_sudo):
-    if not path:
-        return True
-    res = run_command(["rm", "-rf", "--", path], check=False, sudo=use_sudo)
-    rc = getattr(res, "returncode", 0)
-    if rc != 0:
-        log(f"Failed to remove existing path: {path}", "ERROR")
-        return False
-    return True
-
-
-def _backup_path_with_timestamp(path, use_sudo):
-    if not path:
-        return None
-    base = _backup_base_path(path)
-    if not base:
-        return None
-    return _backup_path_with_base(path, use_sudo, base)
-
-
-def _backup_base_path(path):
-    if not path:
-        return None
-    src = path.rstrip("/") or path
-    if src == "/":
-        return None
-    parent = os.path.dirname(src) or "."
-    name = os.path.basename(src)
-    if not name:
-        return None
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    return os.path.join(parent, f"{name}.{stamp}")
-
-
-def _next_backup_candidate_from_base(base):
-    if not base:
-        return None
-    for idx in range(1000):
-        candidate = base if idx == 0 else f"{base}.{idx}"
-        if os.path.exists(candidate):
-            continue
-        return candidate
-    return None
-
-
-def _plan_backup_path(path):
-    base = _backup_base_path(path)
-    return _next_backup_candidate_from_base(base)
-
-
-def _backup_path_with_base(path, use_sudo, base):
-    if not path:
-        return None
-    src = path.rstrip("/") or path
-    if src == "/":
-        log("Refusing to backup root path.", "ERROR")
-        return None
-    if not base:
-        log(f"Failed to derive backup name for path: {src}", "ERROR")
-        return None
-    for idx in range(1000):
-        candidate = base if idx == 0 else f"{base}.{idx}"
-        if os.path.exists(candidate):
-            continue
-        res = run_command(["mv", "--", src, candidate], check=False, sudo=use_sudo)
-        rc = getattr(res, "returncode", 0)
-        if rc == 0:
-            return candidate
-        err = (getattr(res, "stderr", "") or "").strip()
-        if "exists" in err.lower():
-            continue
-        log(f"Failed to backup existing path: {src}", "ERROR")
-        if err:
-            log(err, "ERROR")
-        return None
-    log(f"Failed to create unique backup name for: {src}", "ERROR")
-    return None
-
-
-def _copy_path_to_backup(path, backup_path, use_sudo):
-    if not path or not backup_path:
-        return None
-    res = run_command(["cp", "-a", "--", path, backup_path], check=False, sudo=use_sudo)
-    rc = getattr(res, "returncode", 0)
-    if rc != 0:
-        err = (getattr(res, "stderr", "") or "").strip()
-        log(f"Failed to create backup copy: {path}", "ERROR")
-        if err:
-            log(err, "ERROR")
-        return None
-    return backup_path
-
-
-def _fmt_mode_word(label, active):
-    if active:
-        return f"{Colors.OKGREEN}{label}{Colors.ENDC}"
-    return f"{Colors.DIM}{label}{Colors.ENDC}"
-
-
 def _parse_stat_int(label, text):
     m = re.search(rf"^\s*{re.escape(label)}:\s*([0-9,]+)\b", text, re.MULTILINE)
     if not m:
@@ -327,8 +245,6 @@ def _print_preview_tree(preview_items, base_prefix=""):
                     print(f"{prefix}{branch}{Colors.WARNING}{name}{suffix}{Colors.ENDC}")
                 else:
                     print(f"{prefix}{branch}{name}{suffix}")
-                child_prefix = prefix + ("    " if last else "│   ")
-                walk(child_node, child_prefix)
             else:
                 if name in node.get("explicit_new_files", set()):
                     print(f"{prefix}{branch}{Colors.OKGREEN}{name}{Colors.ENDC}")
@@ -338,6 +254,136 @@ def _print_preview_tree(preview_items, base_prefix=""):
                     print(f"{prefix}{branch}{name}")
 
     walk(tree, base_prefix)
+
+
+def _collect_top_level_preview(preview_root, preview_items, extra_added=None, extra_modified=None):
+    extra_added = set(extra_added or [])
+    extra_modified = set(extra_modified or [])
+    root = preview_root.rstrip("/") or "/"
+
+    existing_entries = set()
+    if os.path.isdir(root):
+        try:
+            existing_entries = set(os.listdir(root))
+        except OSError:
+            existing_entries = set()
+
+    top_states = {}
+    top_is_dir = {}
+    for change_kind, raw in preview_items:
+        item = (raw or "").strip().lstrip("./")
+        if not item:
+            continue
+        is_dir = item.endswith("/")
+        item = item.rstrip("/")
+        if not item:
+            continue
+        top = item.split("/", 1)[0]
+        if not top:
+            continue
+        if is_dir or "/" in item:
+            top_is_dir[top] = True
+        elif top not in top_is_dir:
+            top_is_dir[top] = False
+        state = "added" if change_kind in ("new_file", "new_dir") else "modified"
+        prev = top_states.get(top)
+        if prev == "added":
+            continue
+        if state == "added" or prev is None:
+            top_states[top] = state
+        else:
+            top_states[top] = "modified"
+
+    for name in extra_added:
+        top_states[name] = "added"
+    for name in extra_modified:
+        if top_states.get(name) != "added":
+            top_states[name] = "modified"
+
+    entries = sorted(existing_entries | set(top_states.keys()))
+    unchanged_files = 0
+    unchanged_dirs = 0
+    for name in sorted(existing_entries):
+        if name in top_states:
+            continue
+        full = os.path.join(root, name)
+        if os.path.isdir(full):
+            unchanged_dirs += 1
+        else:
+            unchanged_files += 1
+    return root, entries, top_states, top_is_dir, unchanged_files, unchanged_dirs
+
+
+def _print_showall_preview(preview_root, preview_items, extra_added=None, extra_modified=None):
+    root, entries, top_states, top_is_dir, _, _ = _collect_top_level_preview(
+        preview_root,
+        preview_items,
+        extra_added=extra_added,
+        extra_modified=extra_modified,
+    )
+    for idx, name in enumerate(entries):
+        last = idx == len(entries) - 1
+        branch = "└── " if last else "├── "
+        full = os.path.join(root, name)
+        is_dir = top_is_dir.get(name, os.path.isdir(full))
+        suffix = "/" if is_dir else ""
+        state = top_states.get(name)
+        if state == "added":
+            color = Colors.OKGREEN
+        elif state == "modified":
+            color = Colors.WARNING
+        else:
+            color = Colors.WHITE
+        print(f"{branch}{color}{name}{suffix}{Colors.ENDC}")
+
+
+def _print_changed_top_preview(preview_root, preview_items, extra_added=None, extra_modified=None):
+    root, _, top_states, top_is_dir, unchanged_files, unchanged_dirs = _collect_top_level_preview(
+        preview_root,
+        preview_items,
+        extra_added=extra_added,
+        extra_modified=extra_modified,
+    )
+    changed_names = sorted(top_states.keys())
+    added_files = 0
+    added_dirs = 0
+    changed_files = 0
+    changed_dirs = 0
+    for name in changed_names:
+        full = os.path.join(root, name)
+        is_dir = top_is_dir.get(name, os.path.isdir(full))
+        state = top_states.get(name)
+        if state == "added":
+            if is_dir:
+                added_dirs += 1
+            else:
+                added_files += 1
+        else:
+            if is_dir:
+                changed_dirs += 1
+            else:
+                changed_files += 1
+    if not changed_names:
+        print("(no new additions)")
+    else:
+        for idx, name in enumerate(changed_names):
+            last = idx == len(changed_names) - 1
+            branch = "└── " if last else "├── "
+            full = os.path.join(root, name)
+            is_dir = top_is_dir.get(name, os.path.isdir(full))
+            suffix = "/" if is_dir else ""
+            state = top_states.get(name)
+            color = Colors.OKGREEN if state == "added" else Colors.WARNING
+            print(f"{branch}{color}{name}{suffix}{Colors.ENDC}")
+    unchanged_total = unchanged_files + unchanged_dirs
+    if unchanged_total > 0:
+        print(f"... and {unchanged_total:,} more unchanged")
+        print("")
+    print(
+        f"Top level: Added: dirs={added_dirs} files={added_files} | "
+        f"Changed: dirs={changed_dirs} files={changed_files} | "
+        f"Unchanged: dirs={unchanged_dirs} files={unchanged_files}"
+    )
 
 
 def _parse_progress2_bytes(line):
@@ -377,9 +423,19 @@ def _fmt_speed_bps(bps):
     return _format_bytes_binary(str(b), decimals=2)
 
 
-def _run_copy(src_path, dst_path, planned_bytes, use_sudo):
-    cmd = ["rsync", "-aH", "--size-only"]
-    cmd += ["--info=progress2,stats2,name0", src_path, dst_path]
+def _run_rsync_transfer(src_path, dst_path, planned_bytes, use_sudo, remove_source=False):
+    cmd = [
+        "rsync",
+        "-aH",
+        "--size-only",
+    ]
+    if remove_source:
+        cmd.append("--remove-source-files")
+    cmd += [
+        "--info=progress2,stats2,name0",
+        src_path,
+        dst_path,
+    ]
     if use_sudo:
         cmd = ["sudo"] + cmd
     proc = subprocess.Popen(
@@ -430,13 +486,13 @@ def _run_copy(src_path, dst_path, planned_bytes, use_sudo):
             elif line.strip():
                 print(line)
 
-    rc_copy = proc.wait()
+    rc_transfer = proc.wait()
     progress_stop.set()
     progress_thread.join(timeout=1.0)
 
     with progress_lock:
         final_done = int(done_bytes)
-    if planned_bytes > 0 and rc_copy in (0, 24):
+    if planned_bytes > 0 and rc_transfer in (0, 24):
         final_done = max(final_done, planned_bytes)
     if planned_bytes > 0:
         pct = min(100.0, (final_done * 100.0) / planned_bytes)
@@ -446,17 +502,134 @@ def _run_copy(src_path, dst_path, planned_bytes, use_sudo):
     else:
         cur_disp = _format_bytes_binary(str(final_done), decimals=2)
         print(f"Progress: ---% ({cur_disp}) | Speed: 0 B/s", flush=True)
-    return rc_copy
+    return rc_transfer
+
+
+def _cleanup_source_dirs(src_root, remove_root, use_sudo):
+    if not src_root or not os.path.isdir(src_root):
+        return
+    cmd = ["find", src_root]
+    if not remove_root:
+        cmd += ["-mindepth", "1"]
+    cmd += ["-depth", "-type", "d", "-empty", "-delete"]
+    res = run_command(cmd, check=False, sudo=use_sudo)
+    rc = getattr(res, "returncode", 0)
+    if rc != 0:
+        log(f"Source cleanup failed: find exited with status {rc}.", "WARN")
+
+
+def _fmt_mode_word(label, active):
+    if active:
+        return f"{Colors.OKGREEN}{label}{Colors.ENDC}"
+    return f"{Colors.DIM}{label}{Colors.ENDC}"
+
+
+def _remove_path_recursive(path, use_sudo):
+    if not path:
+        return True
+    res = run_command(["rm", "-rf", "--", path], check=False, sudo=use_sudo)
+    rc = getattr(res, "returncode", 0)
+    if rc != 0:
+        log(f"Failed to remove existing path: {path}", "ERROR")
+        return False
+    return True
+
+
+def _backup_path_with_timestamp(path, use_sudo):
+    if not path:
+        return None
+    base = _backup_base_path(path)
+    if not base:
+        return None
+    return _backup_path_with_base(path, use_sudo, base)
+
+
+def _backup_base_path(path):
+    if not path:
+        return None
+    src = path.rstrip("/") or path
+    if src == "/":
+        return None
+    parent = os.path.dirname(src) or "."
+    name = os.path.basename(src)
+    if not name:
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return os.path.join(parent, f"{name}.{stamp}")
+
+
+def _next_backup_candidate_from_base(base):
+    if not base:
+        return None
+    for idx in range(1000):
+        candidate = base if idx == 0 else f"{base}.{idx}"
+        if os.path.exists(candidate):
+            continue
+        return candidate
+    return None
+
+
+def _plan_backup_path(path):
+    base = _backup_base_path(path)
+    return _next_backup_candidate_from_base(base)
+
+
+def _backup_path_with_base(path, use_sudo, base):
+    if not path:
+        return None
+    src = path.rstrip("/") or path
+    if src == "/":
+        log("Refusing to backup root path.", "ERROR")
+        return None
+    if not base:
+        log(f"Failed to derive backup name for path: {src}", "ERROR")
+        return None
+    for idx in range(1000):
+        candidate = base if idx == 0 else f"{base}.{idx}"
+        if os.path.exists(candidate):
+            continue
+        res = run_command(["mv", "--", src, candidate], check=False, sudo=use_sudo)
+        rc = getattr(res, "returncode", 0)
+        if rc == 0:
+            return candidate
+        err = (getattr(res, "stderr", "") or "").strip()
+        if "exists" in err.lower():
+            continue
+        log(f"Failed to backup existing path: {src}", "ERROR")
+        if err:
+            log(err, "ERROR")
+        return None
+    log(f"Failed to create unique backup name for: {src}", "ERROR")
+    return None
+
+
+def _copy_path_to_backup(path, backup_path, use_sudo):
+    if not path or not backup_path:
+        return None
+    res = run_command(["cp", "-a", "--", path, backup_path], check=False, sudo=use_sudo)
+    rc = getattr(res, "returncode", 0)
+    if rc != 0:
+        err = (getattr(res, "stderr", "") or "").strip()
+        log(f"Failed to create backup copy: {path}", "ERROR")
+        if err:
+            log(err, "ERROR")
+        return None
+    return backup_path
 
 
 def main():
     parser = CoreutilsArgumentParser(
-        prog="diskcopy",
-        description="Standalone rsync copy with preview/progress (path-only).",
+        prog="copy",
+        description="Standalone rsync copy/move with preview/progress (path-only).",
     )
     parser.add_argument("source", help="Source path (file or directory)")
     parser.add_argument("destination", help="Destination path (directory, or file path when source is a file)")
     parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--move",
+        action="store_true",
+        help="Move mode: transfer then remove source data (equivalent to move behavior).",
+    )
     parser.add_argument("--sudo", action="store_true", help="Run rsync with sudo")
     parser.add_argument(
         "-o",
@@ -465,11 +638,11 @@ def main():
         help="Force overwrite (replace) instead of merge when destination target already exists.",
     )
     parser.add_argument(
-        "-f",
-        "-r",
-        "--force-rename",
+        "-n",
+        "--no-nesting",
+        dest="force_rename",
         action="store_true",
-        help="Force rename and merge when destination rename target already exists (rather than nesting).",
+        help="When a rename target already exists, merge into it instead of creating a nested directory.",
     )
     parser.add_argument(
         "-b",
@@ -478,7 +651,18 @@ def main():
         action="store_true",
         help="Create a timestamped backup when destination data will be merged or overwritten.",
     )
+    parser.add_argument(
+        "--showall",
+        action="store_true",
+        help="Show all depth-1 destination entries in preview (green=added, yellow=modified, white=unchanged).",
+    )
     args = parser.parse_args()
+
+    requested_mode = "move" if bool(args.move) else "copy"
+    _set_transfer_mode(requested_mode)
+    is_move = requested_mode == "move"
+    action_word = _mode_word()
+    action_word_cap = _mode_word_cap()
 
     if args.extra:
         log("Unexpected extra path arguments. If using '*', quote it (e.g. 'src/*').", "ERROR")
@@ -488,6 +672,7 @@ def main():
     source = source_input
     destination = args.destination
     use_sudo = bool(args.sudo)
+    show_all = bool(args.showall)
     backup_requested = bool(args.backup)
     overwrite = bool(args.overwrite)
     force = bool(args.force_rename)
@@ -508,7 +693,9 @@ def main():
     if not dst_mnt:
         return 1
 
-    src_user_had_trailing = source.endswith("/") or source_glob_contents
+    # Match normal coreutils semantics: trailing slash alone should not switch to
+    # "contents mode"; only an explicit "/*" should do that.
+    source_contents_mode = bool(source_glob_contents)
     dest_tail_raw = os.path.basename((destination or "").rstrip("/"))
     destination_is_dir_ref = destination.endswith("/") or dest_tail_raw in ("", ".", "..")
 
@@ -526,17 +713,17 @@ def main():
                 merge_child_into_parent = True
             else:
                 source_already_in_destination = True
-                if overwrite and not src_user_had_trailing and not destination_is_dir_ref:
+                if overwrite and not source_contents_mode and not destination_is_dir_ref:
                     overwrite_parent_from_child = True
                     source_already_in_destination = False
-                elif force and not src_user_had_trailing and not destination_is_dir_ref and not overwrite:
+                elif force and not source_contents_mode and not destination_is_dir_ref and not overwrite:
                     force_parent_from_child = True
                     source_already_in_destination = False
 
     rename_style_existing_dir_target = bool(
         src_obj_kind == "dir"
         and dst_obj_kind == "dir_existing"
-        and not src_user_had_trailing
+        and not source_contents_mode
         and not destination_is_dir_ref
         and os.path.basename(src_mnt.rstrip("/")) != os.path.basename(dst_mnt.rstrip("/"))
     )
@@ -549,6 +736,7 @@ def main():
         overwrite_rename_dir_target = True
     elif (
         overwrite
+        and force
         and rename_style_existing_dir_target
     ):
         overwrite_rename_dir_target = True
@@ -557,7 +745,7 @@ def main():
         overwrite
         and src_obj_kind == "dir"
         and dst_obj_kind == "file_existing_for_dir"
-        and not src_user_had_trailing
+        and not source_contents_mode
     ):
         overwrite_replace_file_target = True
 
@@ -628,7 +816,7 @@ def main():
         overwrite
         and src_obj_kind == "dir"
         and dst_obj_kind in ("dir", "dir_existing")
-        and not src_user_had_trailing
+        and not source_contents_mode
         and not merge_child_into_parent
         and not source_already_in_destination
     ):
@@ -646,19 +834,19 @@ def main():
     else:
         # For a directory rename (src dir -> non-existent dst path), rsync needs
         # source contents mode to materialize exactly at the new destination path.
-        if (overwrite_rename_dir_target or overwrite_replace_file_target) and not src_user_had_trailing:
+        if (overwrite_rename_dir_target or overwrite_replace_file_target) and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
             rename_dir_to_new_path = True
-        elif force_merge_dir_target and not src_user_had_trailing:
+        elif force_merge_dir_target and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
-        elif dst_obj_kind == "dir_new" and not src_user_had_trailing:
+        elif dst_obj_kind == "dir_new" and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
             rename_dir_to_new_path = True
         # If destination would place the source directory back onto itself
         # (e.g. src=poo/poo, dst=poo), merge source contents into destination.
-        elif merge_child_into_parent and not src_user_had_trailing:
+        elif merge_child_into_parent and not source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
-        elif src_user_had_trailing:
+        elif source_contents_mode:
             src_path = src_mnt.rstrip("/") + "/"
         else:
             src_path = src_mnt.rstrip("/")
@@ -680,6 +868,7 @@ def main():
 
     target_base = target_name_for_conflict or ""
     target_parent = target_dir_for_name or ""
+
     mode_move = False
     if src_parent and target_parent:
         mode_move = os.path.realpath(src_parent) != os.path.realpath(target_parent)
@@ -687,6 +876,9 @@ def main():
         mode_move = False
     if overwrite_parent_from_child:
         mode_move = False
+
+    mode_rename = bool(src_base and target_base and src_base != target_base)
+
     mode_overwrite = False
     mode_merge = False
     if src_obj_kind == "dir":
@@ -702,6 +894,7 @@ def main():
         mode_overwrite = False
         mode_move = False
         mode_merge = False
+        mode_rename = False
 
     backup_source_path = None
     backup_source_kind = None
@@ -727,8 +920,10 @@ def main():
         " ".join(
             [
                 _fmt_mode_word("Overwrite", mode_overwrite),
-                _fmt_mode_word("Copy", mode_move),
+                _fmt_mode_word("Move", is_move),
+                _fmt_mode_word("Copy", not is_move),
                 _fmt_mode_word("Merge", mode_merge),
+                _fmt_mode_word("Rename", mode_rename),
                 _fmt_mode_word("Backup", mode_backup),
                 _fmt_mode_word("File", mode_kind == "file"),
                 _fmt_mode_word("Dir", mode_kind == "dir"),
@@ -751,11 +946,11 @@ def main():
         preflight_tmpdir = None
         if overwrite_replace_file_target:
             pre_parent = os.path.dirname(dst_mnt.rstrip("/")) or "."
-            preflight_tmpdir = tempfile.mkdtemp(prefix=".copy-preflight-", dir=pre_parent)
+            preflight_tmpdir = tempfile.mkdtemp(prefix=f".{action_word}-preflight-", dir=pre_parent)
             pre_dst_path = os.path.join(preflight_tmpdir, "target")
         elif overwrite_parent_from_child:
             pre_parent = os.path.dirname(dst_mnt.rstrip("/")) or "."
-            preflight_tmpdir = tempfile.mkdtemp(prefix=".copy-preflight-", dir=pre_parent)
+            preflight_tmpdir = tempfile.mkdtemp(prefix=f".{action_word}-preflight-", dir=pre_parent)
             pre_dst_path = os.path.join(preflight_tmpdir, "target")
 
         try:
@@ -831,18 +1026,6 @@ def main():
         dst_preview_root = os.path.dirname(dst_path.rstrip("/")) + "/"
 
     display_change_preview = list(change_preview)
-    if force_merge_dir_target and not force_parent_from_child and target_name_for_conflict and display_change_preview:
-        wrapped_preview = []
-        target_prefix = target_name_for_conflict.rstrip("/")
-        for ck, raw_name in display_change_preview:
-            item_name = (raw_name or "").lstrip("./")
-            if item_name.startswith(f"{target_prefix}/") or item_name == target_prefix:
-                wrapped_preview.append((ck, item_name))
-            elif item_name:
-                wrapped_preview.append((ck, f"{target_prefix}/{item_name}"))
-            else:
-                wrapped_preview.append((ck, f"{target_prefix}/"))
-        display_change_preview = wrapped_preview
 
     simple_rename_src = None
     simple_rename_dst = None
@@ -873,9 +1056,11 @@ def main():
         elif src_base and dst_base and (src_parent != dst_parent or src_base != dst_base):
             rename_target_only = dst_base
 
+    preview_inside_target_dir = bool(rename_target_only and rename_target_is_dir and overwrite_target_path)
+
     if simple_rename_parent:
         preview_root = (simple_rename_parent.rstrip("/") or "/") + "/"
-    elif rename_target_only:
+    elif rename_target_only and not preview_inside_target_dir:
         if rename_target_is_dir:
             rename_parent = os.path.dirname(dst_mnt.rstrip("/"))
         else:
@@ -901,130 +1086,51 @@ def main():
                         remapped_preview.append((ck, f"{current_root_name}/"))
                 display_change_preview = remapped_preview
             preview_root = (backup_parent.rstrip("/") or "/") + "/"
-
     print(f"{Colors.WARNING}{preview_root}{Colors.ENDC}")
-    if source_already_in_destination:
-        entry_name = os.path.basename(src_mnt.rstrip("/")) + ("/" if src_obj_kind == "dir" else "")
-        print(f"└── {entry_name}")
-        print(f"{Colors.WARNING}(no changes: source already in destination directory){Colors.ENDC}")
-    elif overwrite_merge_child_parent and rename_target_only:
-        print(f"├── {Colors.FAIL}{rename_target_only} (old){Colors.ENDC}")
-        print(f"└── {Colors.OKGREEN}{rename_target_only}/{Colors.ENDC}")
-    elif overwrite_target_path:
-        base_name = os.path.basename(overwrite_target_path.rstrip("/"))
-        if overwrite_parent_from_child:
-            old_name = base_name
-            new_name = base_name + "/"
-        elif overwrite_target_kind == "file":
-            old_name = base_name
-            new_name = base_name + "/"
+    extra_added = set()
+    extra_modified = set()
+    if planned_backup_path and not overwrite_target_path:
+        extra_added.add(os.path.basename(planned_backup_path.rstrip("/")))
+    if overwrite_target_path and not preview_inside_target_dir:
+        extra_modified.add(os.path.basename(overwrite_target_path.rstrip("/")))
+    if rename_target_only and not preview_inside_target_dir:
+        if existing_same_name_target:
+            extra_modified.add(rename_target_only.rstrip("/"))
         else:
-            old_name = base_name + "/"
-            new_name = base_name + "/"
-        src_base_name = os.path.basename(src_mnt.rstrip("/")) if src_obj_kind == "dir" else os.path.basename(src_mnt)
-        src_name = (src_base_name + "/") if src_obj_kind == "dir" else src_base_name
-        src_parent = os.path.dirname(src_mnt.rstrip("/")) if src_obj_kind == "dir" else os.path.dirname(src_mnt)
-        preview_parent = preview_root.rstrip("/") or "/"
-        show_source = (
-            bool(src_name)
-            and bool(src_base_name)
-            and src_base_name != base_name
-            and os.path.realpath(src_parent) == os.path.realpath(preview_parent)
-        )
-        if show_source:
-            if backup_requested and planned_backup_path:
-                backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-                backup_suffix = "/" if backup_source_kind != "file" else ""
-                print(f"├── {src_name}")
-                print(f"├── {Colors.FAIL}{old_name} (old){Colors.ENDC}")
-                print(f"├── {Colors.OKGREEN}{new_name} (new){Colors.ENDC}")
-                print(f"└── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-            else:
-                print(f"├── {src_name}")
-                print(f"├── {Colors.FAIL}{old_name} (old){Colors.ENDC}")
-                print(f"└── {Colors.OKGREEN}{new_name} (new){Colors.ENDC}")
+            extra_added.add(rename_target_only.rstrip("/"))
+    if simple_rename_dst:
+        if existing_same_name_target:
+            extra_modified.add(simple_rename_dst.rstrip("/"))
         else:
-            if backup_requested and planned_backup_path:
-                backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-                backup_suffix = "/" if backup_source_kind != "file" else ""
-                print(f"├── {Colors.FAIL}{old_name} (old){Colors.ENDC}")
-                print(f"├── {Colors.OKGREEN}{new_name} (new){Colors.ENDC}")
-                print(f"└── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-            else:
-                print(f"├── {Colors.FAIL}{old_name} (old){Colors.ENDC}")
-                print(f"└── {Colors.OKGREEN}{new_name} (new){Colors.ENDC}")
-    elif simple_rename_src and simple_rename_dst:
-        rename_suffix = "/" if src_obj_kind == "dir" else ""
-        rename_target_color = Colors.WARNING if existing_same_name_target else Colors.OKGREEN
-        if planned_backup_path and not overwrite_target_path:
-            backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-            backup_suffix = "/" if backup_source_kind != "file" else ""
-            print(f"├── {Colors.FAIL}{simple_rename_src}{rename_suffix}{Colors.ENDC}")
-            print(f"├── {rename_target_color}{simple_rename_dst}{rename_suffix}{Colors.ENDC}")
-            print(f"└── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-        else:
-            print(f"├── {Colors.FAIL}{simple_rename_src}{rename_suffix}{Colors.ENDC}")
-            print(f"└── {rename_target_color}{simple_rename_dst}{rename_suffix}{Colors.ENDC}")
-    elif merge_child_into_parent and rename_target_only:
-        if planned_backup_path and not overwrite_target_path:
-            backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-            backup_suffix = "/" if backup_source_kind != "file" else ""
-            print(f"├── {Colors.WARNING}{rename_target_only}/{Colors.ENDC}")
-            print(f"└── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-        else:
-            print(f"└── {Colors.WARNING}{rename_target_only}/{Colors.ENDC}")
-        if change_preview:
-            max_preview = 10
-            preview_prefix = "│   " if planned_backup_path and not overwrite_target_path else "    "
-            _print_preview_tree(display_change_preview[:max_preview], base_prefix=preview_prefix)
-            if len(display_change_preview) > max_preview:
-                more_prefix = "│   " if planned_backup_path and not overwrite_target_path else "    "
-                print(f"{more_prefix}... and {len(display_change_preview) - max_preview:,} more")
-    elif rename_target_only:
-        suffix = "/" if rename_target_is_dir else ""
-        rename_target_color = Colors.WARNING if existing_same_name_target else Colors.OKGREEN
-        if planned_backup_path and not overwrite_target_path:
-            backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-            backup_suffix = "/" if backup_source_kind != "file" else ""
-            print(f"├── {rename_target_color}{rename_target_only}{suffix}{Colors.ENDC}")
-            print(f"└── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-        else:
-            print(f"└── {rename_target_color}{rename_target_only}{suffix}{Colors.ENDC}")
-    elif change_preview:
-        max_preview = 10
-        if planned_backup_path and not overwrite_target_path:
-            backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-            backup_suffix = "/" if backup_source_kind != "file" else ""
-            print(f"├── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-            _print_preview_tree(display_change_preview[:max_preview])
-        else:
-            _print_preview_tree(display_change_preview[:max_preview])
-        if len(display_change_preview) > max_preview:
-            if planned_backup_path and not overwrite_target_path:
-                print(f"... and {len(display_change_preview) - max_preview:,} more")
-            else:
-                print(f"... and {len(display_change_preview) - max_preview:,} more")
-    else:
-        if planned_backup_path and not overwrite_target_path:
-            backup_base = os.path.basename(planned_backup_path.rstrip("/"))
-            backup_suffix = "/" if backup_source_kind != "file" else ""
-            print(f"└── {Colors.OKGREEN}{backup_base}{backup_suffix} (backup){Colors.ENDC}")
-        else:
-            print("(no new additions)")
+            extra_added.add(simple_rename_dst.rstrip("/"))
 
-    print("")
+    if show_all:
+        _print_showall_preview(preview_root, display_change_preview, extra_added=extra_added, extra_modified=extra_modified)
+    else:
+        _print_changed_top_preview(preview_root, display_change_preview, extra_added=extra_added, extra_modified=extra_modified)
+
     if total_regular_files is not None:
         unchanged_files = max(0, int(total_regular_files) - int(add_files) - int(mod_files))
         print(f"Regular files: new={add_files:,}  modified={mod_files:,}  unchanged={unchanged_files:,}")
     print(f"Planned transfer bytes: {planned_bytes:,} ({_format_bytes_binary(str(planned_bytes), decimals=2)})")
     print("")
 
-    no_changes_planned = bool(source_already_in_destination or (planned_bytes == 0 and not has_itemized_changes))
+    overwrite_requires_action = bool(overwrite_target_path and os.path.exists(overwrite_target_path))
+    no_changes_planned = bool(
+        source_already_in_destination
+        or (
+            planned_bytes == 0
+            and not has_itemized_changes
+            and not overwrite_requires_action
+        )
+    )
+    if overwrite_requires_action and planned_bytes == 0 and not has_itemized_changes:
+        log("Overwrite requested: destination conflict will be replaced.")
     if no_changes_planned:
-        log("No changes detected; nothing to copy.")
+        log(f"No changes detected; nothing to {action_word}.")
         return 0
 
-    ans = (input("Proceed with copy? [y/N]: ") or "").strip().lower()
+    ans = (input(f"Proceed with {action_word}? [y/N]: ") or "").strip().lower()
     if ans not in ("y", "yes"):
         print(f"{Colors.FAIL}Cancelled.{Colors.ENDC}")
         return 0
@@ -1033,8 +1139,8 @@ def main():
         log("No changes: source is already in destination directory.")
         return 0
 
-    use_native_copy = bool(
-        not src_user_had_trailing
+    use_native_transfer = bool(
+        not source_contents_mode
         and not backup_requested
         and not overwrite
         and not force
@@ -1043,12 +1149,13 @@ def main():
         and not overwrite_target_path
     )
 
+    native_backend = "mv" if is_move else "cp"
     if use_sudo:
         run_command(["sudo", "-v"])
-    if use_native_copy:
-        log(f"Starting copy (native cp backend): {source_input} -> {destination}...")
+    if use_native_transfer:
+        log(f"Starting {action_word} (native {native_backend} backend): {source_input} -> {destination}...")
     else:
-        log(f"Starting rsync copy: {source_input} -> {destination}...")
+        log(f"Starting rsync {action_word}: {source_input} -> {destination}...")
     start_ts = time.time()
     try:
         if backup_requested and backup_source_path and not overwrite_target_path:
@@ -1063,10 +1170,18 @@ def main():
         if overwrite_target_path:
             if overwrite_parent_from_child:
                 stage_parent = os.path.dirname(dst_mnt.rstrip("/")) or "."
-                stage_path = tempfile.mkdtemp(prefix=".copy-stage-", dir=stage_parent)
+                stage_path = tempfile.mkdtemp(prefix=f".{action_word}-stage-", dir=stage_parent)
                 log(f"Staging source before overwrite: {stage_path}")
-                rc_copy = _run_copy(src_path, stage_path, planned_bytes, use_sudo)
-                if rc_copy in (0, 24):
+                rc_transfer = _run_rsync_transfer(
+                    src_path,
+                    stage_path,
+                    planned_bytes,
+                    use_sudo,
+                    remove_source=is_move,
+                )
+                if rc_transfer in (0, 24):
+                    if is_move:
+                        _cleanup_source_dirs(src_mnt, remove_root=True, use_sudo=use_sudo)
                     if backup_requested:
                         log(f"Backing up existing directory: {overwrite_target_path}")
                         backup_base = planned_backup_path or _backup_base_path(overwrite_target_path)
@@ -1085,13 +1200,13 @@ def main():
                         log("Failed to place staged directory into destination.", "ERROR")
                         _remove_path_recursive(stage_path, use_sudo=use_sudo)
                         return 1
-                    if rc_copy == 0:
-                        log("Copy complete.")
+                    if rc_transfer == 0:
+                        log(f"{action_word_cap} complete.")
                         return 0
-                    log("Copy failed: some source files vanished during transfer (rsync exit 24).", "ERROR")
-                    log("Re-run copy to converge once the source tree is stable.", "ERROR")
+                    log(f"{action_word_cap} failed: some source files vanished during transfer (rsync exit 24).", "ERROR")
+                    log(f"Re-run {action_word} to converge once the source tree is stable.", "ERROR")
                     return 1
-                log(f"Copy failed: rsync exited with status {rc_copy}.", "ERROR")
+                log(f"{action_word_cap} failed: rsync exited with status {rc_transfer}.", "ERROR")
                 _remove_path_recursive(stage_path, use_sudo=use_sudo)
                 return 1
             if backup_requested:
@@ -1111,29 +1226,41 @@ def main():
                     log(f"Overwriting existing directory: {overwrite_target_path}")
                 if not _remove_path_recursive(overwrite_target_path, use_sudo=use_sudo):
                     return 1
-        if use_native_copy:
-            cp_res = run_command(["cp", "-a", "--", src_mnt, dst_mnt], check=False, sudo=use_sudo)
-            cp_rc = getattr(cp_res, "returncode", 0)
-            if cp_rc == 0:
-                log("Copy complete.")
+        if use_native_transfer:
+            if is_move:
+                native_res = run_command(["mv", "--", src_mnt, dst_mnt], check=False, sudo=use_sudo)
+            else:
+                native_res = run_command(["cp", "-a", "--", src_mnt, dst_mnt], check=False, sudo=use_sudo)
+            native_rc = getattr(native_res, "returncode", 0)
+            if native_rc == 0:
+                log(f"{action_word_cap} complete.")
                 return 0
-            log(f"Copy failed: cp exited with status {cp_rc}.", "ERROR")
-            cp_err = (getattr(cp_res, "stderr", "") or "").strip()
-            if cp_err:
-                log(cp_err, "ERROR")
+            log(f"{action_word_cap} failed: {native_backend} exited with status {native_rc}.", "ERROR")
+            native_err = (getattr(native_res, "stderr", "") or "").strip()
+            if native_err:
+                log(native_err, "ERROR")
             return 1
-        rc_copy = _run_copy(src_path, dst_path, planned_bytes, use_sudo)
-        if rc_copy == 0:
-            log("Copy complete.")
+        rc_transfer = _run_rsync_transfer(
+            src_path,
+            dst_path,
+            planned_bytes,
+            use_sudo,
+            remove_source=is_move,
+        )
+        if is_move and rc_transfer in (0, 24) and src_obj_kind == "dir":
+            remove_root = (not source_contents_mode) or rename_dir_to_new_path
+            _cleanup_source_dirs(src_mnt, remove_root=remove_root, use_sudo=use_sudo)
+        if rc_transfer == 0:
+            log(f"{action_word_cap} complete.")
             return 0
-        if rc_copy == 24:
-            log("Copy failed: some source files vanished during transfer (rsync exit 24).", "ERROR")
-            log("Re-run copy to converge once the source tree is stable.", "ERROR")
+        if rc_transfer == 24:
+            log(f"{action_word_cap} failed: some source files vanished during transfer (rsync exit 24).", "ERROR")
+            log(f"Re-run {action_word} to converge once the source tree is stable.", "ERROR")
             return 1
-        log(f"Copy failed: rsync exited with status {rc_copy}.", "ERROR")
+        log(f"{action_word_cap} failed: rsync exited with status {rc_transfer}.", "ERROR")
         return 1
     except Exception as e:
-        log(f"Copy failed: {e}", "ERROR")
+        log(f"{action_word_cap} failed: {e}", "ERROR")
         return 1
     finally:
         print(f"Duration: {_fmt_hms(time.time() - start_ts)}")

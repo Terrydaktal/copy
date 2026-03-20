@@ -1,153 +1,111 @@
-# move+copy
+# copy
 
-Two standalone Python CLI tools for local filesystem transfers using `rsync`:
+Single standalone Python CLI for local filesystem transfers using `rsync`.
 
-- `copy`: copy files/directories with preview, progress, and optional backups.
-- `move`: move files/directories with preview, progress, optional backups, and source cleanup.
+- `copy` mode (default): source stays in place.
+- `move` mode (`--move`): source is transferred, then removed.
 
 ## Requirements
 
 - Linux with:
   - `python3`
   - `rsync`
-  - coreutils (`mv`, `cp`, `rm`, `find`)
-  - `sudo` (only if you use `--sudo`)
+  - coreutils (`cp`, `mv`, `rm`, `find`)
+  - `sudo` (only when using `--sudo`)
 
 ## Project Structure
 
 ```text
-move+copy/
+copy/
 ├── .gitignore
 ├── copy
-├── move
 └── README.md
 ```
 
-## Scripts
+## Script
 
 ### `copy`
 
 Purpose:
-- Copies a source file or directory to a destination using `rsync -aH`.
-- Shows a dry-run preview tree before making changes.
-- Prompts for confirmation before executing.
+- Copy or move a file/directory with preview, confirmation, progress, and optional backup.
 
 Inputs:
 - Positional:
   - `source`: file or directory path
   - `destination`: directory path, or file path when source is a file
 - Flags:
-  - `--sudo`: run transfer commands with sudo
-  - `-o`, `--overwrite`: replace existing target path when conflicts exist
-  - `-f`, `-r`, `--force-rename`: force rename-style merge when rename target exists
-  - `-b`, `--backup`: create a timestamped backup of destination content before merge/overwrite
+  - `--move`: run in move mode (transfer then remove source data)
+  - `--sudo`: run transfer/removal commands with sudo
+  - `-o`, `--overwrite`: replace conflicting destination target
+  - `-n`, `--no-nesting`: treat destination directory as the explicit target (merge into it instead of nesting source name under it)
+  - `-b`, `--backup`: create timestamped backup when destination data would be merged/replaced
+  - `--showall`: preview all destination depth-1 entries (new/changed/unchanged)
 
 Behavior detail:
-- `copy` uses `rsync --size-only`.
-- If destination has the same relative file name and same file size, `copy` updates metadata from source without rewriting file content.
-- If file size differs, file content is overwritten from source.
-- `copy` always performs an rsync dry-run preview first.
-- For simple non-merge, non-overwrite, non-backup, non-`source/*` operations, execution uses native `cp -a` for speed.
-
-Outputs:
-- Terminal:
-  - mode summary line (Overwrite/Copy/Merge/Backup/File/Dir)
-  - preview tree of planned changes
-  - planned transfer bytes
-  - confirmation prompt (`Proceed with copy? [y/N]:`)
-  - live progress and duration
-  - final completion/warning/error message
-- Filesystem:
-  - copied content at destination
-  - optional backup path (timestamped sibling naming)
-
-### `move`
-
-Purpose:
-- Moves a source file or directory to destination using `rsync -aH --remove-source-files`.
-- Uses the same preview/confirmation flow as `copy`.
-- Cleans up empty source directories after successful transfer.
-
-Behavior detail:
-- `move` uses `rsync --size-only`.
-- If destination has the same relative file name and same file size, `move` updates destination metadata from source without rewriting file content.
-- If file size differs, destination file content is overwritten from source.
-- Source trailing slash behaves like normal `mv` (same as no trailing slash). Use `source/*` to move directory contents only.
-- `move` always performs an rsync dry-run preview first.
-- For simple non-merge, non-overwrite, non-backup, non-`source/*` operations, execution uses native `mv` for speed.
-
-Inputs:
-- Positional:
-  - `source`: file or directory path
-  - `destination`: directory path, or file path when source is a file
-- Flags:
-  - `--sudo`
-  - `-o`, `--overwrite`
-  - `-f`, `-r`, `--force-rename`
-  - `-b`, `--backup`
+- Always performs an `rsync` dry-run preflight first (`--itemize-changes --stats`).
+- Uses `--size-only` matching for transfer decisions.
+- For simple operations (no merge/overwrite/backup/`source/*`), uses native backend:
+  - `cp -a` in copy mode
+  - `mv` in move mode
+- Directory conflict handling:
+  - default: may nest source directory under destination directory
+  - `-n`: avoid nesting, merge source contents into destination directory path
+  - `-o`: overwrite nested conflicting target
+  - `-o -n`: overwrite explicit destination directory path
+- For move mode, empty source directories are cleaned up after successful transfer.
 
 Outputs:
 - Terminal:
   - mode summary line
-  - preview tree
+  - preview tree + top-level summary
   - planned transfer bytes
-  - confirmation prompt (`Proceed with move? [y/N]:`)
+  - confirmation prompt
   - live progress and duration
   - final completion/warning/error message
 - Filesystem:
-  - moved content at destination
-  - source files removed by rsync
-  - empty source directories deleted after successful move
-  - optional backup path when merge/overwrite would affect destination content
+  - copied or moved content at destination
+  - optional timestamped backup directory/file (when requested and applicable)
 
 ## Internal Operation Pipeline
 
-Both scripts follow this order:
+Execution flow:
 
-1. Parse arguments and normalize source/destination paths.
-2. Determine operation mode (copy/move, merge, overwrite, backup, file vs directory).
-3. Run `rsync` dry-run preflight (`-anH --itemize-changes --stats`) to build preview and planned byte count.
-4. Print preview and prompt for confirmation.
+1. Parse args and normalize paths.
+2. Resolve source/destination kinds and choose conflict strategy.
+3. Run `rsync` dry-run preflight and build preview + byte estimate.
+4. Print preview and request confirmation.
 5. If confirmed:
-   - optionally create backup of conflicting destination content
-   - optionally remove/replace conflicting destination content for overwrite flows
-   - run live `rsync` with progress output
+   - optionally backup destination conflict target
+   - optionally remove conflict target for overwrite flows
+   - execute transfer (native `cp`/`mv` or `rsync`)
+   - in move mode, clean empty source directories
 6. Print final status and duration.
-7. For `move`, remove empty source directories after successful transfer.
-
-## Execution Order
-
-There is no mandatory multi-script pipeline. Choose one script per operation:
-
-1. Use `copy` when source must remain in place.
-2. Use `move` when source should be relocated.
-
-Recommended safe workflow for important data:
-
-1. Run `copy` first.
-2. Validate destination contents.
-3. Run `move` only if you then want to remove/relocate source content.
 
 ## Usage Examples
 
 ```bash
-# Copy a directory into an existing destination directory
-./copy /data/source_dir /data/target_root/
+# Copy a directory into a destination root
+./copy /data/src/project /data/dst/
 
-# Copy a single file to a new filename
-./copy /data/a/report.csv /data/b/report-archive.csv
+# Move a directory
+./copy --move /data/src/project /data/archive/
 
-# Move a directory and overwrite conflicting destination content, with backup
-./move -o -b /data/old_project /data/new_parent/
+# Replace nested conflicting target (overwrite)
+./copy --move -o /data/src/project /data/archive/
 
-# Use sudo for protected locations
+# Replace explicit destination directory path (overwrite + no nesting)
+./copy --move -o -n /data/src/project /data/archive/project_renamed
+
+# Backup destination data before merge/overwrite
+./copy -b -n /data/src/project /data/dst/project_renamed
+
+# Use sudo for protected paths
 ./copy --sudo /root/input /mnt/shared/output/
-
-# Same-name + same-size files get metadata synced without rewriting file data
-./copy /data/source_dir/ /data/target_dir/
 ```
 
 ## Notes
 
-- The `copy` script help banner uses `diskcopy` as its program label.
-- If passing shell globs such as `*`, quote them so the script can parse intent correctly.
+- Use `source/*` if you want to transfer directory contents only.
+- Quote globs like `'*'` if you need literal handling by the script.
+- Default preview shows only changed destination depth-1 entries plus unchanged counts.
+- `--showall` includes unchanged entries in white.
