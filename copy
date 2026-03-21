@@ -103,6 +103,22 @@ def run_command(command, check=True, sudo=False):
         return e
 
 
+def _count_regular_files(path):
+    if not path or not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        return 1
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            fp = os.path.join(root, name)
+            if os.path.isfile(fp):
+                total += 1
+    return total
+
+
 def _to_real_path(value):
     expanded = os.path.expanduser(value)
     if os.path.isabs(expanded):
@@ -256,9 +272,18 @@ def _print_preview_tree(preview_items, base_prefix=""):
     walk(tree, base_prefix)
 
 
-def _collect_top_level_preview(preview_root, preview_items, extra_added=None, extra_modified=None):
+def _collect_top_level_preview(
+    preview_root,
+    preview_items,
+    extra_added=None,
+    extra_modified=None,
+    extra_replaced=None,
+    extra_removed=None,
+):
     extra_added = set(extra_added or [])
     extra_modified = set(extra_modified or [])
+    extra_replaced = set(extra_replaced or [])
+    extra_removed = set(extra_removed or [])
     root = preview_root.rstrip("/") or "/"
 
     existing_entries = set()
@@ -299,6 +324,15 @@ def _collect_top_level_preview(preview_root, preview_items, extra_added=None, ex
     for name in extra_modified:
         if top_states.get(name) != "added":
             top_states[name] = "modified"
+    for name in extra_replaced:
+        top_states[name] = "replaced"
+    for name in extra_removed:
+        top_states[name] = "removed"
+    # If the top-level entry already exists in destination, treat it as modified
+    # even when rsync reports only nested additions under it.
+    for name in list(top_states.keys()):
+        if top_states.get(name) == "added" and name in existing_entries:
+            top_states[name] = "modified"
 
     entries = sorted(existing_entries | set(top_states.keys()))
     unchanged_files = 0
@@ -314,35 +348,222 @@ def _collect_top_level_preview(preview_root, preview_items, extra_added=None, ex
     return root, entries, top_states, top_is_dir, unchanged_files, unchanged_dirs
 
 
-def _print_showall_preview(preview_root, preview_items, extra_added=None, extra_modified=None):
-    root, entries, top_states, top_is_dir, _, _ = _collect_top_level_preview(
-        preview_root,
-        preview_items,
-        extra_added=extra_added,
-        extra_modified=extra_modified,
-    )
-    for idx, name in enumerate(entries):
-        last = idx == len(entries) - 1
-        branch = "└── " if last else "├── "
-        full = os.path.join(root, name)
-        is_dir = top_is_dir.get(name, os.path.isdir(full))
-        suffix = "/" if is_dir else ""
-        state = top_states.get(name)
+def _print_showall_preview(
+    preview_root,
+    preview_items,
+    extra_added=None,
+    extra_modified=None,
+    extra_replaced=None,
+    extra_removed=None,
+):
+    def _build_change_tree(items):
+        root_node = {"children": {}, "state": None, "is_dir": True}
+        for change_kind, raw in items:
+            p = (raw or "").strip().lstrip("./")
+            if not p:
+                continue
+            leaf_is_dir = p.endswith("/")
+            p = p.rstrip("/")
+            if not p:
+                continue
+            parts = p.split("/")
+            if change_kind in ("new_file", "new_dir"):
+                leaf_state = "added"
+            elif change_kind in ("removed_file", "removed_dir"):
+                leaf_state = "removed"
+            else:
+                leaf_state = "modified"
+            node = root_node
+            for idx, part in enumerate(parts):
+                is_leaf = idx == len(parts) - 1
+                child = node["children"].setdefault(
+                    part,
+                    {"children": {}, "state": None, "is_dir": True},
+                )
+                if is_leaf:
+                    child["is_dir"] = bool(leaf_is_dir)
+                    if leaf_state == "added":
+                        if child["state"] is None:
+                            child["state"] = "added"
+                    elif leaf_state == "removed":
+                        child["state"] = "removed"
+                    else:
+                        if child["state"] != "added":
+                            child["state"] = "modified"
+                else:
+                    child["is_dir"] = True
+                    if child["state"] != "added":
+                        child["state"] = "modified"
+                node = child
+        return root_node
+
+    def _collect_level_entries(abs_dir, node, level_extra_states=None):
+        level_extra_states = dict(level_extra_states or {})
+        existing_entries = set()
+        if os.path.isdir(abs_dir):
+            try:
+                existing_entries = set(os.listdir(abs_dir))
+            except OSError:
+                existing_entries = set()
+        changed_entries = set((node or {}).get("children", {}).keys())
+        all_names = sorted(existing_entries | changed_entries | set(level_extra_states.keys()))
+        result = []
+        for name in all_names:
+            child_node = (node or {}).get("children", {}).get(name)
+            state = level_extra_states.get(name)
+            if state is None and child_node:
+                state = child_node.get("state")
+            if not state:
+                state = "unchanged"
+            full = os.path.join(abs_dir, name)
+            is_dir = bool((child_node and child_node.get("is_dir")) or os.path.isdir(full))
+            result.append(
+                {
+                    "name": name,
+                    "state": state,
+                    "is_dir": is_dir,
+                    "node": child_node,
+                }
+            )
+        return result
+
+    def _select_level_entries(entries, max_entries=5, top_level=False):
+        changed = [e for e in entries if e.get("state") != "unchanged"]
+        priority = {
+            "modified": 0,
+            "replaced": 0,
+            "removed": 1,
+            "added": 2,
+        }
+        changed.sort(key=lambda e: (priority.get(e.get("state"), 9), e.get("name", "")))
+        selected = changed[:max_entries]
+        selected_names = {e["name"] for e in selected}
+        hidden_new = 0
+        hidden_modified = 0
+        hidden_unchanged = 0
+        hidden_removed = 0
+        for e in entries:
+            if e["name"] in selected_names:
+                continue
+            st = e.get("state")
+            if st == "added":
+                hidden_new += 1
+            elif st in ("modified", "replaced"):
+                hidden_modified += 1
+            elif st == "removed":
+                hidden_removed += 1
+            else:
+                hidden_unchanged += 1
+        return selected, hidden_new, hidden_modified, hidden_unchanged, hidden_removed
+
+    def _format_entry(entry, row_kind=None):
+        name = entry.get("name", "")
+        suffix = "/" if entry.get("is_dir") else ""
+        state = entry.get("state")
+        if row_kind == "replaced_old":
+            return f"{Colors.FAIL}{name}{suffix} (old){Colors.ENDC}"
+        if row_kind == "replaced_new":
+            return f"{Colors.OKGREEN}{name}{suffix} (new){Colors.ENDC}"
+        if state == "removed":
+            return f"{Colors.FAIL}{name}{suffix} (removed){Colors.ENDC}"
         if state == "added":
-            color = Colors.OKGREEN
-        elif state == "modified":
-            color = Colors.WARNING
-        else:
-            color = Colors.WHITE
-        print(f"{branch}{color}{name}{suffix}{Colors.ENDC}")
+            return f"{Colors.OKGREEN}{name}{suffix}{Colors.ENDC}"
+        if state == "modified":
+            return f"{Colors.WARNING}{name}{suffix}{Colors.ENDC}"
+        return f"{Colors.WHITE}{name}{suffix}{Colors.ENDC}"
+
+    def _render_level(abs_dir, node, prefix="", level_extra_states=None, depth=0):
+        entries = _collect_level_entries(abs_dir, node, level_extra_states=level_extra_states)
+        selected, hidden_new, hidden_modified, hidden_unchanged, hidden_removed = _select_level_entries(
+            entries,
+            max_entries=5,
+            top_level=(depth == 0),
+        )
+
+        render_units = []
+        for entry in selected:
+            if entry.get("state") == "replaced":
+                render_units.append(("entry", entry, "replaced_old"))
+                render_units.append(("entry", entry, "replaced_new"))
+            else:
+                render_units.append(("entry", entry, None))
+
+        hidden_total = hidden_new + hidden_modified + hidden_unchanged + hidden_removed
+        if hidden_total > 0:
+            render_units.append(("summary", hidden_new, hidden_modified, hidden_unchanged, hidden_removed))
+
+        if not render_units:
+            return
+
+        for idx, unit in enumerate(render_units):
+            last = idx == len(render_units) - 1
+            branch = "└── " if last else "├── "
+            if unit[0] == "summary":
+                _, n_new, n_mod, n_unch, n_rem = unit
+                parts = []
+                if n_new > 0:
+                    parts.append(f"{n_new} more new")
+                if n_mod > 0:
+                    parts.append(f"{n_mod} more modified")
+                if n_unch > 0:
+                    parts.append(f"{n_unch} more unchanged")
+                if n_rem > 0:
+                    parts.append(f"{n_rem} more removed")
+                print(f"{prefix}{branch}... and {' '.join(parts)}")
+                continue
+
+            _, entry, row_kind = unit
+            print(f"{prefix}{branch}{_format_entry(entry, row_kind=row_kind)}")
+
+            should_expand = bool(
+                row_kind is None
+                and entry.get("is_dir")
+                and entry.get("state") == "modified"
+            )
+            if not should_expand:
+                continue
+
+            child_prefix = prefix + ("    " if last else "│   ")
+            child_node = entry.get("node") or {"children": {}, "state": None, "is_dir": True}
+            _render_level(
+                os.path.join(abs_dir, entry.get("name", "")),
+                child_node,
+                prefix=child_prefix,
+                level_extra_states=None,
+                depth=depth + 1,
+            )
+
+    root = preview_root.rstrip("/") or "/"
+    root_extra_states = {}
+    for name in set(extra_added or []):
+        root_extra_states[name] = "added"
+    for name in set(extra_modified or []):
+        if root_extra_states.get(name) != "added":
+            root_extra_states[name] = "modified"
+    for name in set(extra_replaced or []):
+        root_extra_states[name] = "replaced"
+    for name in set(extra_removed or []):
+        root_extra_states[name] = "removed"
+
+    change_tree = _build_change_tree(preview_items)
+    _render_level(root, change_tree, prefix="", level_extra_states=root_extra_states, depth=0)
 
 
-def _print_changed_top_preview(preview_root, preview_items, extra_added=None, extra_modified=None):
+def _print_changed_top_preview(
+    preview_root,
+    preview_items,
+    extra_added=None,
+    extra_modified=None,
+    extra_replaced=None,
+    extra_removed=None,
+):
     root, _, top_states, top_is_dir, unchanged_files, unchanged_dirs = _collect_top_level_preview(
         preview_root,
         preview_items,
         extra_added=extra_added,
         extra_modified=extra_modified,
+        extra_replaced=extra_replaced,
+        extra_removed=extra_removed,
     )
     changed_names = sorted(top_states.keys())
     added_files = 0
@@ -366,15 +587,35 @@ def _print_changed_top_preview(preview_root, preview_items, extra_added=None, ex
     if not changed_names:
         print("(no new additions)")
     else:
-        for idx, name in enumerate(changed_names):
-            last = idx == len(changed_names) - 1
-            branch = "└── " if last else "├── "
+        render_rows = []
+        for name in changed_names:
             full = os.path.join(root, name)
             is_dir = top_is_dir.get(name, os.path.isdir(full))
+            state = top_states.get(name)
+            if state == "replaced":
+                render_rows.append(("replaced_old", name, is_dir))
+                render_rows.append(("replaced_new", name, is_dir))
+            else:
+                render_rows.append(("single", name, is_dir))
+        for idx, row in enumerate(render_rows):
+            kind, name, is_dir = row
+            last = idx == len(render_rows) - 1
+            branch = "└── " if last else "├── "
             suffix = "/" if is_dir else ""
             state = top_states.get(name)
-            color = Colors.OKGREEN if state == "added" else Colors.WARNING
-            print(f"{branch}{color}{name}{suffix}{Colors.ENDC}")
+            if kind == "replaced_old":
+                color = Colors.FAIL
+                label = " (old)"
+            elif kind == "replaced_new":
+                color = Colors.OKGREEN
+                label = " (new)"
+            elif state == "removed":
+                color = Colors.FAIL
+                label = " (removed)"
+            else:
+                color = Colors.OKGREEN if state == "added" else Colors.WARNING
+                label = ""
+            print(f"{branch}{color}{name}{suffix}{label}{Colors.ENDC}")
     unchanged_total = unchanged_files + unchanged_dirs
     if unchanged_total > 0:
         print(f"... and {unchanged_total:,} more unchanged")
@@ -626,11 +867,12 @@ def main():
     parser.add_argument("destination", help="Destination path (directory, or file path when source is a file)")
     parser.add_argument("extra", nargs="*", help=argparse.SUPPRESS)
     parser.add_argument(
+        "-m",
         "--move",
         action="store_true",
         help="Move mode: transfer then remove source data (equivalent to move behavior).",
     )
-    parser.add_argument("--sudo", action="store_true", help="Run rsync with sudo")
+    parser.add_argument("-s", "--sudo", action="store_true", help="Run rsync with sudo")
     parser.add_argument(
         "-o",
         "--overwrite",
@@ -638,11 +880,12 @@ def main():
         help="Force overwrite (replace) instead of merge when destination target already exists.",
     )
     parser.add_argument(
-        "-n",
-        "--no-nesting",
+        "-c",
+        "-C",
+        "--contents-only",
         dest="force_rename",
         action="store_true",
-        help="When a rename target already exists, merge into it instead of creating a nested directory.",
+        help="Merge source contents directly into destination path (do not nest source basename).",
     )
     parser.add_argument(
         "-b",
@@ -652,9 +895,12 @@ def main():
         help="Create a timestamped backup when destination data will be merged or overwritten.",
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
         "--showall",
+        dest="showall",
         action="store_true",
-        help="Show all depth-1 destination entries in preview (green=added, yellow=modified, white=unchanged).",
+        help="Show hierarchical preview: up to 5 changed entries per level (modified first), expand only modified folders, and abbreviate remaining new/modified/unchanged/removed counts.",
     )
     args = parser.parse_args()
 
@@ -675,12 +921,16 @@ def main():
     show_all = bool(args.showall)
     backup_requested = bool(args.backup)
     overwrite = bool(args.overwrite)
-    force = bool(args.force_rename)
+    force_requested = bool(args.force_rename)
     source_glob_contents = False
 
     if source.endswith("/*"):
         source = source[:-1]
         source_glob_contents = True
+    # Treat explicit "source/*" as contents-only mode so it matches
+    # "source/" with "-c".
+    force = bool(force_requested or source_glob_contents)
+    contents_mode_requested = bool(force_requested or source_glob_contents)
 
     src_mnt, src_obj_kind = _resolve_source(source)
     if not src_mnt:
@@ -693,9 +943,9 @@ def main():
     if not dst_mnt:
         return 1
 
-    # Match normal coreutils semantics: trailing slash alone should not switch to
-    # "contents mode"; only an explicit "/*" should do that.
-    source_contents_mode = bool(source_glob_contents)
+    # Trailing slash alone does not imply contents mode. Explicit "/*" is
+    # normalized to no-nesting behavior (same as "-n"), not a separate mode.
+    source_contents_mode = bool(source_glob_contents and not force)
     dest_tail_raw = os.path.basename((destination or "").rstrip("/"))
     destination_is_dir_ref = destination.endswith("/") or dest_tail_raw in ("", ".", "..")
 
@@ -703,21 +953,31 @@ def main():
     merge_child_into_parent = False
     source_already_in_destination = False
     overwrite_parent_from_child = False
-    force_parent_from_child = False
     if src_obj_kind == "dir" and dst_obj_kind in ("dir", "dir_existing"):
         dst_slot_for_src = os.path.realpath(os.path.join(dst_mnt, os.path.basename(src_mnt.rstrip("/"))))
         if dst_slot_for_src == src_mnt:
             src_base_for_slot = os.path.basename(src_mnt.rstrip("/"))
             dst_base_for_slot = os.path.basename(dst_mnt.rstrip("/"))
             if src_base_for_slot == dst_base_for_slot:
-                merge_child_into_parent = True
+                source_already_in_destination = True
+                if force and not source_contents_mode:
+                    merge_child_into_parent = True
+                    source_already_in_destination = False
             else:
                 source_already_in_destination = True
                 if overwrite and not source_contents_mode and not destination_is_dir_ref:
                     overwrite_parent_from_child = True
                     source_already_in_destination = False
-                elif force and not source_contents_mode and not destination_is_dir_ref and not overwrite:
-                    force_parent_from_child = True
+                elif force and not source_contents_mode:
+                    source_already_in_destination = False
+        else:
+            src_parent_real = os.path.realpath(os.path.dirname(src_mnt.rstrip("/")))
+            # Example: cwd=/x/poo, src=poo, dst=..
+            # Default should no-op (self-overwrite path); -n should merge contents into dst.
+            if dst_slot_for_src == src_parent_real:
+                source_already_in_destination = True
+                if force and not source_contents_mode:
+                    merge_child_into_parent = True
                     source_already_in_destination = False
 
     rename_style_existing_dir_target = bool(
@@ -751,9 +1011,12 @@ def main():
 
     force_merge_dir_target = bool(
         force
-        and rename_style_existing_dir_target
+        and src_obj_kind == "dir"
+        and dst_obj_kind in ("dir", "dir_existing")
+        and not source_contents_mode
         and not source_already_in_destination
         and not overwrite_parent_from_child
+        and not overwrite_rename_dir_target
     )
 
     overwrite_merge_child_parent = bool(overwrite and merge_child_into_parent and src_obj_kind == "dir")
@@ -878,6 +1141,8 @@ def main():
         mode_move = False
 
     mode_rename = bool(src_base and target_base and src_base != target_base)
+    if force_merge_dir_target or merge_child_into_parent:
+        mode_rename = False
 
     mode_overwrite = False
     mode_merge = False
@@ -915,6 +1180,8 @@ def main():
             log(f"Failed to plan backup path for: {backup_source_path}", "ERROR")
             return 1
     mode_backup = bool(planned_backup_path)
+    contents_mode_active = bool(contents_mode_requested and src_obj_kind == "dir")
+    mode_dir_active = bool(mode_kind == "dir" and not contents_mode_active)
 
     print(
         " ".join(
@@ -926,7 +1193,8 @@ def main():
                 _fmt_mode_word("Rename", mode_rename),
                 _fmt_mode_word("Backup", mode_backup),
                 _fmt_mode_word("File", mode_kind == "file"),
-                _fmt_mode_word("Dir", mode_kind == "dir"),
+                _fmt_mode_word("Dir", mode_dir_active),
+                _fmt_mode_word("Contents", contents_mode_active),
             ]
         )
     )
@@ -1032,7 +1300,7 @@ def main():
     simple_rename_parent = None
     rename_target_only = None
     rename_target_is_dir = False
-    if src_obj_kind == "dir" and (rename_dir_to_new_path or merge_child_into_parent):
+    if src_obj_kind == "dir" and rename_dir_to_new_path:
         src_base = os.path.basename(src_mnt.rstrip("/"))
         dst_base = os.path.basename(dst_mnt.rstrip("/"))
         src_parent = os.path.dirname(src_mnt.rstrip("/"))
@@ -1086,13 +1354,23 @@ def main():
                         remapped_preview.append((ck, f"{current_root_name}/"))
                 display_change_preview = remapped_preview
             preview_root = (backup_parent.rstrip("/") or "/") + "/"
+    if is_move and merge_child_into_parent and src_obj_kind == "dir":
+        preview_root_real = os.path.realpath(preview_root.rstrip("/") or "/")
+        src_real = os.path.realpath(src_mnt.rstrip("/"))
+        try:
+            removed_rel = os.path.relpath(src_real, preview_root_real)
+        except Exception:
+            removed_rel = None
+        if removed_rel and removed_rel not in (".", "..") and not removed_rel.startswith("../"):
+            display_change_preview.append(("removed_dir", removed_rel.rstrip("/") + "/"))
     print(f"{Colors.WARNING}{preview_root}{Colors.ENDC}")
     extra_added = set()
     extra_modified = set()
+    extra_replaced = set()
     if planned_backup_path and not overwrite_target_path:
         extra_added.add(os.path.basename(planned_backup_path.rstrip("/")))
     if overwrite_target_path and not preview_inside_target_dir:
-        extra_modified.add(os.path.basename(overwrite_target_path.rstrip("/")))
+        extra_replaced.add(os.path.basename(overwrite_target_path.rstrip("/")))
     if rename_target_only and not preview_inside_target_dir:
         if existing_same_name_target:
             extra_modified.add(rename_target_only.rstrip("/"))
@@ -1105,13 +1383,34 @@ def main():
             extra_added.add(simple_rename_dst.rstrip("/"))
 
     if show_all:
-        _print_showall_preview(preview_root, display_change_preview, extra_added=extra_added, extra_modified=extra_modified)
+        _print_showall_preview(
+            preview_root,
+            display_change_preview,
+            extra_added=extra_added,
+            extra_modified=extra_modified,
+            extra_replaced=extra_replaced,
+        )
     else:
-        _print_changed_top_preview(preview_root, display_change_preview, extra_added=extra_added, extra_modified=extra_modified)
+        _print_changed_top_preview(
+            preview_root,
+            display_change_preview,
+            extra_added=extra_added,
+            extra_modified=extra_modified,
+            extra_replaced=extra_replaced,
+        )
 
     if total_regular_files is not None:
         unchanged_files = max(0, int(total_regular_files) - int(add_files) - int(mod_files))
-        print(f"Regular files: new={add_files:,}  modified={mod_files:,}  unchanged={unchanged_files:,}")
+        removed_from_source_files = (int(add_files) + int(mod_files)) if is_move else 0
+        removed_from_dest_files = 0
+        if overwrite_target_path and os.path.exists(overwrite_target_path):
+            removed_from_dest_files = _count_regular_files(overwrite_target_path)
+        print(
+            f"Regular files: new={add_files:,}  modified={mod_files:,}  "
+            f"unchanged={unchanged_files:,}  "
+            f"removed={removed_from_dest_files:,}  "
+            f"removed_from_source={removed_from_source_files:,}"
+        )
     print(f"Planned transfer bytes: {planned_bytes:,} ({_format_bytes_binary(str(planned_bytes), decimals=2)})")
     print("")
 
