@@ -557,6 +557,7 @@ def _print_changed_top_preview(
     extra_replaced=None,
     extra_removed=None,
 ):
+    max_top_entries = 15
     root, _, top_states, top_is_dir, unchanged_files, unchanged_dirs = _collect_top_level_preview(
         preview_root,
         preview_items,
@@ -584,11 +585,26 @@ def _print_changed_top_preview(
                 changed_dirs += 1
             else:
                 changed_files += 1
-    if not changed_names:
+    hidden_new = 0
+    hidden_modified = 0
+    hidden_removed = 0
+    hidden_unchanged = unchanged_files + unchanged_dirs
+    visible_names = changed_names[:max_top_entries]
+    hidden_names = changed_names[max_top_entries:]
+    for name in hidden_names:
+        state = top_states.get(name)
+        if state == "added":
+            hidden_new += 1
+        elif state == "removed":
+            hidden_removed += 1
+        else:
+            hidden_modified += 1
+
+    if not visible_names:
         print("(no new additions)")
     else:
         render_rows = []
-        for name in changed_names:
+        for name in visible_names:
             full = os.path.join(root, name)
             is_dir = top_is_dir.get(name, os.path.isdir(full))
             state = top_states.get(name)
@@ -616,9 +632,12 @@ def _print_changed_top_preview(
                 color = Colors.OKGREEN if state == "added" else Colors.WARNING
                 label = ""
             print(f"{branch}{color}{name}{suffix}{label}{Colors.ENDC}")
-    unchanged_total = unchanged_files + unchanged_dirs
-    if unchanged_total > 0:
-        print(f"... and {unchanged_total:,} more unchanged")
+    hidden_total = hidden_new + hidden_modified + hidden_removed + hidden_unchanged
+    if hidden_total > 0:
+        print(
+            f"... and {hidden_new:,} more new {hidden_modified:,} more modified "
+            f"{hidden_unchanged:,} more unchanged and {hidden_removed:,} more removed"
+        )
         print("")
     print(
         f"Top level: Added: dirs={added_dirs} files={added_files} | "
@@ -1336,6 +1355,18 @@ def main():
     else:
         preview_root = dst_preview_root
 
+    if simple_rename_parent and src_obj_kind == "dir" and simple_rename_dst and display_change_preview:
+        remapped_preview = []
+        for ck, raw_name in display_change_preview:
+            item_name = (raw_name or "").lstrip("./")
+            if item_name.startswith(f"{simple_rename_dst}/") or item_name == simple_rename_dst:
+                remapped_preview.append((ck, item_name))
+            elif item_name:
+                remapped_preview.append((ck, f"{simple_rename_dst}/{item_name}"))
+            else:
+                remapped_preview.append((ck, f"{simple_rename_dst}/"))
+        display_change_preview = remapped_preview
+
     if planned_backup_path and not overwrite_target_path:
         backup_parent = os.path.dirname(planned_backup_path.rstrip("/")) or "/"
         current_root = preview_root.rstrip("/") or "/"
@@ -1366,6 +1397,7 @@ def main():
     extra_added = set()
     extra_modified = set()
     extra_replaced = set()
+    extra_removed = set()
     if planned_backup_path and not overwrite_target_path:
         extra_added.add(os.path.basename(planned_backup_path.rstrip("/")))
     if overwrite_target_path and not preview_inside_target_dir:
@@ -1380,6 +1412,8 @@ def main():
             extra_modified.add(simple_rename_dst.rstrip("/"))
         else:
             extra_added.add(simple_rename_dst.rstrip("/"))
+    if is_move and simple_rename_src:
+        extra_removed.add(simple_rename_src.rstrip("/"))
 
     if show_all:
         _print_showall_preview(
@@ -1388,6 +1422,7 @@ def main():
             extra_added=extra_added,
             extra_modified=extra_modified,
             extra_replaced=extra_replaced,
+            extra_removed=extra_removed,
         )
     else:
         _print_changed_top_preview(
@@ -1396,6 +1431,7 @@ def main():
             extra_added=extra_added,
             extra_modified=extra_modified,
             extra_replaced=extra_replaced,
+            extra_removed=extra_removed,
         )
 
     if total_regular_files is not None:
