@@ -1,22 +1,23 @@
 # copy
 
-Single standalone Python CLI for local filesystem transfers using `rsync` (copy by default, move with `-m/--move`).
+Rust CLI for local filesystem transfers with preview/confirm flow.
 
 ## Requirements
 
-- Linux with:
-  - `python3`
-  - `rsync`
-  - coreutils (`cp`, `mv`, `rm`, `find`)
-  - `sudo` (only when using `-s/--sudo`)
+- Linux
+- Rust toolchain (`cargo`)
+- `rsync` (used when source device is rotational HDD, and for sudo transfer mode)
 
 ## Project Structure
 
 ```text
 copy/
 ├── .gitignore
-├── copy
+├── Cargo.toml
+├── copy                  # launcher script (builds + runs Rust binary)
 ├── README.md
+├── src/
+│   └── main.rs           # full CLI implementation
 └── tests/
     ├── test_cli_matrix.py
     └── test_copy_cli.py
@@ -25,7 +26,7 @@ copy/
 ## Command
 
 ```bash
-./copy [OPTIONS] SOURCE DESTINATION
+./copy [OPTIONS] [--preview] [--preview-lite] SOURCE DESTINATION
 ```
 
 - Default mode: copy
@@ -44,52 +45,40 @@ copy/
 - `-b`, `--backup`
   - Create timestamped backup when destination data would be merged/replaced.
 - `-v`, `--verbose`, `--showall`
-  - Show hierarchical preview: up to 5 changed entries per level (modified first), expand only modified folders, and abbreviate remaining non-shown counts.
+  - Show hierarchical preview: up to 5 changed entries per level (modified first), expand only modified folders, and abbreviate remaining new/modified/unchanged/removed counts.
+- `--preview`
+  - Run only the preview phase and exit (no confirmation prompt, no transfer).
+- `--preview-lite`
+  - Faster preview-only mode that skips exact byte scanning when destination tree is brand-new.
 
-## Current Behavior
+## Backend Selection
 
-- Always runs an `rsync` dry-run preflight first (`--itemize-changes --stats`).
-- Uses `--size-only` for transfer decisions.
-- For simple operations (no merge/overwrite/backup/contents-only), uses native backend:
-  - `cp -a` in copy mode
-  - `mv` in move mode
-- `SOURCE/*` is treated as contents-only mode (equivalent to using `-c` on `SOURCE/`).
-- Parent/self-overlap safety is enforced; no-op cases print `No changes detected`.
-- Move mode removes transferred source files and cleans empty source directories.
+- Preview is always done in Rust using `jwalk` traversal + `rayon` parallel comparison.
+- Transfer backend is selected from source device type:
+  - NVMe / non-rotational: Rust native transfer path.
+  - Rotational HDD: `rsync` transfer path.
+- `--sudo` forces `rsync` backend (so elevated transfers can run via `sudo`).
 
-## Preview Output
+## Performance Build Settings
 
-- Mode line (`Overwrite Move Copy Merge Rename Backup File Dir Contents`).
-- Tree preview rooted at destination context.
-- In verbose mode, unchanged overflow is abbreviated (plus new/modified/removed overflow when present).
-- Regular file summary:
-  - `new`, `modified`, `unchanged`, `removed`, `removed_from_source`
-- Planned transfer bytes + confirmation prompt.
+- `copy` builds and runs `target/release/copy-rs` by default.
+- Release profile uses aggressive optimization (`opt-level=3`, `lto=fat`, `codegen-units=1`, `panic=abort`, stripped symbols).
+- Host tuning is enabled with `-C target-cpu=native` via `.cargo/config.toml`.
 
-## Usage Examples
+## Runtime Behavior
+
+- `SOURCE/*` is treated as contents-only mode (same as `-c` on `SOURCE/`).
+- Parent/self-overlap safety is enforced.
+- Move mode cleans empty source directories after transferred files are removed.
+- Mode line and preview output remain compatible with the previous CLI behavior.
+
+## Build
 
 ```bash
-# Copy directory into destination root (may nest source basename)
-./copy /data/src/project /data/dst/
-
-# Move directory
-./copy -m /data/src/project /data/archive/
-
-# Overwrite conflicting target
-./copy -m -o /data/src/project /data/archive/
-
-# Contents-only merge (no nesting)
-./copy -c /data/src/project/ /data/archive/project_renamed
-
-# Overwrite explicit destination path in contents-only mode
-./copy -m -o -c /data/src/project/ /data/archive/project_renamed
-
-# Literal SOURCE/* behavior (same as contents-only)
-./copy "/data/src/project/*" /data/archive/
-
-# Sudo mode
-./copy -s /root/input /mnt/shared/output/
+cargo build --release
 ```
+
+The launcher `./copy` auto-builds `target/release/copy-rs` when needed.
 
 ## Test
 
