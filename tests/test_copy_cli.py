@@ -17,13 +17,17 @@ def strip_ansi(text):
     return ANSI_RE.sub("", text)
 
 
-def run_copy(args, cwd=None, confirm=False):
+def run_copy(args, cwd=None, confirm=False, env=None):
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
     proc = subprocess.run(
         [str(COPY_BIN), *args],
         cwd=str(cwd) if cwd else None,
         input=("y\n" if confirm else "n\n"),
         text=True,
         capture_output=True,
+        env=merged_env,
     )
     combined = f"{proc.stdout}\n{proc.stderr}".strip()
     return proc.returncode, strip_ansi(combined), proc.stdout
@@ -58,6 +62,41 @@ class CopyCliIntegrationTests(unittest.TestCase):
         self.assertIn("-c, --contents-only", out)
         self.assertIn("-v, --verbose, --showall", out)
 
+    def test_copy_fails_preflight_when_destination_space_is_insufficient(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src.bin"
+            dst = Path(td) / "dst"
+            dst.mkdir(parents=True, exist_ok=True)
+            vfs = os.statvfs(dst)
+            required_bytes = (vfs.f_bavail * vfs.f_frsize) + 1
+            with src.open("wb") as fh:
+                try:
+                    fh.truncate(required_bytes)
+                except OSError as exc:
+                    self.skipTest(f"cannot create sparse preflight file at {required_bytes} bytes: {exc}")
+
+            rc, out, _ = run_copy([str(src), str(dst)], confirm=True)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("Insufficient free space on destination filesystem", out)
+
+    def test_move_fast_rename_is_not_blocked_by_space_preflight(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "huge.bin"
+            dst = Path(td) / "renamed.bin"
+            vfs = os.statvfs(td)
+            required_bytes = (vfs.f_bavail * vfs.f_frsize) + 1
+            with src.open("wb") as fh:
+                try:
+                    fh.truncate(required_bytes)
+                except OSError as exc:
+                    self.skipTest(f"cannot create sparse rename file at {required_bytes} bytes: {exc}")
+
+            rc, out, _ = run_copy(["--move", str(src), str(dst)], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertFalse(src.exists(), out)
+            self.assertTrue(dst.exists(), out)
+            self.assertIn("Fast-path rename on same filesystem", out)
+
     def test_move_same_slot_to_parent_is_noop_by_default(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "Telegram Backup" / "poo"
@@ -74,7 +113,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertNotIn("No changes detected; nothing to move.", out)
             self.assertIn("poo/ (removed)", out)
-            self.assertIn("Deleted (source): 1", out)
+            self.assertIn("Deleted (src)", out)
 
     def test_move_same_slot_to_parent_with_contents_only_and_overwrite_is_not_noop(self):
         with tempfile.TemporaryDirectory() as td:
@@ -164,7 +203,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
 
             rc, out, _ = run_copy(["--move", str(src), str(dst_root)], confirm=True)
             self.assertEqual(rc, 0, out)
-            self.assertIn("Identical: 1", out)
+            self.assertRegex(out, r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*1\s+\|\s*0")
             self.assertFalse(src.exists(), out)
             self.assertTrue((dst / "same.txt").exists(), out)
             self.assertIn("Starting move cleanup:", out)
@@ -173,7 +212,9 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertRegex(out, r"Cleanup:\s+\d+\.\d+%")
             self.assertIn("Cleanup:", out)
             self.assertIn("Average delete speed:", out)
-            self.assertIn("Overall throughput:", out)
+            self.assertIn("Average read speed:", out)
+            self.assertIn("Average write speed:", out)
+            self.assertIn("(total)", out)
 
     def test_move_contents_only_transfers_symlink_and_removes_source(self):
         with tempfile.TemporaryDirectory() as td:
@@ -222,7 +263,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
 
             rc, out, _ = run_copy(["--move", str(src), str(dst_root)])
             self.assertEqual(rc, 0, out)
-            self.assertIn("Deleted (source): 1", out)
+            self.assertIn("Deleted (src)", out)
 
     def test_move_contents_only_named_target_removes_source_dir_after_merge(self):
         with tempfile.TemporaryDirectory() as td:
@@ -274,7 +315,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("poo/ (old)", out)
             self.assertIn("poo/ (new)", out)
-            self.assertIn("Deleted (dest): 1", out)
+            self.assertIn("Deleted (dest)", out)
 
     def test_dir_rename_preview_does_not_flatten_children_into_parent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -302,7 +343,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("f/ (removed)", out)
             self.assertIn("unearth/", out)
-            self.assertIn("Deleted (source): 1", out)
+            self.assertIn("Deleted (src)", out)
 
     def test_move_same_filesystem_uses_fast_rename(self):
         with tempfile.TemporaryDirectory() as td:
@@ -407,19 +448,15 @@ class CopyCliIntegrationTests(unittest.TestCase):
 
             rc_copy, out_copy, _ = run_copy([str(src), str(dst), "-c"])
             self.assertEqual(rc_copy, 0, out_copy)
-            self.assertIn("Regular files:", out_copy)
-            self.assertIn("New: 1", out_copy)
-            self.assertIn("Modified: 0", out_copy)
-            self.assertIn("Identical: 0", out_copy)
-            self.assertIn("Unaffected: 1", out_copy)
+            self.assertIn("Type", out_copy)
+            self.assertIn("Deleted (src)", out_copy)
+            self.assertRegex(out_copy, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0")
 
             rc_move, out_move, _ = run_copy(["--move", str(src), str(dst), "-c"])
             self.assertEqual(rc_move, 0, out_move)
-            self.assertIn("Regular files:", out_move)
-            self.assertIn("New: 1", out_move)
-            self.assertIn("Modified: 0", out_move)
-            self.assertIn("Identical: 0", out_move)
-            self.assertIn("Unaffected: 1", out_move)
+            self.assertIn("Type", out_move)
+            self.assertIn("Deleted (src)", out_move)
+            self.assertRegex(out_move, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*1\s+\|\s*0")
 
     def test_unaffected_counts_destination_only_files_for_contents_merge_named_target(self):
         with tempfile.TemporaryDirectory() as td:
@@ -433,10 +470,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
 
             rc, out, _ = run_copy([str(src), str(dst), "-c"])
             self.assertEqual(rc, 0, out)
-            self.assertIn("New: 1", out)
-            self.assertIn("Modified: 0", out)
-            self.assertIn("Identical: 1", out)
-            self.assertIn("Unaffected: 2", out)
+            self.assertRegex(out, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*1\s+\|\s*2\s+\|\s*0\s+\|\s*0")
 
     def test_backup_merge_copy_creates_backup_dir(self):
         with tempfile.TemporaryDirectory() as td:

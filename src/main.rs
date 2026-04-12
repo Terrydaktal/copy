@@ -2,6 +2,7 @@ use filetime::{set_file_times, FileTime};
 use jemallocator::Jemalloc;
 use jwalk::WalkDir;
 use nix::sys::stat::{major, minor};
+use nix::sys::statvfs::statvfs;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -12,7 +13,7 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Once};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -130,9 +131,13 @@ struct PreScan {
     planned_bytes_exact: bool,
     total_regular_files: Option<u64>,
     total_regular_bytes: Option<u64>,
+    total_dirs: Option<u64>,
     add_files: u64,
     mod_files: u64,
     unaffected_files: u64,
+    add_dirs: u64,
+    mod_dirs: u64,
+    unaffected_dirs: u64,
     change_preview: Vec<ChangeItem>,
     has_itemized_changes: bool,
     transfer_manifest: Option<TransferManifest>,
@@ -145,9 +150,13 @@ impl Default for PreScan {
             planned_bytes_exact: true,
             total_regular_files: None,
             total_regular_bytes: None,
+            total_dirs: None,
             add_files: 0,
             mod_files: 0,
             unaffected_files: 0,
+            add_dirs: 0,
+            mod_dirs: 0,
+            unaffected_dirs: 0,
             change_preview: Vec::new(),
             has_itemized_changes: false,
             transfer_manifest: None,
@@ -179,6 +188,70 @@ struct TransferOutcome {
     rc: i32,
     bytes_done: u64,
     elapsed_s: f64,
+    io_read_bytes: Option<u64>,
+    io_write_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeviceIoRates {
+    src_read_bps: Option<f64>,
+    dst_write_bps: Option<f64>,
+}
+
+#[derive(Default)]
+struct DeviceIoWindow {
+    src_keys: Vec<(u64, u64)>,
+    dst_keys: Vec<(u64, u64)>,
+    last_at: Option<Instant>,
+    last_src_read_bytes: Option<u64>,
+    last_dst_write_bytes: Option<u64>,
+}
+
+struct InflightWriteLimiter {
+    max_bytes: u64,
+    used_bytes: Mutex<u64>,
+    cv: Condvar,
+}
+
+struct InflightWritePermit {
+    limiter: Arc<InflightWriteLimiter>,
+    reserved: u64,
+}
+
+impl Drop for InflightWritePermit {
+    fn drop(&mut self) {
+        self.limiter.release(self.reserved);
+    }
+}
+
+impl InflightWriteLimiter {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes: max_bytes.max(1),
+            used_bytes: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, want_bytes: u64) -> InflightWritePermit {
+        let reserve = want_bytes.max(1).min(self.max_bytes);
+        let mut used = self.used_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        while (*used + reserve > self.max_bytes) && *used > 0 {
+            used = self.cv.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used = used.saturating_add(reserve);
+        drop(used);
+        InflightWritePermit {
+            limiter: Arc::clone(self),
+            reserved: reserve,
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut used = self.used_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(bytes);
+        self.cv.notify_all();
+    }
 }
 
 enum RsyncStreamEvent {
@@ -207,6 +280,15 @@ fn fmt_hms_ms(total_seconds: f64) -> String {
     let s = (ms_total % 60_000) / 1000;
     let ms = ms_total % 1000;
     format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+fn fmt_hms_tenths(total_seconds: f64) -> String {
+    let tenth_total = (total_seconds.max(0.0) * 10.0).round() as i64;
+    let h = tenth_total / 36_000;
+    let m = (tenth_total % 36_000) / 600;
+    let s = (tenth_total % 600) / 10;
+    let t = tenth_total % 10;
+    format!("{h:02}:{m:02}:{s:02}.{t}")
 }
 
 fn format_bytes_binary(byte_value: u64, decimals: usize) -> String {
@@ -242,16 +324,32 @@ fn fmt_bytes_col_10(byte_value: u64) -> String {
     }
 }
 
-fn fmt_speed_bps_aligned(bps: f64) -> String {
-    let raw = fmt_speed_bps(bps);
-    let mut parts = raw.splitn(2, ' ');
-    let number = parts.next().unwrap_or("0");
-    let unit = parts.next().unwrap_or("");
-    if unit.is_empty() {
-        format!("{:>7}", number)
+fn fmt_rate_col(bps: f64) -> String {
+    let raw = format!("{}/s", fmt_speed_bps(bps));
+    if raw.len() >= 14 {
+        raw
     } else {
-        format!("{:>7} {}", number, unit)
+        format!("{:>14}", raw)
     }
+}
+
+fn fmt_rate_col_opt(bps: Option<f64>) -> String {
+    match bps {
+        Some(v) => fmt_rate_col(v),
+        None => format!("{:>14}", "--/s"),
+    }
+}
+
+fn print_transfer_columns_header() {
+    println!(
+        "{:<10} {:>7} {:>23} | {:>14} | {:>14} {:>14}",
+        "Time",
+        "%",
+        "Transferred / Total",
+        "Throughput",
+        "Read",
+        "Write"
+    );
 }
 
 fn print_summary_rate_line(label: &str, bps: f64, duration_s: f64, total: bool) {
@@ -265,9 +363,49 @@ fn print_summary_rate_line(label: &str, bps: f64, duration_s: f64, total: bool) 
     );
 }
 
+fn print_duration_only_line(duration_s: f64, total: bool) {
+    let total_suffix = if total { " (total)" } else { "" };
+    println!("{:<38}| Duration: {}{}", "", fmt_hms_ms(duration_s), total_suffix);
+}
+
+fn print_move_speed_summary(
+    avg_transfer_bps: f64,
+    avg_read_bps: f64,
+    avg_write_bps: f64,
+    transfer_duration_s: f64,
+    avg_delete_bps: f64,
+    delete_duration_s: f64,
+    total_duration_s: f64,
+) {
+    println!("{:<24}{}/s", "Average transfer speed:", fmt_speed_bps(avg_transfer_bps));
+    println!("{:<24}{}/s", "Average read speed:", fmt_speed_bps(avg_read_bps));
+    println!(
+        "{:<24}{}/s | Duration: {}",
+        "Average write speed:",
+        fmt_speed_bps(avg_write_bps),
+        fmt_hms_ms(transfer_duration_s)
+    );
+    println!(
+        "{:<24}{}/s | Duration: {}",
+        "Average delete speed:",
+        fmt_speed_bps(avg_delete_bps),
+        fmt_hms_ms(delete_duration_s)
+    );
+    print_duration_only_line(total_duration_s, true);
+}
+
 fn parse_env_threads() -> Option<usize> {
     let raw = env::var("COPY_RS_THREADS").ok()?;
     let parsed = raw.trim().parse::<usize>().ok()?;
+    if parsed == 0 {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn parse_env_u64(name: &str) -> Option<u64> {
+    let raw = env::var(name).ok()?;
+    let parsed = raw.trim().parse::<u64>().ok()?;
     if parsed == 0 {
         return None;
     }
@@ -284,6 +422,48 @@ fn preferred_thread_count(media: MediaKind) -> usize {
         MediaKind::Nvme => logical.clamp(2, 32),
         MediaKind::Other => logical.clamp(1, 8),
     }
+}
+
+fn copy_chunk_bytes_for_media(media: MediaKind) -> usize {
+    if let Some(kib) = parse_env_u64("COPY_RS_CHUNK_KIB") {
+        return (kib.saturating_mul(1024)).max(64 * 1024) as usize;
+    }
+    match media {
+        MediaKind::Hdd => 4 * 1024 * 1024,
+        MediaKind::Nvme => 2 * 1024 * 1024,
+        MediaKind::Other => 1024 * 1024,
+    }
+}
+
+fn inflight_max_bytes_for_media(media: MediaKind) -> Option<u64> {
+    if let Some(mib) = parse_env_u64("COPY_RS_MAX_INFLIGHT_MIB") {
+        return Some(mib.saturating_mul(1024 * 1024));
+    }
+    match media {
+        MediaKind::Hdd => Some(96 * 1024 * 1024),
+        _ => None,
+    }
+}
+
+fn inflight_reserve_bytes_for_file(file_size: u64, media: MediaKind) -> u64 {
+    match media {
+        MediaKind::Hdd => {
+            let min_reserve = 4 * 1024 * 1024u64;
+            let max_reserve = 32 * 1024 * 1024u64;
+            file_size.max(min_reserve).min(max_reserve)
+        }
+        _ => file_size.max(1024 * 1024),
+    }
+}
+
+fn acquire_file_write_permit(
+    limiter: Option<&Arc<InflightWriteLimiter>>,
+    file_size: u64,
+    media: MediaKind,
+) -> Option<InflightWritePermit> {
+    let lim = limiter?;
+    let reserve = inflight_reserve_bytes_for_file(file_size, media);
+    Some(lim.acquire(reserve))
 }
 
 fn configure_rayon_threads_for_media(media: MediaKind) {
@@ -305,10 +485,455 @@ fn count_regular_files_any(path: &Path) -> u64 {
         return 0;
     }
     WalkDir::new(path)
+        .skip_hidden(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.path().is_file())
         .count() as u64
+}
+
+fn read_diskstats_bytes() -> io::Result<HashMap<(u64, u64), (u64, u64)>> {
+    let raw = fs::read_to_string("/proc/diskstats")?;
+    let mut out: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+    for line in raw.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
+            continue;
+        }
+        let maj = match cols[0].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let min = match cols[1].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let sectors_read = match cols[5].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let sectors_written = match cols[9].parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        out.insert(
+            (maj, min),
+            (sectors_read.saturating_mul(512), sectors_written.saturating_mul(512)),
+        );
+    }
+    Ok(out)
+}
+
+fn unescape_mountinfo_field(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+        {
+            let oct = &raw[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(oct, 8) {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn mount_source_device_for_path(path: &Path) -> Option<PathBuf> {
+    let probe = existing_probe_path(path)?;
+    let probe_real = realpath_allow_missing(&probe);
+    let raw = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<(usize, PathBuf)> = None;
+    for line in raw.lines() {
+        let (left, right) = line.split_once(" - ")?;
+        let left_cols: Vec<&str> = left.split_whitespace().collect();
+        if left_cols.len() < 5 {
+            continue;
+        }
+        let right_cols: Vec<&str> = right.split_whitespace().collect();
+        if right_cols.len() < 2 {
+            continue;
+        }
+        let mount_point = PathBuf::from(unescape_mountinfo_field(left_cols[4]));
+        if !probe_real.starts_with(&mount_point) {
+            continue;
+        }
+        let src = unescape_mountinfo_field(right_cols[1]);
+        if !src.starts_with("/dev/") {
+            continue;
+        }
+        let depth = mount_point.components().count();
+        match &best {
+            Some((best_depth, _)) if *best_depth >= depth => {}
+            _ => best = Some((depth, PathBuf::from(src))),
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+fn device_key_for_block_device(devnode: &Path) -> Option<(u64, u64)> {
+    let md = fs::metadata(devnode).ok()?;
+    let rdev = md.rdev();
+    if rdev == 0 {
+        return None;
+    }
+    Some((major(rdev), minor(rdev)))
+}
+
+fn parse_major_minor(raw: &str) -> Option<(u64, u64)> {
+    let mut parts = raw.trim().split(':');
+    let maj = parts.next()?.trim().parse::<u64>().ok()?;
+    let min = parts.next()?.trim().parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((maj, min))
+}
+
+fn device_key_for_sys_block_name(name: &str) -> Option<(u64, u64)> {
+    let dev_path = Path::new("/sys/class/block").join(name).join("dev");
+    let raw = fs::read_to_string(dev_path).ok()?;
+    parse_major_minor(&raw)
+}
+
+fn collect_leaf_keys_for_block_name(
+    name: &str,
+    visited: &mut HashSet<String>,
+    out: &mut Vec<(u64, u64)>,
+) {
+    if !visited.insert(name.to_string()) {
+        return;
+    }
+
+    let slaves_dir = Path::new("/sys/class/block").join(name).join("slaves");
+    let mut had_slave = false;
+    if let Ok(rd) = fs::read_dir(&slaves_dir) {
+        for ent in rd.flatten() {
+            let child_name = ent.file_name().to_string_lossy().to_string();
+            if child_name.is_empty() {
+                continue;
+            }
+            had_slave = true;
+            collect_leaf_keys_for_block_name(&child_name, visited, out);
+        }
+    }
+
+    if !had_slave {
+        if let Some(k) = device_key_for_sys_block_name(name) {
+            out.push(k);
+        }
+    }
+}
+
+fn leaf_device_keys_for_block_device(devnode: &Path) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    let canonical = fs::canonicalize(devnode).unwrap_or_else(|_| devnode.to_path_buf());
+    if let Some(name) = canonical.file_name().and_then(|s| s.to_str()) {
+        collect_leaf_keys_for_block_name(name, &mut visited, &mut out);
+    }
+
+    if out.is_empty() {
+        if let Some(k) = device_key_for_block_device(devnode) {
+            out.push(k);
+        }
+    }
+
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn local_path_from_transfer_arg(arg: &str) -> Option<PathBuf> {
+    let trimmed = arg.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with("./") || trimmed.starts_with("../") {
+        return Some(PathBuf::from(trimmed));
+    }
+    None
+}
+
+fn device_keys_for_path(path: &Path) -> Vec<(u64, u64)> {
+    if let Some(devnode) = mount_source_device_for_path(path) {
+        let keys = leaf_device_keys_for_block_device(&devnode);
+        if !keys.is_empty() {
+            return keys;
+        }
+    }
+    let Some(probe) = existing_probe_path(path) else {
+        return Vec::new();
+    };
+    let Some(md) = fs::metadata(probe).ok() else {
+        return Vec::new();
+    };
+    let dev = md.dev();
+    vec![(major(dev), minor(dev))]
+}
+
+fn sum_diskstats_counter(
+    table: &HashMap<(u64, u64), (u64, u64)>,
+    keys: &[(u64, u64)],
+    read_counter: bool,
+) -> Option<u64> {
+    if keys.is_empty() {
+        return None;
+    }
+    let mut found = false;
+    let mut total: u64 = 0;
+    for key in keys {
+        if let Some((read_bytes, write_bytes)) = table.get(key) {
+            found = true;
+            let v = if read_counter { *read_bytes } else { *write_bytes };
+            total = total.saturating_add(v);
+        }
+    }
+    if found {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn block_name_for_dev_key(key: (u64, u64)) -> Option<String> {
+    let link = PathBuf::from(format!("/sys/dev/block/{}:{}", key.0, key.1));
+    let canon = fs::canonicalize(link).ok()?;
+    canon.file_name().map(|s| s.to_string_lossy().to_string())
+}
+
+fn block_leaf_names_for_path(path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = device_keys_for_path(path)
+        .into_iter()
+        .filter_map(block_name_for_dev_key)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn block_is_rotational(name: &str) -> Option<bool> {
+    let p = Path::new("/sys/class/block").join(name).join("queue/rotational");
+    let raw = fs::read_to_string(p).ok()?;
+    match raw.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_scheduler_info(raw: &str) -> (Option<String>, HashSet<String>) {
+    let mut active: Option<String> = None;
+    let mut available: HashSet<String> = HashSet::new();
+    for tok in raw.split_whitespace() {
+        let is_active = tok.starts_with('[') && tok.ends_with(']');
+        let name = tok.trim_matches('[').trim_matches(']').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if is_active {
+            active = Some(name.clone());
+        }
+        available.insert(name);
+    }
+    (active, available)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn set_block_scheduler(name: &str, scheduler: &str, use_sudo: bool) -> bool {
+    let p = Path::new("/sys/class/block").join(name).join("queue/scheduler");
+    if fs::write(&p, scheduler).is_ok() {
+        return true;
+    }
+    if !use_sudo {
+        return false;
+    }
+    let script = format!(
+        "printf %s {} > {}",
+        shell_single_quote(scheduler),
+        shell_single_quote(&p.display().to_string())
+    );
+    let cmd = vec!["sh".to_string(), "-c".to_string(), script];
+    run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false)
+}
+
+fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mode: TransferMode) {
+    let mut block_names: BTreeSet<String> = BTreeSet::new();
+    for p in paths {
+        for name in block_leaf_names_for_path(p) {
+            block_names.insert(name);
+        }
+    }
+    if block_names.is_empty() {
+        return;
+    }
+
+    let mut changed: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for name in block_names {
+        if !matches!(block_is_rotational(&name), Some(true)) {
+            continue;
+        }
+        let sched_path = Path::new("/sys/class/block").join(&name).join("queue/scheduler");
+        let raw = match fs::read_to_string(&sched_path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let (active, available) = parse_scheduler_info(&raw);
+        let desired = if available.contains("mq-deadline") {
+            Some("mq-deadline")
+        } else if available.contains("deadline") {
+            Some("deadline")
+        } else {
+            None
+        };
+        let Some(desired_scheduler) = desired else {
+            continue;
+        };
+        if active.as_deref() == Some(desired_scheduler) {
+            continue;
+        }
+        if set_block_scheduler(&name, desired_scheduler, use_sudo) {
+            changed.push(format!("{name}:{desired_scheduler}"));
+        } else {
+            failed.push(name);
+        }
+    }
+
+    if !changed.is_empty() {
+        log(
+            mode,
+            &format!("Using preferred HDD scheduler on {}", changed.join(", ")),
+            LogLevel::Info,
+        );
+    }
+    if !failed.is_empty() {
+        log(
+            mode,
+            &format!(
+                "Could not set preferred HDD scheduler on {} (insufficient permissions or unsupported device).",
+                failed.join(", ")
+            ),
+            LogLevel::Warn,
+        );
+    }
+}
+
+impl DeviceIoWindow {
+    fn from_transfer_paths(src_path: &str, dst_path: &str) -> Self {
+        let src_keys = local_path_from_transfer_arg(src_path)
+            .as_deref()
+            .map(device_keys_for_path)
+            .unwrap_or_default();
+        let dst_keys = local_path_from_transfer_arg(dst_path)
+            .as_deref()
+            .map(device_keys_for_path)
+            .unwrap_or_default();
+        Self {
+            src_keys,
+            dst_keys,
+            ..Self::default()
+        }
+    }
+
+    fn sample(&mut self) -> DeviceIoRates {
+        let mut rates = DeviceIoRates::default();
+        let now = Instant::now();
+        let table = match read_diskstats_bytes() {
+            Ok(v) => v,
+            Err(_) => return rates,
+        };
+
+        let src_read_now = sum_diskstats_counter(&table, &self.src_keys, true);
+        let dst_write_now = sum_diskstats_counter(&table, &self.dst_keys, false);
+
+        if let Some(prev_at) = self.last_at {
+            let dt = now.duration_since(prev_at).as_secs_f64().max(1e-6);
+            if let (Some(cur), Some(prev)) = (src_read_now, self.last_src_read_bytes) {
+                rates.src_read_bps = Some(cur.saturating_sub(prev) as f64 / dt);
+            }
+            if let (Some(cur), Some(prev)) = (dst_write_now, self.last_dst_write_bytes) {
+                rates.dst_write_bps = Some(cur.saturating_sub(prev) as f64 / dt);
+            }
+        }
+
+        self.last_at = Some(now);
+        if src_read_now.is_some() {
+            self.last_src_read_bytes = src_read_now;
+        }
+        if dst_write_now.is_some() {
+            self.last_dst_write_bytes = dst_write_now;
+        }
+        rates
+    }
+
+    fn current_totals(&self) -> (Option<u64>, Option<u64>) {
+        let table = match read_diskstats_bytes() {
+            Ok(v) => v,
+            Err(_) => return (None, None),
+        };
+        (
+            sum_diskstats_counter(&table, &self.src_keys, true),
+            sum_diskstats_counter(&table, &self.dst_keys, false),
+        )
+    }
+}
+
+fn counter_delta(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+    match (start, end) {
+        (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+        _ => None,
+    }
+}
+
+fn existing_probe_path(path: &Path) -> Option<PathBuf> {
+    let mut probe = if path.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        if probe.exists() {
+            return Some(probe);
+        }
+        if !probe.pop() {
+            return None;
+        }
+    }
+}
+
+fn destination_available_bytes(path: &Path) -> io::Result<(u64, PathBuf)> {
+    let probe = existing_probe_path(path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No existing destination ancestor path found"))?;
+    let stats = statvfs(&probe)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("statvfs failed for {}: {e}", probe.display())))?;
+    let avail = stats
+        .blocks_available()
+        .saturating_mul(stats.fragment_size() as u64);
+    Ok((avail, probe))
+}
+
+fn can_fast_rename_same_fs(source: &Path, target: &Path) -> bool {
+    source
+        .parent()
+        .and_then(|p| fs::metadata(p).ok())
+        .map(|m| m.dev())
+        .zip(target.parent().and_then(|p| fs::metadata(p).ok()).map(|m| m.dev()))
+        .map(|(a, b)| a == b)
+        .unwrap_or(false)
 }
 
 fn expand_user(value: &str) -> String {
@@ -595,6 +1220,7 @@ fn destination_file_counts(destination_root: &Path, source_rel_files: &HashSet<S
     }
 
     WalkDir::new(destination_root)
+        .skip_hidden(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.path().is_file())
@@ -610,6 +1236,73 @@ fn destination_file_counts(destination_root: &Path, source_rel_files: &HashSet<S
         })
 }
 
+fn count_directories_any(path: &Path, include_root: bool) -> u64 {
+    if !path.exists() || !path.is_dir() {
+        return 0;
+    }
+    let descendants = WalkDir::new(path)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_dir() && e.depth() > 0)
+        .count() as u64;
+    if include_root {
+        descendants + 1
+    } else {
+        descendants
+    }
+}
+
+fn destination_dir_counts(destination_root: &Path, source_rel_dirs: &HashSet<String>) -> (u64, u64) {
+    if !destination_root.is_dir() {
+        return (0, 0);
+    }
+
+    WalkDir::new(destination_root)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_dir() && e.depth() > 0)
+        .fold((0u64, 0u64), |(total, unaffected), e| {
+            let rel = e
+                .path()
+                .strip_prefix(destination_root)
+                .ok()
+                .map(normalize_rel)
+                .unwrap_or_default();
+            let is_unaffected = !rel.is_empty() && !source_rel_dirs.contains(&rel);
+            (total + 1, unaffected + u64::from(is_unaffected))
+        })
+}
+
+fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut HashSet<String>) {
+    if rel.is_empty() {
+        return;
+    }
+    let mut cur = rel;
+    loop {
+        match cur.rfind('/') {
+            Some(idx) => {
+                let parent = &cur[..idx];
+                if parent.is_empty() {
+                    if include_root {
+                        out.insert(String::new());
+                    }
+                    break;
+                }
+                out.insert(parent.to_string());
+                cur = parent;
+            }
+            None => {
+                if include_root {
+                    out.insert(String::new());
+                }
+                break;
+            }
+        }
+    }
+}
+
 fn usage() {
     eprintln!("usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v] [--preview] [--preview-lite] source destination");
 }
@@ -620,6 +1313,7 @@ fn print_help() {
     println!("Standalone copy/move with preview/progress.");
     println!("Supports local paths and one-sided remote rsync endpoints like user@host:/path or host:/path.");
     println!("Remote mode reads ~/.ssh/config for Host/User matching and uses rsync over SSH.");
+    println!("Local mode preflight checks destination free space against planned transfer bytes (no sudo required).");
     println!();
     println!("positional arguments:");
     println!("  source                Source path (file or directory)");
@@ -776,7 +1470,12 @@ fn plan_backup_path(path: &Path) -> Option<PathBuf> {
     next_backup_candidate_from_base(&base)
 }
 
-fn copy_file_preserve_with_progress<F>(src: &Path, dst: &Path, mut on_bytes: F) -> io::Result<u64>
+fn copy_file_preserve_with_progress_buf<F>(
+    src: &Path,
+    dst: &Path,
+    buf_bytes: usize,
+    mut on_bytes: F,
+) -> io::Result<u64>
 where
     F: FnMut(u64),
 {
@@ -785,7 +1484,7 @@ where
     }
     let mut in_file = fs::File::open(src)?;
     let mut out_file = fs::File::create(dst)?;
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = vec![0u8; buf_bytes.max(64 * 1024)];
     let mut total: u64 = 0;
     loop {
         let n = in_file.read(&mut buf)?;
@@ -804,6 +1503,13 @@ where
     let mtime = FileTime::from_last_modification_time(&meta);
     set_file_times(dst, atime, mtime)?;
     Ok(total)
+}
+
+fn copy_file_preserve_with_progress<F>(src: &Path, dst: &Path, on_bytes: F) -> io::Result<u64>
+where
+    F: FnMut(u64),
+{
+    copy_file_preserve_with_progress_buf(src, dst, 1024 * 1024, on_bytes)
 }
 
 fn copy_file_preserve(src: &Path, dst: &Path) -> io::Result<u64> {
@@ -1067,7 +1773,7 @@ fn prune_move_source_duplicates(
 
     let mut report_progress = |force: bool, removed: &DeleteCleanupOutcome| {
         let now = Instant::now();
-        if !force && now.duration_since(last_report) < Duration::from_secs(1) {
+        if !force && now.duration_since(last_report) < Duration::from_millis(500) {
             return;
         }
         if force && removed.files == 0 {
@@ -1085,36 +1791,36 @@ fn prune_move_source_duplicates(
         if expected_bytes > 0 {
             if expected_files > 0 {
                 println!(
-                    "Cleanup: {cleanup_pct:6.2}% {} / {} | Speed: {}/s | Deleted files: {} / {}",
+                    "Cleanup: {cleanup_pct:6.2}% {} / {} | {} | Deleted files: {} / {}",
                     fmt_bytes_col_10(removed.bytes),
                     format_bytes_binary(expected_bytes, 2),
-                    fmt_speed_bps_aligned(speed_bps),
+                    fmt_rate_col(speed_bps),
                     format_number(removed.files),
                     format_number(expected_files)
                 );
             } else {
                 println!(
-                    "Cleanup: {cleanup_pct:6.2}% {} / {} | Speed: {}/s | Deleted files: {}",
+                    "Cleanup: {cleanup_pct:6.2}% {} / {} | {} | Deleted files: {}",
                     fmt_bytes_col_10(removed.bytes),
                     format_bytes_binary(expected_bytes, 2),
-                    fmt_speed_bps_aligned(speed_bps),
+                    fmt_rate_col(speed_bps),
                     format_number(removed.files)
                 );
             }
         } else {
             if expected_files > 0 {
                 println!(
-                    "Cleanup: {cleanup_pct:6.2}% {} | Speed: {}/s | Deleted files: {} / {}",
+                    "Cleanup: {cleanup_pct:6.2}% {} | {} | Deleted files: {} / {}",
                     fmt_bytes_col_10(removed.bytes),
-                    fmt_speed_bps_aligned(speed_bps),
+                    fmt_rate_col(speed_bps),
                     format_number(removed.files),
                     format_number(expected_files)
                 );
             } else {
                 println!(
-                    "Cleanup: ---% {} | Speed: {}/s | Deleted files: {}",
+                    "Cleanup: ---% {} | {} | Deleted files: {}",
                     fmt_bytes_col_10(removed.bytes),
-                    fmt_speed_bps_aligned(speed_bps),
+                    fmt_rate_col(speed_bps),
                     format_number(removed.files)
                 );
             }
@@ -1240,7 +1946,11 @@ fn prune_move_source_duplicates(
                 return removed;
             }
 
-            for ent in WalkDir::new(src_root).into_iter().filter_map(Result::ok) {
+            for ent in WalkDir::new(src_root)
+                .skip_hidden(false)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
                 let p = ent.path();
                 if p == src_root {
                     continue;
@@ -1394,18 +2104,28 @@ fn pre_scan_directory(
         type FastReduce = (
             u64,
             u64,
+            u64,
             bool,
             HashMap<String, (bool, bool)>,
             Vec<String>,
             Vec<ManifestFileEntry>,
         );
-        let (add_files, planned_bytes, has_itemized, reduced_top_states, mut manifest_dirs, mut manifest_copy_files): FastReduce =
+        let (
+            add_files,
+            add_dirs_desc,
+            planned_bytes,
+            has_itemized,
+            reduced_top_states,
+            mut manifest_dirs,
+            mut manifest_copy_files,
+        ): FastReduce =
             WalkDir::new(src_root)
+            .skip_hidden(false)
             .into_iter()
             .filter_map(Result::ok)
             .par_bridge()
             .fold(
-                || (0, 0, false, HashMap::new(), Vec::new(), Vec::new()),
+                || (0, 0, 0, false, HashMap::new(), Vec::new(), Vec::new()),
                 |mut acc, ent| {
                     if ent.depth() == 0 {
                         return acc;
@@ -1415,12 +2135,12 @@ fn pre_scan_directory(
                         return acc;
                     }
 
-                    acc.2 = true;
+                    acc.3 = true;
 
                     if !include_root && ent.depth() == 1 {
                         let top = ent.file_name().to_string_lossy().to_string();
                         if !top.is_empty() {
-                            merge_top_state(&mut acc.3, top, true, fty.is_dir());
+                            merge_top_state(&mut acc.4, top, true, fty.is_dir());
                         }
                     }
 
@@ -1429,7 +2149,7 @@ fn pre_scan_directory(
                             let rel = normalize_rel(rel_path);
                             if !rel.is_empty() {
                                 if fty.is_dir() {
-                                    acc.4.push(rel);
+                                    acc.5.push(rel);
                                 } else if fty.is_file() || fty.is_symlink() {
                                     let mut sz = 0;
                                     if fty.is_file() {
@@ -1439,7 +2159,7 @@ fn pre_scan_directory(
                                     } else if let Ok(md) = fs::symlink_metadata(ent.path()) {
                                         sz = md.len();
                                     }
-                                    acc.5.push(ManifestFileEntry { rel, size: sz });
+                                    acc.6.push(ManifestFileEntry { rel, size: sz });
                                 }
                             }
                         }
@@ -1449,30 +2169,38 @@ fn pre_scan_directory(
                         acc.0 += 1;
                         if !preview_lite {
                             if let Ok(md) = ent.metadata() {
-                                acc.1 += md.len();
+                                acc.2 += md.len();
                             }
                         }
+                    } else if fty.is_dir() {
+                        acc.1 += 1;
                     }
 
                     acc
                 },
             )
             .reduce(
-                || (0, 0, false, HashMap::new(), Vec::new(), Vec::new()),
+                || (0, 0, 0, false, HashMap::new(), Vec::new(), Vec::new()),
                 |mut a, b| {
                     a.0 += b.0;
                     a.1 += b.1;
-                    a.2 = a.2 || b.2;
-                    for (k, (is_added, is_dir)) in b.3 {
-                        merge_top_state(&mut a.3, k, is_added, is_dir);
+                    a.2 += b.2;
+                    a.3 = a.3 || b.3;
+                    for (k, (is_added, is_dir)) in b.4 {
+                        merge_top_state(&mut a.4, k, is_added, is_dir);
                     }
-                    a.4.extend(b.4);
                     a.5.extend(b.5);
+                    a.6.extend(b.6);
                     a
                 },
             );
 
         out.add_files = add_files;
+        let root_new_dir = u64::from(include_root && !src_base.is_empty());
+        out.add_dirs = add_dirs_desc.saturating_add(root_new_dir);
+        out.total_dirs = Some(out.add_dirs);
+        out.mod_dirs = 0;
+        out.unaffected_dirs = 0;
         out.total_regular_files = Some(add_files);
         out.total_regular_bytes = if preview_lite { None } else { Some(planned_bytes) };
         out.planned_bytes = planned_bytes;
@@ -1545,6 +2273,9 @@ fn pre_scan_directory(
     out.total_regular_files = Some(files.iter().filter(|(_, _, _, is_symlink)| !*is_symlink).count() as u64);
     out.total_regular_bytes = Some(files.iter().filter(|(_, _, _, is_symlink)| !*is_symlink).map(|(_, _, size, _)| *size).sum());
     let source_rel_files: HashSet<String> = files.iter().map(|(rel, _, _, _)| rel.clone()).collect();
+    let source_rel_dirs: HashSet<String> = dirs.iter().cloned().collect();
+    let root_new_dir = include_root && !destination_root.is_dir();
+    out.total_dirs = Some(dirs.len() as u64 + u64::from(include_root));
     let mut top_states: HashMap<String, (bool, bool)> = HashMap::new();
     let mut manifest_dirs = if build_manifest { Some(dirs.clone()) } else { None };
 
@@ -1597,6 +2328,7 @@ fn pre_scan_directory(
         TopMap,
         Vec<ManifestFileEntry>,
         Vec<ManifestFileEntry>,
+        HashSet<String>,
     );
     let has_missing_subtrees = !missing_dir_prefixes.is_empty();
     let (
@@ -1607,10 +2339,11 @@ fn pre_scan_directory(
         reduced_top_states,
         mut manifest_copy_files,
         mut manifest_identical_files,
+        mut changed_parent_dirs,
     ): FileReduce = files
         .par_iter()
         .fold(
-            || (0, 0, 0, Vec::new(), HashMap::new(), Vec::new(), Vec::new()),
+            || (0, 0, 0, Vec::new(), HashMap::new(), Vec::new(), Vec::new(), HashSet::new()),
             |mut acc, (rel, src_file, size, is_symlink)| {
                 let (dst_file, display_rel) = map_dir_dest(include_root, &src_base, rel, dst_base);
                 let change = if destination_missing {
@@ -1652,6 +2385,7 @@ fn pre_scan_directory(
                     } else if let Some((top, is_dir)) = top_name_from_display(&display_rel, false) {
                         merge_top_state(&mut acc.4, top, matches!(kind, ChangeKind::NewFile), is_dir);
                     }
+                    add_parent_dir_chain(rel, include_root, &mut acc.7);
                 } else if build_manifest {
                     acc.6.push(ManifestFileEntry {
                         rel: rel.clone(),
@@ -1662,7 +2396,7 @@ fn pre_scan_directory(
             },
         )
         .reduce(
-            || (0, 0, 0, Vec::new(), HashMap::new(), Vec::new(), Vec::new()),
+            || (0, 0, 0, Vec::new(), HashMap::new(), Vec::new(), Vec::new(), HashSet::new()),
             |mut a, b| {
                 a.0 += b.0;
                 a.1 += b.1;
@@ -1673,6 +2407,7 @@ fn pre_scan_directory(
                 }
                 a.5.extend(b.5);
                 a.6.extend(b.6);
+                a.7.extend(b.7);
                 a
             },
         );
@@ -1689,6 +2424,34 @@ fn pre_scan_directory(
         let unaffected_by_overlap = dest_total_files.saturating_sub(source_not_new);
         out.unaffected_files = unaffected_by_scan.max(unaffected_by_overlap);
     }
+
+    out.add_dirs = missing_dir_prefixes.len() as u64 + u64::from(root_new_dir);
+    for rel in &missing_dir_prefixes {
+        add_parent_dir_chain(rel, include_root, &mut changed_parent_dirs);
+    }
+    let mod_dirs_count = changed_parent_dirs
+        .iter()
+        .filter(|rel| {
+            if rel.is_empty() {
+                include_root && !root_new_dir
+            } else {
+                source_rel_dirs.contains(rel.as_str()) && !missing_dir_prefixes.contains(rel.as_str())
+            }
+        })
+        .count() as u64;
+    let total_dirs = out.total_dirs.unwrap_or(0);
+    out.mod_dirs = mod_dirs_count.min(total_dirs.saturating_sub(out.add_dirs));
+    if destination_missing {
+        out.unaffected_dirs = 0;
+    } else {
+        let (dest_total_dirs, unaffected_dirs_by_scan) =
+            destination_dir_counts(&destination_root, &source_rel_dirs);
+        let source_dir_total_no_root = dirs.len() as u64;
+        let source_dirs_not_new = source_dir_total_no_root.saturating_sub(missing_dir_prefixes.len() as u64);
+        let unaffected_dirs_by_overlap = dest_total_dirs.saturating_sub(source_dirs_not_new);
+        out.unaffected_dirs = unaffected_dirs_by_scan.max(unaffected_dirs_by_overlap);
+    }
+
     if out.add_files > 0 || out.mod_files > 0 {
         out.has_itemized_changes = true;
     }
@@ -1756,6 +2519,7 @@ fn pre_scan_file(src_mnt: &Path, dst_path: &str, dst_obj_kind: DstObjKind) -> Pr
     };
     out.total_regular_files = Some(if src_is_symlink { 0 } else { 1 });
     out.total_regular_bytes = Some(size);
+    out.total_dirs = Some(0);
 
     let src_name = src_mnt
         .file_name()
@@ -1939,14 +2703,21 @@ fn run_rsync_transfer(
                 rc: 1,
                 bytes_done: 0,
                 elapsed_s: 0.0,
+                io_read_bytes: None,
+                io_write_bytes: None,
             }
         }
     };
 
     let transfer_start = Instant::now();
+    print_transfer_columns_header();
     let mut done_bytes: u64 = 0;
     let mut last_report_bytes: u64 = 0;
     let mut last_report = transfer_start;
+    let mut io_window = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let _ = io_window.sample();
+    let (io_start_read, io_start_write) = io_window.current_totals();
+    let mut last_io_rates = DeviceIoRates::default();
 
     let (event_tx, event_rx) = mpsc::channel::<RsyncStreamEvent>();
     let stdout_handle = child
@@ -1959,20 +2730,25 @@ fn run_rsync_transfer(
         .map(|stderr| spawn_rsync_stderr_reader(stderr, event_tx.clone()));
     drop(event_tx);
 
-    let print_progress = |done: u64, speed_bps: f64| {
+    let print_progress = |done: u64, speed_bps: f64, io_rates: DeviceIoRates, elapsed_s: f64| {
+        let timer = fmt_hms_tenths(elapsed_s);
         if planned_bytes > 0 {
             let pct = (done as f64 * 100.0 / planned_bytes as f64).min(100.0);
             println!(
-                "Progress: {pct:6.2}% {} / {} | Speed: {}/s",
+                "{timer} {pct:6.2}% {} / {} | {} | {} {}",
                 fmt_bytes_col_10(done),
                 format_bytes_binary(planned_bytes, 2),
-                fmt_speed_bps_aligned(speed_bps)
+                fmt_rate_col(speed_bps),
+                fmt_rate_col_opt(io_rates.src_read_bps),
+                fmt_rate_col_opt(io_rates.dst_write_bps),
             );
         } else {
             println!(
-                "Progress: ---% {} | Speed: {}/s",
+                "{timer} ---% {} | {} | {} {}",
                 fmt_bytes_col_10(done),
-                fmt_speed_bps_aligned(speed_bps)
+                fmt_rate_col(speed_bps),
+                fmt_rate_col_opt(io_rates.src_read_bps),
+                fmt_rate_col_opt(io_rates.dst_write_bps),
             );
         }
     };
@@ -1990,10 +2766,11 @@ fn run_rsync_transfer(
         }
 
         let now = Instant::now();
-        if now.duration_since(last_report) >= Duration::from_secs(1) {
+        if now.duration_since(last_report) >= Duration::from_millis(500) {
             let dt = now.duration_since(last_report).as_secs_f64().max(1e-6);
             let speed = done_bytes.saturating_sub(last_report_bytes) as f64 / dt;
-            print_progress(done_bytes, speed);
+            last_io_rates = io_window.sample();
+            print_progress(done_bytes, speed, last_io_rates, now.duration_since(transfer_start).as_secs_f64());
             last_report_bytes = done_bytes;
             last_report = now;
         }
@@ -2036,19 +2813,31 @@ fn run_rsync_transfer(
             final_done as f64 / now.duration_since(transfer_start).as_secs_f64().max(1e-6)
         };
         println!(
-            "Progress: {pct:6.2}% {} / {} | Speed: {}/s",
+            "{} {pct:6.2}% {} / {} | {} | {} {}",
+            fmt_hms_tenths(now.duration_since(transfer_start).as_secs_f64()),
             fmt_bytes_col_10(final_done),
             format_bytes_binary(planned_bytes, 2),
-            fmt_speed_bps_aligned(final_speed)
+            fmt_rate_col(final_speed),
+            fmt_rate_col_opt(last_io_rates.src_read_bps),
+            fmt_rate_col_opt(last_io_rates.dst_write_bps),
         );
     } else {
-        println!("Progress: ---% {} | Speed: {}/s", fmt_bytes_col_10(final_done), fmt_speed_bps_aligned(0.0));
+        println!(
+            "{} ---% {} | {} | {} {}",
+            fmt_hms_tenths(transfer_start.elapsed().as_secs_f64()),
+            fmt_bytes_col_10(final_done),
+            fmt_rate_col(0.0),
+            fmt_rate_col_opt(last_io_rates.src_read_bps),
+            fmt_rate_col_opt(last_io_rates.dst_write_bps),
+        );
     }
 
     TransferOutcome {
         rc,
         bytes_done: final_done,
         elapsed_s: transfer_start.elapsed().as_secs_f64(),
+        io_read_bytes: counter_delta(io_start_read, io_window.current_totals().0),
+        io_write_bytes: counter_delta(io_start_write, io_window.current_totals().1),
     }
 }
 
@@ -2059,36 +2848,59 @@ fn run_rust_transfer(
     _is_move: bool,
     planned_bytes: u64,
     manifest: Option<&TransferManifest>,
+    media: MediaKind,
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
+    let copy_buf_bytes = copy_chunk_bytes_for_media(media);
+    let inflight_limiter = inflight_max_bytes_for_media(media).map(InflightWriteLimiter::new).map(Arc::new);
     let transfer_start = Instant::now();
+    print_transfer_columns_header();
+    let io_window_for_avg = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let (io_start_read, io_start_write) = io_window_for_avg.current_totals();
+    let transfer_start_for_ticker = transfer_start;
+    let src_path_for_ticker = src_path.to_string();
+    let dst_path_for_ticker = dst_path.to_string();
 
     let done_for_ticker = Arc::clone(&done);
+    let io_rates_shared = Arc::new(Mutex::new(DeviceIoRates::default()));
+    let io_rates_for_ticker = Arc::clone(&io_rates_shared);
     let (ticker_stop_tx, ticker_stop_rx) = mpsc::channel::<()>();
     let ticker = thread::spawn(move || {
         let mut last_report = Instant::now();
         let mut last_report_bytes: u64 = 0;
+        let mut io_window = DeviceIoWindow::from_transfer_paths(&src_path_for_ticker, &dst_path_for_ticker);
+        let _ = io_window.sample();
         loop {
-            match ticker_stop_rx.recv_timeout(Duration::from_secs(1)) {
+            match ticker_stop_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
                     let done_bytes = done_for_ticker.load(Ordering::Relaxed);
                     let dt = now.duration_since(last_report).as_secs_f64().max(1e-6);
                     let speed = done_bytes.saturating_sub(last_report_bytes) as f64 / dt;
+                    let io_rates = io_window.sample();
+                    if let Ok(mut g) = io_rates_for_ticker.lock() {
+                        *g = io_rates;
+                    }
                     if planned_bytes > 0 {
                         let pct = (done_bytes as f64 * 100.0 / planned_bytes as f64).min(100.0);
                         println!(
-                            "Progress: {pct:6.2}% {} / {} | Speed: {}/s",
+                            "{} {pct:6.2}% {} / {} | {} | {} {}",
+                            fmt_hms_tenths(now.duration_since(transfer_start_for_ticker).as_secs_f64()),
                             fmt_bytes_col_10(done_bytes),
                             format_bytes_binary(planned_bytes, 2),
-                            fmt_speed_bps_aligned(speed)
+                            fmt_rate_col(speed),
+                            fmt_rate_col_opt(io_rates.src_read_bps),
+                            fmt_rate_col_opt(io_rates.dst_write_bps),
                         );
                     } else {
                         println!(
-                            "Progress: ---% {} | Speed: {}/s",
+                            "{} ---% {} | {} | {} {}",
+                            fmt_hms_tenths(now.duration_since(transfer_start_for_ticker).as_secs_f64()),
                             fmt_bytes_col_10(done_bytes),
-                            fmt_speed_bps_aligned(speed)
+                            fmt_rate_col(speed),
+                            fmt_rate_col_opt(io_rates.src_read_bps),
+                            fmt_rate_col_opt(io_rates.dst_write_bps),
                         );
                     }
                     last_report = now;
@@ -2103,27 +2915,37 @@ fn run_rust_transfer(
             let final_done = done.load(Ordering::Relaxed);
             let elapsed = transfer_start.elapsed().as_secs_f64().max(1e-6);
             let final_speed = final_done as f64 / elapsed;
+            let final_io_rates = io_rates_shared.lock().map(|g| *g).unwrap_or_default();
             if planned_bytes > 0 {
                 let pct = (final_done as f64 * 100.0 / planned_bytes as f64).min(100.0);
                 println!(
-                    "Progress: {pct:6.2}% {} / {} | Speed: {}/s",
+                    "{} {pct:6.2}% {} / {} | {} | {} {}",
+                    fmt_hms_tenths(elapsed),
                     fmt_bytes_col_10(final_done),
                     format_bytes_binary(planned_bytes, 2),
-                    fmt_speed_bps_aligned(final_speed)
+                    fmt_rate_col(final_speed),
+                    fmt_rate_col_opt(final_io_rates.src_read_bps),
+                    fmt_rate_col_opt(final_io_rates.dst_write_bps),
                 );
             } else {
                 println!(
-                    "Progress: ---% {} | Speed: {}/s",
+                    "{} ---% {} | {} | {} {}",
+                    fmt_hms_tenths(elapsed),
                     fmt_bytes_col_10(final_done),
-                    fmt_speed_bps_aligned(final_speed)
+                    fmt_rate_col(final_speed),
+                    fmt_rate_col_opt(final_io_rates.src_read_bps),
+                    fmt_rate_col_opt(final_io_rates.dst_write_bps),
                 );
             }
             let _ = ticker_stop_tx.send(());
             let _ = ticker.join();
+            let (io_end_read, io_end_write) = io_window_for_avg.current_totals();
             return TransferOutcome {
                 rc: $rc,
                 bytes_done: final_done,
                 elapsed_s: elapsed,
+                io_read_bytes: counter_delta(io_start_read, io_end_read),
+                io_write_bytes: counter_delta(io_start_write, io_end_write),
             };
         }};
     }
@@ -2152,7 +2974,8 @@ fn run_rust_transfer(
                 Err(_) => true,
             };
             if needs_copy {
-                if copy_file_preserve_with_progress(src, dst, |n| {
+                let _permit = acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
+                if copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
                     done.fetch_add(n, Ordering::Relaxed);
                 })
                 .is_err()
@@ -2201,7 +3024,9 @@ fn run_rust_transfer(
                         if src_md.file_type().is_symlink() {
                             copy_symlink(&src_file, &dst_item).is_ok()
                         } else if src_md.is_file() {
-                            copy_file_preserve_with_progress(&src_file, &dst_item, |n| {
+                            let _permit =
+                                acquire_file_write_permit(inflight_limiter.as_ref(), src_md.len(), media);
+                            copy_file_preserve_with_progress_buf(&src_file, &dst_item, copy_buf_bytes, |n| {
                                 done.fetch_add(n, Ordering::Relaxed);
                             })
                             .is_ok()
@@ -2215,6 +3040,7 @@ fn run_rust_transfer(
                 }
             } else {
                 let mut entries: Vec<PathBuf> = WalkDir::new(src_root)
+                    .skip_hidden(false)
                     .into_iter()
                     .filter_map(Result::ok)
                     .map(|e| e.path().to_path_buf())
@@ -2252,7 +3078,8 @@ fn run_rust_transfer(
                         Err(_) => true,
                     };
                     if needs_copy {
-                        if copy_file_preserve_with_progress(&p, &dst_item, |n| {
+                        let _permit = acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
+                        if copy_file_preserve_with_progress_buf(&p, &dst_item, copy_buf_bytes, |n| {
                             done.fetch_add(n, Ordering::Relaxed);
                         })
                         .is_err()
@@ -3448,9 +4275,13 @@ fn real_main() -> i32 {
     let planned_bytes_exact = prescan.planned_bytes_exact;
     let total_regular_files = prescan.total_regular_files;
     let total_regular_bytes = prescan.total_regular_bytes;
+    let total_dirs = prescan.total_dirs;
     let add_files = prescan.add_files;
     let mod_files = prescan.mod_files;
     let unaffected_files = prescan.unaffected_files;
+    let add_dirs = prescan.add_dirs;
+    let mod_dirs = prescan.mod_dirs;
+    let unaffected_dirs = prescan.unaffected_dirs;
     let transfer_manifest = prescan.transfer_manifest;
     let mut display_change_preview = prescan.change_preview.clone();
     let has_itemized_changes = prescan.has_itemized_changes;
@@ -3686,10 +4517,15 @@ fn real_main() -> i32 {
     } else {
         0
     };
+    let likely_cleanup_dirs = if is_move && !source_already_in_destination {
+        total_dirs.unwrap_or(0)
+    } else {
+        0
+    };
 
-    if let Some(total_regular) = total_regular_files {
+    let file_row = total_regular_files.map(|total_regular| {
         let identical_files = total_regular.saturating_sub(add_files + mod_files);
-        let deleted_source_files = if is_move && !source_already_in_destination {
+        let deleted_src_files = if is_move && !source_already_in_destination {
             if likely_cleanup_files > 0 {
                 likely_cleanup_files
             } else {
@@ -3702,15 +4538,70 @@ fn real_main() -> i32 {
             .as_ref()
             .map(|p| count_regular_files_any(p))
             .unwrap_or(0);
+        (
+            add_files,
+            mod_files,
+            identical_files,
+            unaffected_files,
+            deleted_src_files,
+            deleted_dest_files,
+        )
+    });
+    let dir_row = total_dirs.map(|total_source_dirs| {
+        let identical_dirs = total_source_dirs.saturating_sub(add_dirs + mod_dirs);
+        let deleted_src_dirs = if is_move && !source_already_in_destination {
+            likely_cleanup_dirs
+        } else {
+            0
+        };
+        let deleted_dest_dirs = overwrite_target_path
+            .as_ref()
+            .map(|p| count_directories_any(p, true))
+            .unwrap_or(0);
+        (
+            add_dirs,
+            mod_dirs,
+            identical_dirs,
+            unaffected_dirs,
+            deleted_src_dirs,
+            deleted_dest_dirs,
+        )
+    });
+    if file_row.is_some() || dir_row.is_some() {
         println!(
-            "Regular files: New: {} | Modified: {} | Identical: {} | Unaffected: {} | Deleted (source): {} | Deleted (dest): {}",
-            format_number(add_files),
-            format_number(mod_files),
-            format_number(identical_files),
-            format_number(unaffected_files),
-            format_number(deleted_source_files),
-            format_number(deleted_dest_files)
+            "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
+            "Type",
+            "New",
+            "Modified",
+            "Identical",
+            "Unaffected",
+            "Deleted (src)",
+            "Deleted (dest)"
         );
+        if let Some((new_v, mod_v, identical_v, unaffected_v, deleted_src_v, deleted_dest_v)) = file_row {
+            println!(
+                "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
+                "Files",
+                format_number(new_v),
+                format_number(mod_v),
+                format_number(identical_v),
+                format_number(unaffected_v),
+                format_number(deleted_src_v),
+                format_number(deleted_dest_v)
+            );
+        }
+        if let Some((new_v, mod_v, identical_v, unaffected_v, deleted_src_v, deleted_dest_v)) = dir_row {
+            println!(
+                "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
+                "Dirs",
+                format_number(new_v),
+                format_number(mod_v),
+                format_number(identical_v),
+                format_number(unaffected_v),
+                format_number(deleted_src_v),
+                format_number(deleted_dest_v)
+            );
+        }
     }
 
     if planned_bytes_exact {
@@ -3799,15 +4690,54 @@ fn real_main() -> i32 {
         None
     };
 
+    let fast_rename_possible = maybe_fast_rename_target
+        .as_ref()
+        .map(|rename_target| {
+            can_fast_rename_same_fs(&src_mnt, rename_target)
+                && !rename_target.exists()
+                && *rename_target != src_mnt
+        })
+        .unwrap_or(false);
+
+    if planned_bytes > 0 && !fast_rename_possible {
+        match destination_available_bytes(&dst_mnt) {
+            Ok((available_bytes, probe_path)) => {
+                if available_bytes < planned_bytes {
+                    let msg = format!(
+                        "Insufficient free space on destination filesystem (probe: {}). Need: {} ({}), available: {} ({}).",
+                        probe_path.display(),
+                        format_number(planned_bytes),
+                        format_bytes_binary(planned_bytes, 2),
+                        format_number(available_bytes),
+                        format_bytes_binary(available_bytes, 2)
+                    );
+                    if overwrite_target_path.is_some() && !backup_requested && !overwrite_parent_from_child {
+                        log(
+                            requested_mode,
+                            &format!(
+                                "{} Continuing because overwrite will remove destination data before transfer.",
+                                msg
+                            ),
+                            LogLevel::Warn,
+                        );
+                    } else {
+                        log(requested_mode, &msg, LogLevel::Error);
+                        return 1;
+                    }
+                }
+            }
+            Err(err) => {
+                log(
+                    requested_mode,
+                    &format!("Could not determine destination free space: {err}"),
+                    LogLevel::Warn,
+                );
+            }
+        }
+    }
+
     if let Some(rename_target) = maybe_fast_rename_target {
-        let same_parent_dev = src_mnt
-            .parent()
-            .and_then(|p| fs::metadata(p).ok())
-            .map(|m| m.dev())
-            .zip(rename_target.parent().and_then(|p| fs::metadata(p).ok()).map(|m| m.dev()))
-            .map(|(a, b)| a == b)
-            .unwrap_or(false);
-        if same_parent_dev && !rename_target.exists() && rename_target != src_mnt {
+        if fast_rename_possible {
             if fs::rename(&src_mnt, &rename_target).is_ok() {
                 log(
                     requested_mode,
@@ -3827,6 +4757,8 @@ fn real_main() -> i32 {
     if use_sudo {
         let _ = Command::new("sudo").arg("-v").status();
     }
+
+    prefer_hdd_scheduler_for_paths(&[&src_mnt, &dst_mnt], use_sudo, requested_mode);
 
     let backend_name = match backend {
         TransferBackend::Rust => "rust",
@@ -3861,6 +4793,10 @@ fn real_main() -> i32 {
     let start_ts = Instant::now();
     let mut transferred_bytes_total: u64 = 0;
     let mut transferred_elapsed_total_s: f64 = 0.0;
+    let mut transfer_read_bytes_total: u64 = 0;
+    let mut transfer_write_bytes_total: u64 = 0;
+    let mut transfer_read_elapsed_s: f64 = 0.0;
+    let mut transfer_write_elapsed_s: f64 = 0.0;
     let mut deleted_cleanup_total = DeleteCleanupOutcome::default();
     let mut deleted_cleanup_elapsed_s: f64 = 0.0;
     let mut cleanup_notice_emitted = false;
@@ -3911,10 +4847,19 @@ fn real_main() -> i32 {
                         is_move,
                         planned_bytes,
                         transfer_manifest.as_ref(),
+                        media,
                     ),
                 };
                 transferred_bytes_total += transfer.bytes_done;
                 transferred_elapsed_total_s += transfer.elapsed_s;
+                if let Some(rb) = transfer.io_read_bytes {
+                    transfer_read_bytes_total = transfer_read_bytes_total.saturating_add(rb);
+                    transfer_read_elapsed_s += transfer.elapsed_s;
+                }
+                if let Some(wb) = transfer.io_write_bytes {
+                    transfer_write_bytes_total = transfer_write_bytes_total.saturating_add(wb);
+                    transfer_write_elapsed_s += transfer.elapsed_s;
+                }
                 let rc_transfer = transfer.rc;
 
                 if rc_transfer == 0 || rc_transfer == 24 {
@@ -4073,10 +5018,19 @@ fn real_main() -> i32 {
                 is_move,
                 planned_bytes,
                 transfer_manifest.as_ref(),
+                media,
             ),
         };
         transferred_bytes_total += transfer.bytes_done;
         transferred_elapsed_total_s += transfer.elapsed_s;
+        if let Some(rb) = transfer.io_read_bytes {
+            transfer_read_bytes_total = transfer_read_bytes_total.saturating_add(rb);
+            transfer_read_elapsed_s += transfer.elapsed_s;
+        }
+        if let Some(wb) = transfer.io_write_bytes {
+            transfer_write_bytes_total = transfer_write_bytes_total.saturating_add(wb);
+            transfer_write_elapsed_s += transfer.elapsed_s;
+        }
         let rc_transfer = transfer.rc;
 
         if is_move && (rc_transfer == 0 || rc_transfer == 24) {
@@ -4160,26 +5114,48 @@ fn real_main() -> i32 {
     } else {
         0.0
     };
+    let avg_read_bps = if transfer_read_elapsed_s > 0.0 {
+        transfer_read_bytes_total as f64 / transfer_read_elapsed_s
+    } else {
+        0.0
+    };
+    let avg_write_bps = if transfer_write_elapsed_s > 0.0 {
+        transfer_write_bytes_total as f64 / transfer_write_elapsed_s
+    } else {
+        0.0
+    };
     let total_work_bytes = transferred_bytes_total.saturating_add(deleted_cleanup_total.bytes);
     let avg_total_bps = if total_elapsed_s > 0.0 {
         total_work_bytes as f64 / total_elapsed_s
     } else {
         0.0
     };
-    if transferred_elapsed_total_s > 0.0 {
-        print_summary_rate_line(
-            "Average transfer speed",
+    if is_move {
+        let avg_delete_bps = if deleted_cleanup_elapsed_s > 0.0 {
+            deleted_cleanup_total.bytes as f64 / deleted_cleanup_elapsed_s.max(1e-6)
+        } else {
+            0.0
+        };
+        print_move_speed_summary(
             avg_transfer_bps,
+            avg_read_bps,
+            avg_write_bps,
             transferred_elapsed_total_s,
-            false,
+            avg_delete_bps,
+            deleted_cleanup_elapsed_s,
+            total_elapsed_s,
         );
+    } else {
+        if transferred_elapsed_total_s > 0.0 {
+            print_summary_rate_line(
+                "Average transfer speed",
+                avg_transfer_bps,
+                transferred_elapsed_total_s,
+                false,
+            );
+        }
+        print_summary_rate_line("Overall throughput", avg_total_bps, total_elapsed_s, true);
     }
-    if deleted_cleanup_total.files > 0 {
-        let secs = deleted_cleanup_elapsed_s.max(1e-6);
-        let bps = deleted_cleanup_total.bytes as f64 / secs;
-        print_summary_rate_line("Average delete speed", bps, deleted_cleanup_elapsed_s, false);
-    }
-    print_summary_rate_line("Overall throughput", avg_total_bps, total_elapsed_s, true);
     result
 }
 

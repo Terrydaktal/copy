@@ -69,6 +69,7 @@ copy/
 
 - `SOURCE/*` is treated as contents-only mode (same as `-c` on `SOURCE/`).
 - Parent/self-overlap safety is enforced.
+- Local mode performs a destination free-space preflight using filesystem stats before transfer (no sudo required).
 - Move mode cleans empty source directories after transferred files are removed.
 - Mode line and preview output remain compatible with the previous CLI behavior.
 
