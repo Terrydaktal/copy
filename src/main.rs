@@ -5,10 +5,13 @@ use nix::sys::stat::{major, minor};
 use nix::sys::statvfs::statvfs;
 use rayon::prelude::*;
 use regex::Regex;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -103,7 +106,6 @@ enum ChangeKind {
     NewFile,
     ModFile,
     NewDir,
-    ModDir,
     RemovedDir,
 }
 
@@ -134,10 +136,10 @@ struct PreScan {
     total_dirs: Option<u64>,
     add_files: u64,
     mod_files: u64,
-    unaffected_files: u64,
+    uncollided_files: u64,
     add_dirs: u64,
     mod_dirs: u64,
-    unaffected_dirs: u64,
+    uncollided_dirs: u64,
     change_preview: Vec<ChangeItem>,
     has_itemized_changes: bool,
     transfer_manifest: Option<TransferManifest>,
@@ -153,10 +155,10 @@ impl Default for PreScan {
             total_dirs: None,
             add_files: 0,
             mod_files: 0,
-            unaffected_files: 0,
+            uncollided_files: 0,
             add_dirs: 0,
             mod_dirs: 0,
-            unaffected_dirs: 0,
+            uncollided_dirs: 0,
             change_preview: Vec::new(),
             has_itemized_changes: false,
             transfer_manifest: None,
@@ -174,7 +176,8 @@ struct CliArgs {
     overwrite: bool,
     contents_only: bool,
     backup: bool,
-    showall: bool,
+    tree_depth: Option<usize>,
+    tree_trunc: usize,
     preview_only: bool,
     preview_lite: bool,
 }
@@ -342,7 +345,7 @@ fn fmt_rate_col_opt(bps: Option<f64>) -> String {
 
 fn print_transfer_columns_header() {
     println!(
-        "{:<10} {:>7} {:>23} | {:>14} | {:>14} {:>14}",
+        "{:<10} {:>7} {:>23} {:>14} {:>14} {:>14}",
         "Time",
         "%",
         "Transferred / Total",
@@ -485,6 +488,7 @@ fn count_regular_files_any(path: &Path) -> u64 {
         return 0;
     }
     WalkDir::new(path)
+        .sort(false)
         .skip_hidden(false)
         .into_iter()
         .filter_map(Result::ok)
@@ -1220,19 +1224,21 @@ fn destination_file_counts(destination_root: &Path, source_rel_files: &HashSet<S
     }
 
     WalkDir::new(destination_root)
+        .sort(false)
         .skip_hidden(false)
+        .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.path().is_file())
-        .fold((0u64, 0u64), |(total, unaffected), e| {
+        .fold((0u64, 0u64), |(total, uncollided), e| {
             let rel = e
                 .path()
                 .strip_prefix(destination_root)
                 .ok()
                 .map(normalize_rel)
                 .unwrap_or_default();
-            let is_unaffected = !rel.is_empty() && !source_rel_files.contains(&rel);
-            (total + 1, unaffected + u64::from(is_unaffected))
+            let is_uncollided = !rel.is_empty() && !source_rel_files.contains(&rel);
+            (total + 1, uncollided + u64::from(is_uncollided))
         })
 }
 
@@ -1241,7 +1247,9 @@ fn count_directories_any(path: &Path, include_root: bool) -> u64 {
         return 0;
     }
     let descendants = WalkDir::new(path)
+        .sort(false)
         .skip_hidden(false)
+        .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_dir() && e.depth() > 0)
@@ -1253,29 +1261,75 @@ fn count_directories_any(path: &Path, include_root: bool) -> u64 {
     }
 }
 
-fn destination_dir_counts(destination_root: &Path, source_rel_dirs: &HashSet<String>) -> (u64, u64) {
+struct DestinationIndex {
+    file_sizes: FxHashMap<String, u64>,
+    dirs: FxHashSet<String>,
+    symlinks: FxHashSet<String>,
+}
+
+impl DestinationIndex {
+    fn path_exists(&self, rel: &str) -> bool {
+        self.file_sizes.contains_key(rel) || self.dirs.contains(rel) || self.symlinks.contains(rel)
+    }
+}
+
+impl Default for DestinationIndex {
+    fn default() -> Self {
+        Self {
+            file_sizes: FxHashMap::default(),
+            dirs: FxHashSet::default(),
+            symlinks: FxHashSet::default(),
+        }
+    }
+}
+
+fn build_destination_index(destination_root: &Path) -> DestinationIndex {
     if !destination_root.is_dir() {
-        return (0, 0);
+        return DestinationIndex::default();
     }
 
-    WalkDir::new(destination_root)
+    let mut file_sizes: FxHashMap<String, u64> = FxHashMap::with_capacity_and_hasher(1024 * 1024, Default::default());
+    let mut dirs: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(65536, Default::default());
+    let mut symlinks: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(4096, Default::default());
+
+    for ent in WalkDir::new(destination_root)
+        .sort(false)
         .skip_hidden(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_dir() && e.depth() > 0)
-        .fold((0u64, 0u64), |(total, unaffected), e| {
-            let rel = e
-                .path()
-                .strip_prefix(destination_root)
-                .ok()
-                .map(normalize_rel)
-                .unwrap_or_default();
-            let is_unaffected = !rel.is_empty() && !source_rel_dirs.contains(&rel);
-            (total + 1, unaffected + u64::from(is_unaffected))
-        })
+    {
+        let rel = ent
+            .path()
+            .strip_prefix(destination_root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if rel.is_empty() {
+            continue;
+        }
+
+        let fty = ent.file_type();
+        if fty.is_file() {
+            let size = ent
+                .metadata()
+                .map(|m| m.len())
+                .unwrap_or_else(|_| fs::symlink_metadata(ent.path()).map(|m| m.len()).unwrap_or(0));
+            file_sizes.insert(rel, size);
+        } else if fty.is_dir() && ent.depth() > 0 {
+            dirs.insert(rel);
+        } else if fty.is_symlink() {
+            symlinks.insert(rel);
+        }
+    }
+
+    DestinationIndex {
+        file_sizes,
+        dirs,
+        symlinks,
+    }
 }
 
-fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut HashSet<String>) {
+fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut FxHashSet<String>) {
     if rel.is_empty() {
         return;
     }
@@ -1304,11 +1358,15 @@ fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut HashSet<String>
 }
 
 fn usage() {
-    eprintln!("usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v] [--preview] [--preview-lite] source destination");
+    eprintln!(
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
+    );
 }
 
 fn print_help() {
-    println!("usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v] [--preview] [--preview-lite] source destination");
+    println!(
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
+    );
     println!();
     println!("Standalone copy/move with preview/progress.");
     println!("Supports local paths and one-sided remote rsync endpoints like user@host:/path or host:/path.");
@@ -1327,17 +1385,23 @@ fn print_help() {
     println!("  -c, --contents-only   Transfer source directory children into destination (like source/*; do not nest source basename).");
     println!("                        In --move mode, source directories are removed if they become empty.");
     println!("  -b, --backup          Create a timestamped backup when destination data will be merged or overwritten.");
-    println!("  -v, --verbose, --showall");
-    println!("                        Show hierarchical preview: up to 5 changed entries per level (modified first), expand only modified folders, and abbreviate remaining new/modified/unchanged/removed counts.");
+    println!("  -L depth              Max depth of preview tree (default: auto-fit deepest level within 27 lines, up to 20).");
+    println!("  -T trunc              Max entries per folder before truncation (default: 25).");
     println!("  --preview             Run preview only (no prompt, no transfer).");
     println!("  --preview-lite        Faster preview-only mode; skips exact byte scan on brand-new destination trees.");
 }
 
 fn parse_args() -> Result<CliArgs, i32> {
-    let mut args = CliArgs::default();
+    let mut args = CliArgs {
+        tree_trunc: 25,
+        ..CliArgs::default()
+    };
     let mut positional: Vec<String> = Vec::new();
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let mut i = 0usize;
 
-    for raw in env::args().skip(1) {
+    while i < argv.len() {
+        let raw = &argv[i];
         match raw.as_str() {
             "-h" | "--help" => {
                 print_help();
@@ -1348,7 +1412,38 @@ fn parse_args() -> Result<CliArgs, i32> {
             "-o" | "--overwrite" => args.overwrite = true,
             "-c" | "--contents-only" => args.contents_only = true,
             "-b" | "--backup" => args.backup = true,
-            "-v" | "--verbose" | "--showall" => args.showall = true,
+            "-L" => {
+                i += 1;
+                if i >= argv.len() {
+                    usage();
+                    eprintln!("copy: error: -L requires an argument");
+                    return Err(1);
+                }
+                match argv[i].parse::<usize>() {
+                    Ok(v) => args.tree_depth = Some(v),
+                    Err(_) => {
+                        usage();
+                        eprintln!("copy: error: -L argument must be a positive integer");
+                        return Err(1);
+                    }
+                }
+            }
+            "-T" => {
+                i += 1;
+                if i >= argv.len() {
+                    usage();
+                    eprintln!("copy: error: -T requires an argument");
+                    return Err(1);
+                }
+                match argv[i].parse::<usize>() {
+                    Ok(v) => args.tree_trunc = v,
+                    Err(_) => {
+                        usage();
+                        eprintln!("copy: error: -T argument must be a positive integer");
+                        return Err(1);
+                    }
+                }
+            }
             "--preview" => args.preview_only = true,
             "--preview-lite" => args.preview_lite = true,
             _ if raw.starts_with('-') => {
@@ -1356,8 +1451,9 @@ fn parse_args() -> Result<CliArgs, i32> {
                 eprintln!("copy: error: unrecognized arguments: {raw}");
                 return Err(1);
             }
-            _ => positional.push(raw),
+            _ => positional.push(raw.clone()),
         }
+        i += 1;
     }
 
     if positional.len() < 2 {
@@ -1385,6 +1481,53 @@ fn run_command_capture(cmd: &[String], sudo: bool) -> io::Result<CmdOutput> {
     })
 }
 
+fn flush_destination_writes(dst_path: &Path, use_sudo: bool, mode: TransferMode) {
+    let target = if dst_path.exists() {
+        if dst_path.is_dir() {
+            dst_path.to_path_buf()
+        } else {
+            dst_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf()
+        }
+    } else {
+        dst_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf()
+    };
+
+    let flush_start = Instant::now();
+    let mut ok = false;
+
+    if use_sudo {
+        let cmd = vec![
+            "sync".to_string(),
+            "-f".to_string(),
+            target.display().to_string(),
+        ];
+        ok = run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false);
+    } else if let Ok(f) = fs::File::open(&target) {
+        let rc = unsafe { nix::libc::syncfs(f.as_raw_fd()) };
+        ok = rc == 0;
+    }
+
+    if !ok {
+        if use_sudo {
+            let cmd = vec!["sync".to_string()];
+            let _ = run_command_capture(&cmd, true);
+        } else {
+            unsafe {
+                nix::libc::sync();
+            }
+        }
+    }
+
+    log(
+        mode,
+        &format!(
+            "Destination flush complete ({}).",
+            fmt_hms_ms(flush_start.elapsed().as_secs_f64())
+        ),
+        LogLevel::Info,
+    );
+}
+
 fn fmt_mode_word(label: &str, active: bool) -> String {
     if active {
         format!("{OKGREEN}{label}{ENDC}")
@@ -1393,10 +1536,14 @@ fn fmt_mode_word(label: &str, active: bool) -> String {
     }
 }
 
-fn print_preview_root_line(preview_root: &Path, highlight_new_leaf: bool) {
+fn print_preview_root_line(preview_root: &Path, highlight_new_leaf: bool, emphasize_non_new: bool) {
     let full = preview_root.display().to_string();
     if !highlight_new_leaf {
-        println!("{WARNING}{}{ENDC}", full);
+        if emphasize_non_new {
+            println!("{WARNING}{}{ENDC}", full);
+        } else {
+            println!("{full}");
+        }
         return;
     }
 
@@ -1947,7 +2094,9 @@ fn prune_move_source_duplicates(
             }
 
             for ent in WalkDir::new(src_root)
+                .sort(false)
                 .skip_hidden(false)
+                .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
                 .into_iter()
                 .filter_map(Result::ok)
             {
@@ -1998,79 +2147,123 @@ fn prune_move_source_duplicates(
 }
 
 fn normalize_rel(path: &Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join("/")
+    let s = path.to_string_lossy();
+    if s.contains('\\') {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
+fn map_dir_dest_path(include_root: bool, src_base: &str, rel: &str, dst_base: &Path) -> PathBuf {
+    if include_root {
+        if rel.is_empty() {
+            dst_base.join(src_base)
+        } else {
+            dst_base.join(src_base).join(rel)
+        }
+    } else if rel.is_empty() {
+        dst_base.to_path_buf()
+    } else {
+        dst_base.join(rel)
+    }
+}
+
+fn map_display_rel(include_root: bool, src_base: &str, rel: &str) -> String {
+    if include_root {
+        if rel.is_empty() {
+            format!("{src_base}/")
+        } else {
+            format!("{src_base}/{rel}")
+        }
+    } else if rel.is_empty() {
+        String::new()
+    } else {
+        rel.to_string()
+    }
 }
 
 fn map_dir_dest(include_root: bool, src_base: &str, rel: &str, dst_base: &Path) -> (PathBuf, String) {
-    if include_root {
-        if rel.is_empty() {
-            (dst_base.join(src_base), format!("{src_base}/"))
-        } else {
-            (dst_base.join(src_base).join(rel), format!("{src_base}/{rel}"))
-        }
-    } else if rel.is_empty() {
-        (dst_base.to_path_buf(), String::new())
-    } else {
-        (dst_base.join(rel), rel.to_string())
-    }
+    (
+        map_dir_dest_path(include_root, src_base, rel, dst_base),
+        map_display_rel(include_root, src_base, rel),
+    )
 }
 
-fn top_name_from_display(display_rel: &str, fallback_is_dir: bool) -> Option<(String, bool)> {
-    let trimmed = display_rel.trim_matches('/');
-    if trimmed.is_empty() {
-        return None;
+fn ensure_dst_file_path<'a>(
+    dst_file: &'a mut Option<PathBuf>,
+    include_root: bool,
+    src_base: &str,
+    rel: &str,
+    dst_base: &Path,
+) -> &'a Path {
+    if dst_file.is_none() {
+        *dst_file = Some(map_dir_dest_path(include_root, src_base, rel, dst_base));
     }
-    let mut parts = trimmed.splitn(2, '/');
-    let top = parts.next()?.to_string();
-    let has_rest = parts.next().is_some();
-    Some((top, has_rest || fallback_is_dir))
+    dst_file.as_deref().expect("destination path should be set")
 }
 
-fn merge_top_state(map: &mut HashMap<String, (bool, bool)>, name: String, is_added: bool, is_dir: bool) {
-    map.entry(name)
-        .and_modify(|(added, dir)| {
-            *added = *added || is_added;
-            *dir = *dir || is_dir;
-        })
-        .or_insert((is_added, is_dir));
-}
-
-fn rel_or_ancestor_in_set(rel: &str, set: &HashSet<String>) -> bool {
-    if rel.is_empty() || set.is_empty() {
-        return false;
-    }
-    if set.contains(rel) {
-        return true;
-    }
-    let mut cur = rel;
-    while let Some(idx) = cur.rfind('/') {
-        cur = &cur[..idx];
-        if set.contains(cur) {
-            return true;
-        }
-    }
-    false
-}
-
-fn parent_rel_in_set(rel: &str, set: &HashSet<String>) -> bool {
+fn parent_rel_in_set(rel: &str, set: &FxHashSet<String>) -> bool {
     if set.is_empty() {
         return false;
     }
     match rel.rfind('/') {
-        Some(idx) => rel_or_ancestor_in_set(&rel[..idx], set),
+        Some(idx) => set.contains(&rel[..idx]),
         None => false,
     }
+}
+
+type SrcScanEntries = (Vec<String>, Vec<(String, Option<PathBuf>, u64, bool)>);
+
+fn scan_source_entries(src_root: &Path) -> SrcScanEntries {
+    // Pre-allocate based on rough estimates to avoid reallocation
+    let mut dirs: Vec<String> = Vec::with_capacity(8192);
+    let mut files: Vec<(String, Option<PathBuf>, u64, bool)> = Vec::with_capacity(65536);
+
+    for ent in WalkDir::new(src_root)
+        .sort(false)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if ent.depth() == 0 {
+            continue;
+        }
+        let fty = ent.file_type();
+        if !fty.is_dir() && !fty.is_file() && !fty.is_symlink() {
+            continue;
+        }
+        let rel = ent
+            .path()
+            .strip_prefix(src_root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if rel.is_empty() {
+            continue;
+        }
+
+        if fty.is_dir() {
+            dirs.push(rel);
+        } else if fty.is_file() {
+            let size = ent.metadata().map(|m| m.len()).unwrap_or_else(|_| {
+                fs::symlink_metadata(ent.path())
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            });
+            files.push((rel, None, size, false));
+        } else if fty.is_symlink() {
+            files.push((rel, Some(ent.path().to_path_buf()), 0, true));
+        }
+    }
+
+    (dirs, files)
 }
 
 fn pre_scan_directory(
     src_path: &str,
     dst_path: &str,
     src_mnt: &Path,
-    collect_detailed: bool,
-    preview_lite: bool,
     build_manifest: bool,
 ) -> PreScan {
     let src_no_trailing = src_path.trim_end_matches('/');
@@ -2091,244 +2284,86 @@ fn pre_scan_directory(
 
     // Strict fast-path for non-verbose preview when destination root is missing:
     // all source content is guaranteed "new", so skip destination path construction/stat checks.
-    if destination_missing && !collect_detailed {
-        let mut out = PreScan::default();
-        out.planned_bytes_exact = !preview_lite;
-        let mut top_states: HashMap<String, (bool, bool)> = HashMap::new();
-
-        if include_root && !src_base.is_empty() {
-            merge_top_state(&mut top_states, src_base.clone(), true, true);
-            out.has_itemized_changes = true;
-        }
-
-        type FastReduce = (
-            u64,
-            u64,
-            u64,
-            bool,
-            HashMap<String, (bool, bool)>,
-            Vec<String>,
-            Vec<ManifestFileEntry>,
-        );
-        let (
-            add_files,
-            add_dirs_desc,
-            planned_bytes,
-            has_itemized,
-            reduced_top_states,
-            mut manifest_dirs,
-            mut manifest_copy_files,
-        ): FastReduce =
-            WalkDir::new(src_root)
-            .skip_hidden(false)
-            .into_iter()
-            .filter_map(Result::ok)
-            .par_bridge()
-            .fold(
-                || (0, 0, 0, false, HashMap::new(), Vec::new(), Vec::new()),
-                |mut acc, ent| {
-                    if ent.depth() == 0 {
-                        return acc;
-                    }
-                    let fty = ent.file_type();
-                    if !fty.is_dir() && !fty.is_file() && !fty.is_symlink() {
-                        return acc;
-                    }
-
-                    acc.3 = true;
-
-                    if !include_root && ent.depth() == 1 {
-                        let top = ent.file_name().to_string_lossy().to_string();
-                        if !top.is_empty() {
-                            merge_top_state(&mut acc.4, top, true, fty.is_dir());
-                        }
-                    }
-
-                    if build_manifest {
-                        if let Ok(rel_path) = ent.path().strip_prefix(src_root) {
-                            let rel = normalize_rel(rel_path);
-                            if !rel.is_empty() {
-                                if fty.is_dir() {
-                                    acc.5.push(rel);
-                                } else if fty.is_file() || fty.is_symlink() {
-                                    let mut sz = 0;
-                                    if fty.is_file() {
-                                        if let Ok(md) = ent.metadata() {
-                                            sz = md.len();
-                                        }
-                                    } else if let Ok(md) = fs::symlink_metadata(ent.path()) {
-                                        sz = md.len();
-                                    }
-                                    acc.6.push(ManifestFileEntry { rel, size: sz });
-                                }
-                            }
-                        }
-                    }
-
-                    if fty.is_file() {
-                        acc.0 += 1;
-                        if !preview_lite {
-                            if let Ok(md) = ent.metadata() {
-                                acc.2 += md.len();
-                            }
-                        }
-                    } else if fty.is_dir() {
-                        acc.1 += 1;
-                    }
-
-                    acc
-                },
-            )
-            .reduce(
-                || (0, 0, 0, false, HashMap::new(), Vec::new(), Vec::new()),
-                |mut a, b| {
-                    a.0 += b.0;
-                    a.1 += b.1;
-                    a.2 += b.2;
-                    a.3 = a.3 || b.3;
-                    for (k, (is_added, is_dir)) in b.4 {
-                        merge_top_state(&mut a.4, k, is_added, is_dir);
-                    }
-                    a.5.extend(b.5);
-                    a.6.extend(b.6);
-                    a
-                },
-            );
-
-        out.add_files = add_files;
-        let root_new_dir = u64::from(include_root && !src_base.is_empty());
-        out.add_dirs = add_dirs_desc.saturating_add(root_new_dir);
-        out.total_dirs = Some(out.add_dirs);
-        out.mod_dirs = 0;
-        out.unaffected_dirs = 0;
-        out.total_regular_files = Some(add_files);
-        out.total_regular_bytes = if preview_lite { None } else { Some(planned_bytes) };
-        out.planned_bytes = planned_bytes;
-        out.has_itemized_changes = out.has_itemized_changes || has_itemized;
-
-        for (k, v) in reduced_top_states {
-            merge_top_state(&mut top_states, k, v.0, v.1);
-        }
-
-        let mut tops: Vec<(String, (bool, bool))> = top_states.into_iter().collect();
-        tops.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, (_is_added, is_dir)) in tops {
-            let kind = if is_dir {
-                ChangeKind::NewDir
-            } else {
-                ChangeKind::NewFile
-            };
-            let rel = if is_dir { format!("{name}/") } else { name };
-            out.change_preview.push(ChangeItem { kind, rel });
-        }
-
-        if build_manifest {
-            manifest_dirs.sort_by(|a, b| {
-                let da = a.bytes().filter(|c| *c == b'/').count();
-                let db = b.bytes().filter(|c| *c == b'/').count();
-                da.cmp(&db).then_with(|| a.cmp(b))
-            });
-            manifest_copy_files.sort_by(|a, b| a.rel.cmp(&b.rel));
-            out.transfer_manifest = Some(TransferManifest {
-                dirs: manifest_dirs,
-                copy_files: manifest_copy_files,
-                identical_files: Vec::new(),
-            });
-        }
-
-        return out;
-    }
-
-    let mut dirs: Vec<String> = Vec::new();
-    let mut files: Vec<(String, PathBuf, u64, bool)> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![src_root.to_path_buf()];
-    while let Some(cur_dir) = stack.pop() {
-        let entries = match fs::read_dir(&cur_dir) {
-            Ok(v) => v,
-            Err(_) => continue,
+    let src_dev = fs::metadata(src_root).ok().map(|m| m.dev());
+    let dst_dev = fs::metadata(&destination_root).ok().map(|m| m.dev());
+    let can_parallel_scans = !destination_missing && src_dev.is_some() && dst_dev.is_some() && src_dev != dst_dev;
+    let (mut dirs, files, destination_index): (Vec<String>, Vec<(String, Option<PathBuf>, u64, bool)>, Option<DestinationIndex>) =
+        if destination_missing {
+            let (d, f) = scan_source_entries(src_root);
+            (d, f, None)
+        } else if can_parallel_scans {
+            std::thread::scope(|scope| {
+                let idx_handle = scope.spawn(|| build_destination_index(&destination_root));
+                let (d, f) = scan_source_entries(src_root);
+                let idx = idx_handle.join().unwrap_or_else(|_| build_destination_index(&destination_root));
+                (d, f, Some(idx))
+            })
+        } else {
+            let (d, f) = scan_source_entries(src_root);
+            let idx = build_destination_index(&destination_root);
+            (d, f, Some(idx))
         };
-        for ent in entries.filter_map(Result::ok) {
-            let p = ent.path();
-            let rel = p.strip_prefix(src_root).map(normalize_rel).unwrap_or_else(|_| String::new());
-            if rel.is_empty() {
-                continue;
-            }
-            let md = match fs::symlink_metadata(&p) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if md.is_dir() {
-                dirs.push(rel);
-                stack.push(p);
-            } else if md.is_file() {
-                files.push((rel, p, md.len(), false));
-            } else if md.file_type().is_symlink() {
-                files.push((rel, p, 0, true));
-            }
-        }
-    }
 
     let mut out = PreScan::default();
     out.planned_bytes_exact = true;
     out.total_regular_files = Some(files.iter().filter(|(_, _, _, is_symlink)| !*is_symlink).count() as u64);
     out.total_regular_bytes = Some(files.iter().filter(|(_, _, _, is_symlink)| !*is_symlink).map(|(_, _, size, _)| *size).sum());
-    let source_rel_files: HashSet<String> = files.iter().map(|(rel, _, _, _)| rel.clone()).collect();
-    let source_rel_dirs: HashSet<String> = dirs.iter().cloned().collect();
+    let source_rel_dirs: FxHashSet<String> = dirs.iter().cloned().collect();
     let root_new_dir = include_root && !destination_root.is_dir();
     out.total_dirs = Some(dirs.len() as u64 + u64::from(include_root));
-    let mut top_states: HashMap<String, (bool, bool)> = HashMap::new();
-    let mut manifest_dirs = if build_manifest { Some(dirs.clone()) } else { None };
 
     if include_root && destination_missing {
         let (dst_root, display_rel) = map_dir_dest(true, &src_base, "", dst_base);
         if !dst_root.is_dir() {
             if !display_rel.is_empty() {
-                if collect_detailed {
-                    out.change_preview.push(ChangeItem {
-                        kind: ChangeKind::NewDir,
-                        rel: display_rel,
-                    });
-                } else if let Some((top, is_dir)) = top_name_from_display(&display_rel, true) {
-                    merge_top_state(&mut top_states, top, true, is_dir);
-                }
+                out.change_preview.push(ChangeItem {
+                    kind: ChangeKind::NewDir,
+                    rel: display_rel,
+                });
                 out.has_itemized_changes = true;
             }
         }
     }
 
-    let mut missing_dir_prefixes: HashSet<String> = HashSet::new();
-    let mut dirs_depth_sorted = dirs.clone();
-    dirs_depth_sorted.sort_by_key(|rel| rel.bytes().filter(|b| *b == b'/').count());
+    let mut missing_dir_prefixes: FxHashSet<String> = FxHashSet::default();
+    dirs.sort_by_key(|rel| rel.bytes().filter(|b| *b == b'/').count());
 
-    for rel in &dirs_depth_sorted {
-        let parent_missing = rel_or_ancestor_in_set(rel, &missing_dir_prefixes);
-        let (dst_dir, display_rel) = map_dir_dest(include_root, &src_base, rel, dst_base);
-        let dir_missing = destination_missing || parent_missing || !dst_dir.is_dir();
+    for rel in &dirs {
+        let parent_missing = match rel.rfind('/') {
+            Some(idx) => missing_dir_prefixes.contains(&rel[..idx]),
+            None => false,
+        };
+        let dir_missing = if destination_missing || parent_missing {
+            true
+        } else if let Some(idx) = destination_index.as_ref() {
+            !idx.dirs.contains(rel.as_str())
+        } else {
+            !map_dir_dest_path(include_root, &src_base, rel, dst_base).is_dir()
+        };
         if dir_missing {
             missing_dir_prefixes.insert(rel.clone());
+            let display_rel = map_display_rel(include_root, &src_base, rel);
             let rel_dir = format!("{display_rel}/").replace("//", "/");
-            if collect_detailed {
-                out.change_preview.push(ChangeItem {
-                    kind: ChangeKind::NewDir,
-                    rel: rel_dir.clone(),
-                });
-            } else if let Some((top, is_dir)) = top_name_from_display(&rel_dir, true) {
-                merge_top_state(&mut top_states, top, true, is_dir);
-            }
+            out.change_preview.push(ChangeItem {
+                kind: ChangeKind::NewDir,
+                rel: rel_dir,
+            });
             out.has_itemized_changes = true;
         }
     }
 
-    type TopMap = HashMap<String, (bool, bool)>;
+    let source_dir_count = dirs.len();
+    let mut manifest_dirs = if build_manifest { Some(dirs) } else { None };
+
     type FileReduce = (
         u64,
         u64,
         u64,
         Vec<ChangeItem>,
-        TopMap,
         Vec<ManifestFileEntry>,
         Vec<ManifestFileEntry>,
-        HashSet<String>,
+        FxHashSet<String>,
+        u64,
     );
     let has_missing_subtrees = !missing_dir_prefixes.is_empty();
     let (
@@ -2336,33 +2371,110 @@ fn pre_scan_directory(
         mod_files,
         planned_bytes,
         detailed_changes,
-        reduced_top_states,
         mut manifest_copy_files,
         mut manifest_identical_files,
         mut changed_parent_dirs,
+        overlap_count,
     ): FileReduce = files
         .par_iter()
         .fold(
-            || (0, 0, 0, Vec::new(), HashMap::new(), Vec::new(), Vec::new(), HashSet::new()),
+            || (
+                0,
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                FxHashSet::default(),
+                0,
+            ),
             |mut acc, (rel, src_file, size, is_symlink)| {
-                let (dst_file, display_rel) = map_dir_dest(include_root, &src_base, rel, dst_base);
+                let dst_idx = destination_index.as_ref();
+                let mut dst_file: Option<PathBuf> = None;
                 let change = if destination_missing {
                     Some(ChangeKind::NewFile)
                 } else if has_missing_subtrees && parent_rel_in_set(rel, &missing_dir_prefixes) {
                     Some(ChangeKind::NewFile)
                 } else if *is_symlink {
-                    match fs::symlink_metadata(&dst_file) {
-                        Ok(dm) if dm.file_type().is_symlink() && symlink_targets_equal(src_file, &dst_file) => None,
-                        Ok(_) => Some(ChangeKind::ModFile),
-                        Err(_) => Some(ChangeKind::NewFile),
+                    if let Some(idx) = dst_idx {
+                        if idx.symlinks.contains(rel.as_str()) {
+                            if symlink_targets_equal(
+                                src_file.as_ref().unwrap(),
+                                ensure_dst_file_path(
+                                    &mut dst_file,
+                                    include_root,
+                                    &src_base,
+                                    rel,
+                                    dst_base,
+                                ),
+                            ) {
+                                None
+                            } else {
+                                Some(ChangeKind::ModFile)
+                            }
+                        } else if idx.path_exists(rel.as_str()) {
+                            Some(ChangeKind::ModFile)
+                        } else {
+                            Some(ChangeKind::NewFile)
+                        }
+                    } else {
+                        match fs::symlink_metadata(ensure_dst_file_path(
+                            &mut dst_file,
+                            include_root,
+                            &src_base,
+                            rel,
+                            dst_base,
+                        )) {
+                            Ok(dm)
+                                if dm.file_type().is_symlink()
+                                    && symlink_targets_equal(
+                                        src_file.as_ref().unwrap(),
+                                        ensure_dst_file_path(
+                                            &mut dst_file,
+                                            include_root,
+                                            &src_base,
+                                            rel,
+                                            dst_base,
+                                        ),
+                                    ) =>
+                            {
+                                None
+                            }
+                            Ok(_) => Some(ChangeKind::ModFile),
+                            Err(_) => Some(ChangeKind::NewFile),
+                        }
                     }
                 } else {
-                    match fs::metadata(&dst_file) {
-                        Ok(dm) if dm.is_file() && dm.len() == *size => None,
-                        Ok(_) => Some(ChangeKind::ModFile),
-                        Err(_) => Some(ChangeKind::NewFile),
+                    if let Some(idx) = dst_idx {
+                        if let Some(dst_size) = idx.file_sizes.get(rel.as_str()) {
+                            if *dst_size == *size {
+                                None
+                            } else {
+                                Some(ChangeKind::ModFile)
+                            }
+                        } else if idx.path_exists(rel.as_str()) {
+                            Some(ChangeKind::ModFile)
+                        } else {
+                            Some(ChangeKind::NewFile)
+                        }
+                    } else {
+                        match fs::metadata(ensure_dst_file_path(
+                            &mut dst_file,
+                            include_root,
+                            &src_base,
+                            rel,
+                            dst_base,
+                        )) {
+                            Ok(dm) if dm.is_file() && dm.len() == *size => None,
+                            Ok(_) => Some(ChangeKind::ModFile),
+                            Err(_) => Some(ChangeKind::NewFile),
+                        }
                     }
                 };
+                let is_overlap = !matches!(change, Some(ChangeKind::NewFile));
+                if is_overlap {
+                    acc.7 += 1;
+                }
                 if let Some(kind) = change {
                     if !*is_symlink {
                         match kind {
@@ -2372,22 +2484,21 @@ fn pre_scan_directory(
                         acc.2 += *size;
                     }
                     if build_manifest {
-                        acc.5.push(ManifestFileEntry {
+                        acc.4.push(ManifestFileEntry {
                             rel: rel.clone(),
                             size: *size,
                         });
                     }
-                    if collect_detailed {
+                    {
+                        let display_rel = map_display_rel(include_root, &src_base, &rel);
                         acc.3.push(ChangeItem {
                             kind,
-                            rel: display_rel.clone(),
+                            rel: display_rel,
                         });
-                    } else if let Some((top, is_dir)) = top_name_from_display(&display_rel, false) {
-                        merge_top_state(&mut acc.4, top, matches!(kind, ChangeKind::NewFile), is_dir);
                     }
-                    add_parent_dir_chain(rel, include_root, &mut acc.7);
+                    add_parent_dir_chain(&rel, include_root, &mut acc.6);
                 } else if build_manifest {
-                    acc.6.push(ManifestFileEntry {
+                    acc.5.push(ManifestFileEntry {
                         rel: rel.clone(),
                         size: *size,
                     });
@@ -2396,18 +2507,25 @@ fn pre_scan_directory(
             },
         )
         .reduce(
-            || (0, 0, 0, Vec::new(), HashMap::new(), Vec::new(), Vec::new(), HashSet::new()),
+            || (
+                0,
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                FxHashSet::default(),
+                0,
+            ),
             |mut a, b| {
                 a.0 += b.0;
                 a.1 += b.1;
                 a.2 += b.2;
                 a.3.extend(b.3);
-                for (k, (is_added, is_dir)) in b.4 {
-                    merge_top_state(&mut a.4, k, is_added, is_dir);
-                }
+                a.4.extend(b.4);
                 a.5.extend(b.5);
                 a.6.extend(b.6);
-                a.7.extend(b.7);
+                a.7 += b.7;
                 a
             },
         );
@@ -2415,14 +2533,16 @@ fn pre_scan_directory(
     out.add_files += add_files;
     out.mod_files += mod_files;
     out.planned_bytes += planned_bytes;
+
     if destination_missing {
-        out.unaffected_files = 0;
+        out.uncollided_files = 0;
     } else {
-        let (dest_total_files, unaffected_by_scan) = destination_file_counts(&destination_root, &source_rel_files);
+        let idx = destination_index.as_ref().expect("destination index should exist when destination is present");
+        let dest_total_files = idx.file_sizes.len() as u64;
         let source_regular_total = out.total_regular_files.unwrap_or(0);
-        let source_not_new = source_regular_total.saturating_sub(add_files);
-        let unaffected_by_overlap = dest_total_files.saturating_sub(source_not_new);
-        out.unaffected_files = unaffected_by_scan.max(unaffected_by_overlap);
+        let overlap_files = source_regular_total.saturating_sub(add_files);
+        let uncollided_by_overlap = dest_total_files.saturating_sub(overlap_files);
+        out.uncollided_files = uncollided_by_overlap;
     }
 
     out.add_dirs = missing_dir_prefixes.len() as u64 + u64::from(root_new_dir);
@@ -2442,44 +2562,26 @@ fn pre_scan_directory(
     let total_dirs = out.total_dirs.unwrap_or(0);
     out.mod_dirs = mod_dirs_count.min(total_dirs.saturating_sub(out.add_dirs));
     if destination_missing {
-        out.unaffected_dirs = 0;
+        out.uncollided_dirs = 0;
     } else {
-        let (dest_total_dirs, unaffected_dirs_by_scan) =
-            destination_dir_counts(&destination_root, &source_rel_dirs);
-        let source_dir_total_no_root = dirs.len() as u64;
+        let idx = destination_index.as_ref().expect("destination index should exist when destination is present");
+        let dest_total_dirs = idx.dirs.len() as u64;
+        let uncollided_dirs_by_scan = idx
+            .dirs
+            .iter()
+            .filter(|rel| !source_rel_dirs.contains(rel.as_str()))
+            .count() as u64;
+        let source_dir_total_no_root = source_dir_count as u64;
         let source_dirs_not_new = source_dir_total_no_root.saturating_sub(missing_dir_prefixes.len() as u64);
-        let unaffected_dirs_by_overlap = dest_total_dirs.saturating_sub(source_dirs_not_new);
-        out.unaffected_dirs = unaffected_dirs_by_scan.max(unaffected_dirs_by_overlap);
+        let uncollided_dirs_by_overlap = dest_total_dirs.saturating_sub(source_dirs_not_new);
+        out.uncollided_dirs = uncollided_dirs_by_scan.max(uncollided_dirs_by_overlap);
     }
 
     if out.add_files > 0 || out.mod_files > 0 {
         out.has_itemized_changes = true;
     }
 
-    if collect_detailed {
-        out.change_preview.extend(detailed_changes);
-    } else {
-        for (k, v) in reduced_top_states {
-            merge_top_state(&mut top_states, k, v.0, v.1);
-        }
-        let mut tops: Vec<(String, (bool, bool))> = top_states.into_iter().collect();
-        tops.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, (is_added, is_dir)) in tops {
-            let kind = if is_added {
-                if is_dir {
-                    ChangeKind::NewDir
-                } else {
-                    ChangeKind::NewFile
-                }
-            } else if is_dir {
-                ChangeKind::ModDir
-            } else {
-                ChangeKind::ModFile
-            };
-            let rel = if is_dir { format!("{name}/") } else { name };
-            out.change_preview.push(ChangeItem { kind, rel });
-        }
-    }
+    out.change_preview.extend(detailed_changes);
 
     if build_manifest {
         if let Some(mut d) = manifest_dirs.take() {
@@ -2531,8 +2633,8 @@ fn pre_scan_file(src_mnt: &Path, dst_path: &str, dst_obj_kind: DstObjKind) -> Pr
         if base.is_dir() {
             let mut source_rel_files = HashSet::new();
             source_rel_files.insert(src_name.clone());
-            let (_dest_total, unaffected_by_scan) = destination_file_counts(base, &source_rel_files);
-            out.unaffected_files = unaffected_by_scan;
+            let (_dest_total, uncollided_by_scan) = destination_file_counts(base, &source_rel_files);
+            out.uncollided_files = uncollided_by_scan;
         }
     }
 
@@ -2735,7 +2837,7 @@ fn run_rsync_transfer(
         if planned_bytes > 0 {
             let pct = (done as f64 * 100.0 / planned_bytes as f64).min(100.0);
             println!(
-                "{timer} {pct:6.2}% {} / {} | {} | {} {}",
+                "{timer} {pct:6.2}% {} / {} {} {} {}",
                 fmt_bytes_col_10(done),
                 format_bytes_binary(planned_bytes, 2),
                 fmt_rate_col(speed_bps),
@@ -2744,7 +2846,7 @@ fn run_rsync_transfer(
             );
         } else {
             println!(
-                "{timer} ---% {} | {} | {} {}",
+                "{timer} ---% {} {} {} {}",
                 fmt_bytes_col_10(done),
                 fmt_rate_col(speed_bps),
                 fmt_rate_col_opt(io_rates.src_read_bps),
@@ -2813,7 +2915,7 @@ fn run_rsync_transfer(
             final_done as f64 / now.duration_since(transfer_start).as_secs_f64().max(1e-6)
         };
         println!(
-            "{} {pct:6.2}% {} / {} | {} | {} {}",
+            "{} {pct:6.2}% {} / {} {} {} {}",
             fmt_hms_tenths(now.duration_since(transfer_start).as_secs_f64()),
             fmt_bytes_col_10(final_done),
             format_bytes_binary(planned_bytes, 2),
@@ -2823,7 +2925,7 @@ fn run_rsync_transfer(
         );
     } else {
         println!(
-            "{} ---% {} | {} | {} {}",
+            "{} ---% {} {} {} {}",
             fmt_hms_tenths(transfer_start.elapsed().as_secs_f64()),
             fmt_bytes_col_10(final_done),
             fmt_rate_col(0.0),
@@ -2885,7 +2987,7 @@ fn run_rust_transfer(
                     if planned_bytes > 0 {
                         let pct = (done_bytes as f64 * 100.0 / planned_bytes as f64).min(100.0);
                         println!(
-                            "{} {pct:6.2}% {} / {} | {} | {} {}",
+                            "{} {pct:6.2}% {} / {} {} {} {}",
                             fmt_hms_tenths(now.duration_since(transfer_start_for_ticker).as_secs_f64()),
                             fmt_bytes_col_10(done_bytes),
                             format_bytes_binary(planned_bytes, 2),
@@ -2895,7 +2997,7 @@ fn run_rust_transfer(
                         );
                     } else {
                         println!(
-                            "{} ---% {} | {} | {} {}",
+                            "{} ---% {} {} {} {}",
                             fmt_hms_tenths(now.duration_since(transfer_start_for_ticker).as_secs_f64()),
                             fmt_bytes_col_10(done_bytes),
                             fmt_rate_col(speed),
@@ -2919,7 +3021,7 @@ fn run_rust_transfer(
             if planned_bytes > 0 {
                 let pct = (final_done as f64 * 100.0 / planned_bytes as f64).min(100.0);
                 println!(
-                    "{} {pct:6.2}% {} / {} | {} | {} {}",
+                    "{} {pct:6.2}% {} / {} {} {} {}",
                     fmt_hms_tenths(elapsed),
                     fmt_bytes_col_10(final_done),
                     format_bytes_binary(planned_bytes, 2),
@@ -2929,7 +3031,7 @@ fn run_rust_transfer(
                 );
             } else {
                 println!(
-                    "{} ---% {} | {} | {} {}",
+                    "{} ---% {} {} {} {}",
                     fmt_hms_tenths(elapsed),
                     fmt_bytes_col_10(final_done),
                     fmt_rate_col(final_speed),
@@ -3040,7 +3142,9 @@ fn run_rust_transfer(
                 }
             } else {
                 let mut entries: Vec<PathBuf> = WalkDir::new(src_root)
+                    .sort(false)
                     .skip_hidden(false)
+                    .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
                     .into_iter()
                     .filter_map(Result::ok)
                     .map(|e| e.path().to_path_buf())
@@ -3147,14 +3251,14 @@ fn dev_media_kind(path: &Path) -> MediaKind {
 
 #[derive(Default, Clone)]
 struct TreeNode {
-    children: BTreeMap<String, TreeNode>,
+    children: FxHashMap<String, TreeNode>,
     state: Option<String>,
     is_dir: bool,
 }
 
 fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
     let mut root = TreeNode {
-        children: BTreeMap::new(),
+        children: FxHashMap::default(),
         state: None,
         is_dir: true,
     };
@@ -3182,7 +3286,7 @@ fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
         for (idx, part) in parts.iter().enumerate() {
             let is_leaf = idx == parts.len() - 1;
             node = node.children.entry((*part).to_string()).or_insert_with(|| TreeNode {
-                children: BTreeMap::new(),
+                children: FxHashMap::default(),
                 state: None,
                 is_dir: true,
             });
@@ -3222,14 +3326,34 @@ struct LevelEntry {
     node: Option<TreeNode>,
 }
 
-fn collect_level_entries(abs_dir: &Path, node: Option<&TreeNode>, extra: &HashMap<String, String>) -> Vec<LevelEntry> {
-    let mut existing_entries: BTreeSet<String> = BTreeSet::new();
-    if abs_dir.is_dir() {
-        if let Ok(rd) = fs::read_dir(abs_dir) {
-            for e in rd.flatten() {
-                existing_entries.insert(e.file_name().to_string_lossy().to_string());
+fn collect_level_entries(
+    abs_dir: &Path,
+    node: Option<&TreeNode>,
+    extra: &HashMap<String, String>,
+    dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
+) -> Vec<LevelEntry> {
+    let existing = dir_cache
+        .entry(abs_dir.to_path_buf())
+        .or_insert_with(|| {
+            if !abs_dir.is_dir() {
+                return Vec::new();
             }
-        }
+            let mut rows: Vec<(String, bool)> = Vec::new();
+            if let Ok(rd) = fs::read_dir(abs_dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    rows.push((name, is_dir));
+                }
+            }
+            rows
+        })
+        .clone();
+    let mut existing_entries: BTreeSet<String> = BTreeSet::new();
+    let mut existing_is_dir: HashMap<String, bool> = HashMap::new();
+    for (name, is_dir) in existing {
+        existing_entries.insert(name.clone());
+        existing_is_dir.insert(name, is_dir);
     }
 
     let mut changed: BTreeSet<String> = BTreeSet::new();
@@ -3253,13 +3377,20 @@ fn collect_level_entries(abs_dir: &Path, node: Option<&TreeNode>, extra: &HashMa
         }
         let state = state.unwrap_or_else(|| "unchanged".to_string());
         let full = abs_dir.join(&name);
-        let is_dir = child.as_ref().map(|c| c.is_dir).unwrap_or_else(|| full.is_dir());
+        let is_dir = child
+            .as_ref()
+            .map(|c| c.is_dir)
+            .or_else(|| existing_is_dir.get(&name).copied())
+            .unwrap_or_else(|| full.is_dir());
         out.push(LevelEntry { name, state, is_dir, node: child });
     }
     out
 }
 
-fn select_level_entries(entries: &[LevelEntry], max_entries: usize) -> (Vec<LevelEntry>, usize, usize, usize, usize) {
+fn select_level_entries(
+    entries: &[LevelEntry],
+    max_entries: usize,
+) -> (Vec<LevelEntry>, usize, usize) {
     let mut changed: Vec<LevelEntry> = entries
         .iter()
         .filter(|e| e.state != "unchanged")
@@ -3269,14 +3400,14 @@ fn select_level_entries(entries: &[LevelEntry], max_entries: usize) -> (Vec<Leve
     changed.sort_by(|a, b| {
         let pa = match a.state.as_str() {
             "modified" | "replaced" => 0,
-            "removed" => 1,
-            "added" => 2,
+            "added" => 1,
+            "removed" => 2,
             _ => 9,
         };
         let pb = match b.state.as_str() {
             "modified" | "replaced" => 0,
-            "removed" => 1,
-            "added" => 2,
+            "added" => 1,
+            "removed" => 2,
             _ => 9,
         };
         pa.cmp(&pb).then(a.name.cmp(&b.name))
@@ -3285,24 +3416,21 @@ fn select_level_entries(entries: &[LevelEntry], max_entries: usize) -> (Vec<Leve
     let selected: Vec<LevelEntry> = changed.into_iter().take(max_entries).collect();
     let selected_names: HashSet<String> = selected.iter().map(|e| e.name.clone()).collect();
 
-    let mut hidden_new = 0usize;
-    let mut hidden_mod = 0usize;
-    let mut hidden_unch = 0usize;
-    let mut hidden_rem = 0usize;
+    let mut hidden_dirs = 0usize;
+    let mut hidden_files = 0usize;
 
     for e in entries {
         if selected_names.contains(&e.name) {
             continue;
         }
-        match e.state.as_str() {
-            "added" => hidden_new += 1,
-            "modified" | "replaced" => hidden_mod += 1,
-            "removed" => hidden_rem += 1,
-            _ => hidden_unch += 1,
+        if e.is_dir {
+            hidden_dirs += 1;
+        } else {
+            hidden_files += 1;
         }
     }
 
-    (selected, hidden_new, hidden_mod, hidden_unch, hidden_rem)
+    (selected, hidden_dirs, hidden_files)
 }
 
 fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
@@ -3321,13 +3449,25 @@ fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
     }
 }
 
-fn render_showall_level(abs_dir: &Path, node: Option<&TreeNode>, prefix: &str, extras: &HashMap<String, String>, depth: usize) {
-    let entries = collect_level_entries(abs_dir, node, extras);
-    let (selected, hn, hm, hu, hr) = select_level_entries(&entries, 5);
+fn render_showall_level(
+    abs_dir: &Path,
+    node: Option<&TreeNode>,
+    prefix: &str,
+    extras: &HashMap<String, String>,
+    depth: usize,
+    max_depth: usize,
+    trunc: usize,
+    dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
+    out: &mut String,
+    max_lines: Option<usize>,
+    line_count: &mut usize,
+) -> bool {
+    let entries = collect_level_entries(abs_dir, node, extras, dir_cache);
+    let (selected, hidden_dirs, hidden_files) = select_level_entries(&entries, trunc);
 
     enum Unit {
         Entry(LevelEntry, Option<&'static str>),
-        Summary(usize, usize, usize, usize),
+        Summary(usize, usize),
     }
 
     let mut units: Vec<Unit> = Vec::new();
@@ -3340,8 +3480,8 @@ fn render_showall_level(abs_dir: &Path, node: Option<&TreeNode>, prefix: &str, e
         }
     }
 
-    if hn + hm + hu + hr > 0 {
-        units.push(Unit::Summary(hn, hm, hu, hr));
+    if hidden_dirs + hidden_files > 0 {
+        units.push(Unit::Summary(hidden_dirs, hidden_files));
     }
 
     for (idx, unit) in units.iter().enumerate() {
@@ -3349,49 +3489,71 @@ fn render_showall_level(abs_dir: &Path, node: Option<&TreeNode>, prefix: &str, e
         let branch = if last { "└── " } else { "├── " };
 
         match unit {
-            Unit::Summary(n_new, n_mod, n_unch, n_rem) => {
+            Unit::Summary(hid_dirs, hid_files) => {
+                if max_lines.map(|m| *line_count >= m).unwrap_or(false) {
+                    return false;
+                }
                 let mut parts: Vec<String> = Vec::new();
-                if *n_new > 0 {
-                    parts.push(format!("{n_new} more new"));
+                if *hid_dirs > 0 {
+                    let suffix = if *hid_dirs == 1 { "dir" } else { "dirs" };
+                    parts.push(format!("{hid_dirs} more {suffix}"));
                 }
-                if *n_mod > 0 {
-                    parts.push(format!("{n_mod} more modified"));
+                if *hid_files > 0 {
+                    let suffix = if *hid_files == 1 { "file" } else { "files" };
+                    parts.push(format!("{hid_files} more {suffix}"));
                 }
-                if *n_unch > 0 {
-                    parts.push(format!("{n_unch} more unchanged"));
+                if parts.is_empty() {
+                    parts.push(format!("{} more", hid_dirs + hid_files));
                 }
-                if *n_rem > 0 {
-                    parts.push(format!("{n_rem} more removed"));
-                }
-                println!("{prefix}{branch}... and {}", parts.join(" "));
+                let _ = writeln!(out, "{prefix}{branch}... and {}", parts.join(" "));
+                *line_count += 1;
             }
             Unit::Entry(entry, row_kind) => {
-                println!("{prefix}{branch}{}", format_entry(entry, *row_kind));
-                let should_expand = row_kind.is_none() && entry.is_dir && entry.state == "modified";
+                if max_lines.map(|m| *line_count >= m).unwrap_or(false) {
+                    return false;
+                }
+                let _ = writeln!(out, "{prefix}{branch}{}", format_entry(entry, *row_kind));
+                *line_count += 1;
+                let should_expand = row_kind.is_none()
+                    && entry.is_dir
+                    && depth + 1 <= max_depth
+                    && (entry.state == "modified" || entry.state == "added");
                 if should_expand {
                     let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
                     let empty: HashMap<String, String> = HashMap::new();
-                    render_showall_level(
+                    if !render_showall_level(
                         &abs_dir.join(&entry.name),
                         entry.node.as_ref(),
                         &child_prefix,
                         &empty,
                         depth + 1,
-                    );
+                        max_depth,
+                        trunc,
+                        dir_cache,
+                        out,
+                        max_lines,
+                        line_count,
+                    ) {
+                        return false;
+                    }
                 }
             }
         }
     }
+    true
 }
 
-fn print_showall_preview(
+fn render_showall_preview_to_string(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
     extra_removed: &HashSet<String>,
-) {
+    max_depth: usize,
+    trunc: usize,
+    max_lines: Option<usize>,
+) -> Option<String> {
     let mut root_extra: HashMap<String, String> = HashMap::new();
     for n in extra_added {
         root_extra.insert(n.clone(), "added".to_string());
@@ -3409,20 +3571,40 @@ fn print_showall_preview(
     }
 
     let tree = build_change_tree(preview_items);
-    render_showall_level(preview_root, Some(&tree), "", &root_extra, 0);
+    let mut dir_cache: HashMap<PathBuf, Vec<(String, bool)>> = HashMap::new();
+    let mut out = String::new();
+    let mut line_count = 0usize;
+    let ok = render_showall_level(
+        preview_root,
+        Some(&tree),
+        "",
+        &root_extra,
+        0,
+        max_depth,
+        trunc,
+        &mut dir_cache,
+        &mut out,
+        max_lines,
+        &mut line_count,
+    );
+    if !ok {
+        return None;
+    }
+    Some(out)
 }
 
 struct TopPreviewData {
     root: PathBuf,
     top_states: HashMap<String, String>,
     top_is_dir: HashMap<String, bool>,
-    unchanged_files: usize,
-    unchanged_dirs: usize,
+    unchanged_identical: usize,
+    unchanged_uncollided: usize,
 }
 
 fn collect_top_level_preview(
     preview_root: &Path,
     preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
@@ -3506,17 +3688,16 @@ fn collect_top_level_preview(
     all_entries.extend(existing_entries.iter().cloned());
     all_entries.extend(top_states.keys().cloned());
 
-    let mut unchanged_files = 0usize;
-    let mut unchanged_dirs = 0usize;
+    let mut unchanged_identical = 0usize;
+    let mut unchanged_uncollided = 0usize;
     for name in &existing_entries {
         if top_states.contains_key(name) {
             continue;
         }
-        let full = root.join(name);
-        if full.is_dir() {
-            unchanged_dirs += 1;
+        if source_top_entries.contains(name) {
+            unchanged_identical += 1;
         } else {
-            unchanged_files += 1;
+            unchanged_uncollided += 1;
         }
     }
 
@@ -3524,23 +3705,73 @@ fn collect_top_level_preview(
         root,
         top_states,
         top_is_dir,
-        unchanged_files,
-        unchanged_dirs,
+        unchanged_identical,
+        unchanged_uncollided,
     }
 }
 
-fn print_changed_top_preview(
+fn collect_source_top_entries(
+    src_mnt: &Path,
+    src_obj_kind: SrcObjKind,
+    include_root: bool,
+    simple_rename_dst: Option<&str>,
+    rename_target_only: Option<&str>,
+    rename_target_is_dir: bool,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let rename_target_name = simple_rename_dst
+        .or_else(|| {
+            if src_obj_kind == SrcObjKind::Dir && rename_target_is_dir {
+                rename_target_only
+            } else if src_obj_kind == SrcObjKind::File {
+                rename_target_only
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    match src_obj_kind {
+        SrcObjKind::File => {
+            if let Some(name) = rename_target_name {
+                out.insert(name);
+            } else if let Some(name) = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()) {
+                out.insert(name);
+            }
+        }
+        SrcObjKind::Dir => {
+            if include_root {
+                if let Some(name) = rename_target_name {
+                    out.insert(name);
+                } else if let Some(name) = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()) {
+                    out.insert(name);
+                }
+            } else if let Ok(rd) = fs::read_dir(src_mnt) {
+                for e in rd.flatten() {
+                    out.insert(e.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn render_changed_top_preview_to_string(
     preview_root: &Path,
     preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
     extra_removed: &HashSet<String>,
-) {
-    let max_top_entries = 15usize;
+    max_top_entries: usize,
+) -> String {
     let d = collect_top_level_preview(
         preview_root,
         preview_items,
+        source_top_entries,
         extra_added,
         extra_modified,
         extra_replaced,
@@ -3550,35 +3781,14 @@ fn print_changed_top_preview(
     let mut changed_names: Vec<String> = d.top_states.keys().cloned().collect();
     changed_names.sort();
 
-    let mut added_files = 0;
-    let mut added_dirs = 0;
-    let mut changed_files = 0;
-    let mut changed_dirs = 0;
-
-    for name in &changed_names {
-        let full = d.root.join(name);
-        let is_dir = *d.top_is_dir.get(name).unwrap_or(&full.is_dir());
-        let state = d.top_states.get(name).map(|s| s.as_str()).unwrap_or("modified");
-        if state == "added" {
-            if is_dir {
-                added_dirs += 1;
-            } else {
-                added_files += 1;
-            }
-        } else if is_dir {
-            changed_dirs += 1;
-        } else {
-            changed_files += 1;
-        }
-    }
-
     let visible_names: Vec<String> = changed_names.iter().take(max_top_entries).cloned().collect();
     let hidden_names: Vec<String> = changed_names.iter().skip(max_top_entries).cloned().collect();
 
     let mut hidden_new = 0usize;
     let mut hidden_modified = 0usize;
     let mut hidden_removed = 0usize;
-    let hidden_unchanged = d.unchanged_files + d.unchanged_dirs;
+    let hidden_identical = d.unchanged_identical;
+    let hidden_uncollided = d.unchanged_uncollided;
 
     for n in hidden_names {
         match d.top_states.get(&n).map(|s| s.as_str()).unwrap_or("modified") {
@@ -3589,8 +3799,20 @@ fn print_changed_top_preview(
     }
 
     if visible_names.is_empty() {
-        println!("(no new additions)");
+        let mut out = String::new();
+        let _ = writeln!(out, "(no new additions)");
+        if let Some(summary) = format_hidden_top_summary(
+            hidden_new,
+            hidden_modified,
+            hidden_identical,
+            hidden_uncollided,
+            hidden_removed,
+        ) {
+            let _ = writeln!(out, "... and {summary}");
+        }
+        return out;
     } else {
+        let mut out = String::new();
         let mut rows: Vec<(String, String, bool)> = Vec::new();
         for name in visible_names {
             let full = d.root.join(&name);
@@ -3620,24 +3842,77 @@ fn print_changed_top_preview(
             } else {
                 (WARNING, "")
             };
-            println!("{branch}{color}{name}{suffix}{label}{ENDC}");
+            let _ = writeln!(out, "{branch}{color}{name}{suffix}{label}{ENDC}");
         }
+        if let Some(summary) = format_hidden_top_summary(
+            hidden_new,
+            hidden_modified,
+            hidden_identical,
+            hidden_uncollided,
+            hidden_removed,
+        ) {
+            let _ = writeln!(out, "... and {summary}");
+        }
+        return out;
     }
+}
 
-    let hidden_total = hidden_new + hidden_modified + hidden_removed + hidden_unchanged;
-    if hidden_total > 0 {
-        println!(
-            "... and {} more new {} more modified {} more unchanged and {} more removed",
-            hidden_new, hidden_modified, hidden_unchanged, hidden_removed
-        );
-        println!();
-    }
-
-    println!(
-        "Top level: Added: dirs={added_dirs} files={added_files} | Changed: dirs={changed_dirs} files={changed_files} | Unchanged: dirs={} files={}",
-        d.unchanged_dirs,
-        d.unchanged_files
+fn print_changed_top_preview(
+    preview_root: &Path,
+    preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
+    extra_added: &HashSet<String>,
+    extra_modified: &HashSet<String>,
+    extra_replaced: &HashSet<String>,
+    extra_removed: &HashSet<String>,
+    max_top_entries: usize,
+) {
+    let out = render_changed_top_preview_to_string(
+        preview_root,
+        preview_items,
+        source_top_entries,
+        extra_added,
+        extra_modified,
+        extra_replaced,
+        extra_removed,
+        max_top_entries,
     );
+    print!("{out}");
+    println!();
+}
+
+fn format_hidden_top_summary(
+    hidden_new: usize,
+    hidden_modified: usize,
+    hidden_identical: usize,
+    hidden_uncollided: usize,
+    hidden_removed: usize,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if hidden_new > 0 {
+        parts.push(format!("{hidden_new} more new"));
+    }
+    if hidden_modified > 0 {
+        parts.push(format!("{hidden_modified} more modified"));
+    }
+    if hidden_identical > 0 {
+        parts.push(format!("{hidden_identical} more identical"));
+    }
+    if hidden_uncollided > 0 {
+        parts.push(format!("{hidden_uncollided} more uncollided"));
+    }
+
+    if hidden_removed > 0 {
+        if parts.is_empty() {
+            Some(format!("{hidden_removed} more removed"))
+        } else {
+            Some(format!("{} and {hidden_removed} more removed", parts.join(" ")))
+        }
+    } else if !parts.is_empty() {
+        Some(parts.join(" "))
+    } else {
+        None
+    }
 }
 
 mod libc_time {
@@ -3710,7 +3985,6 @@ fn run_remote_transfer_mode(
     contents_mode_requested: bool,
     overwrite: bool,
     backup_requested: bool,
-    show_all: bool,
     preview_only: bool,
 ) -> i32 {
     if source_remote.is_some() && destination_remote.is_some() {
@@ -3779,13 +4053,6 @@ fn run_remote_transfer_mode(
             LogLevel::Warn,
         );
     }
-    if show_all {
-        log(
-            requested_mode,
-            "--showall preview tree is not available for remote endpoints.",
-            LogLevel::Warn,
-        );
-    }
 
     let contents_active = contents_mode_requested && !matches!(local_src_kind, Some(SrcObjKind::File));
     let mode_dir_active = matches!(local_src_kind, Some(SrcObjKind::Dir)) && !contents_active;
@@ -3817,12 +4084,12 @@ fn run_remote_transfer_mode(
         return 0;
     }
 
-    print!("Proceed with {}? [y/N]: ", requested_mode.word());
+    print!("Proceed with {}? [Y/n]: ", requested_mode.word());
     let _ = io::stdout().flush();
     let mut ans = String::new();
     let _ = io::stdin().read_line(&mut ans);
     let ans = ans.trim().to_ascii_lowercase();
-    if ans != "y" && ans != "yes" {
+    if !ans.is_empty() && ans != "y" && ans != "yes" {
         println!("{FAIL}Cancelled.{ENDC}");
         return 0;
     }
@@ -3851,6 +4118,9 @@ fn run_remote_transfer_mode(
     }
 
     let result = if transfer.rc == 0 {
+        if let Endpoint::Local(dst_local) = &destination_ep {
+            flush_destination_writes(dst_local, use_sudo, requested_mode);
+        }
         log(
             requested_mode,
             &format!("{} complete.", requested_mode.word_cap()),
@@ -3922,7 +4192,6 @@ fn real_main() -> i32 {
     let mut source = source_input.clone();
     let destination = args.destination.clone();
     let use_sudo = args.sudo;
-    let show_all = args.showall;
     let preview_lite = args.preview_lite;
     let preview_only = args.preview_only || preview_lite;
     let backup_requested = args.backup;
@@ -3952,7 +4221,6 @@ fn real_main() -> i32 {
             contents_mode_requested,
             overwrite,
             backup_requested,
-            show_all,
             preview_only,
         );
     }
@@ -4262,7 +4530,12 @@ fn real_main() -> i32 {
 
         let ps = match src_obj_kind {
             SrcObjKind::Dir => {
-                pre_scan_directory(&src_path, &pre_dst_path, &src_mnt, show_all, preview_lite, build_transfer_manifest)
+                pre_scan_directory(
+                    &src_path,
+                    &pre_dst_path,
+                    &src_mnt,
+                    build_transfer_manifest,
+                )
             }
             SrcObjKind::File => pre_scan_file(&src_mnt, &pre_dst_path, dst_obj_kind),
         };
@@ -4278,10 +4551,10 @@ fn real_main() -> i32 {
     let total_dirs = prescan.total_dirs;
     let add_files = prescan.add_files;
     let mod_files = prescan.mod_files;
-    let unaffected_files = prescan.unaffected_files;
+    let uncollided_files = prescan.uncollided_files;
     let add_dirs = prescan.add_dirs;
     let mod_dirs = prescan.mod_dirs;
-    let unaffected_dirs = prescan.unaffected_dirs;
+    let uncollided_dirs = prescan.uncollided_dirs;
     let transfer_manifest = prescan.transfer_manifest;
     let mut display_change_preview = prescan.change_preview.clone();
     let has_itemized_changes = prescan.has_itemized_changes;
@@ -4429,7 +4702,17 @@ fn real_main() -> i32 {
     let highlight_new_preview_leaf = src_obj_kind == SrcObjKind::Dir
         && matches!(dst_obj_kind, DstObjKind::DirNew)
         && !preview_root_trimmed.exists();
-    print_preview_root_line(&preview_root, highlight_new_preview_leaf);
+    let overwrite_requires_action = overwrite_target_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let has_move_cleanup_work = is_move
+        && !source_already_in_destination
+        && (manifest_cleanup_files > 0 || manifest_cleanup_bytes > 0);
+    let emphasize_preview_root =
+        has_itemized_changes || planned_bytes > 0 || overwrite_requires_action || has_move_cleanup_work;
+    print_preview_root_line(
+        &preview_root,
+        highlight_new_preview_leaf,
+        emphasize_preview_root,
+    );
 
     let mut extra_added: HashSet<String> = HashSet::new();
     let mut extra_modified: HashSet<String> = HashSet::new();
@@ -4472,27 +4755,59 @@ fn real_main() -> i32 {
         }
     }
 
-    if show_all {
-        print_showall_preview(
-            Path::new(preview_root.to_string_lossy().trim_end_matches('/')),
-            &display_change_preview,
-            &extra_added,
-            &extra_modified,
-            &extra_replaced,
-            &extra_removed,
-        );
-    } else {
-        print_changed_top_preview(
-            Path::new(preview_root.to_string_lossy().trim_end_matches('/')),
-            &display_change_preview,
-            &extra_added,
-            &extra_modified,
-            &extra_replaced,
-            &extra_removed,
-        );
+    let preview_root_trimmed_owned = preview_root.to_string_lossy().trim_end_matches('/').to_string();
+    let preview_root_path = Path::new(&preview_root_trimmed_owned);
+    {
+        const TOTAL_LINES: usize = 27;
+        const BODY_MAX_LINES: usize = TOTAL_LINES - 1;
+        const DEFAULT_MAX_DEPTH: usize = 20;
+        let max_depth = args.tree_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        let trunc = args.tree_trunc;
+
+        let mut best_render: Option<String> = None;
+        for try_depth in 1..=max_depth {
+            if let Some(rendered) = render_showall_preview_to_string(
+                preview_root_path,
+                &display_change_preview,
+                &extra_added,
+                &extra_modified,
+                &extra_replaced,
+                &extra_removed,
+                try_depth,
+                trunc,
+                Some(BODY_MAX_LINES),
+            ) {
+                best_render = Some(rendered);
+            } else {
+                break;
+            }
+        }
+
+        if let Some(rendered) = best_render {
+            print!("{rendered}");
+            println!();
+        } else {
+            let source_top_entries = collect_source_top_entries(
+                &src_mnt,
+                src_obj_kind,
+                !src_path.ends_with('/'),
+                simple_rename_dst.as_deref(),
+                rename_target_only.as_deref(),
+                rename_target_is_dir,
+            );
+            print_changed_top_preview(
+                preview_root_path,
+                &display_change_preview,
+                &source_top_entries,
+                &extra_added,
+                &extra_modified,
+                &extra_replaced,
+                &extra_removed,
+                trunc,
+            );
+        }
     }
 
-    let overwrite_requires_action = overwrite_target_path.as_ref().map(|p| p.exists()).unwrap_or(false);
     let move_cleanup_only = is_move
         && !source_already_in_destination
         && planned_bytes == 0
@@ -4542,7 +4857,7 @@ fn real_main() -> i32 {
             add_files,
             mod_files,
             identical_files,
-            unaffected_files,
+            uncollided_files,
             deleted_src_files,
             deleted_dest_files,
         )
@@ -4562,7 +4877,7 @@ fn real_main() -> i32 {
             add_dirs,
             mod_dirs,
             identical_dirs,
-            unaffected_dirs,
+            uncollided_dirs,
             deleted_src_dirs,
             deleted_dest_dirs,
         )
@@ -4574,36 +4889,37 @@ fn real_main() -> i32 {
             "New",
             "Modified",
             "Identical",
-            "Unaffected",
+            "Uncollided",
             "Deleted (src)",
             "Deleted (dest)"
         );
-        if let Some((new_v, mod_v, identical_v, unaffected_v, deleted_src_v, deleted_dest_v)) = file_row {
+        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) = file_row {
             println!(
                 "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
                 "Files",
                 format_number(new_v),
                 format_number(mod_v),
                 format_number(identical_v),
-                format_number(unaffected_v),
+                format_number(uncollided_v),
                 format_number(deleted_src_v),
                 format_number(deleted_dest_v)
             );
         }
-        if let Some((new_v, mod_v, identical_v, unaffected_v, deleted_src_v, deleted_dest_v)) = dir_row {
+        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) = dir_row {
             println!(
                 "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
                 "Dirs",
                 format_number(new_v),
                 format_number(mod_v),
                 format_number(identical_v),
-                format_number(unaffected_v),
+                format_number(uncollided_v),
                 format_number(deleted_src_v),
                 format_number(deleted_dest_v)
             );
         }
     }
 
+    println!();
     if planned_bytes_exact {
         println!(
             "Planned transfer bytes: {} ({})",
@@ -4645,12 +4961,12 @@ fn real_main() -> i32 {
         );
     }
 
-    print!("Proceed with {}? [y/N]: ", requested_mode.word());
+    print!("Proceed with {}? [Y/n]: ", requested_mode.word());
     let _ = io::stdout().flush();
     let mut ans = String::new();
     let _ = io::stdin().read_line(&mut ans);
     let ans = ans.trim().to_ascii_lowercase();
-    if ans != "y" && ans != "yes" {
+    if !ans.is_empty() && ans != "y" && ans != "yes" {
         println!("{FAIL}Cancelled.{ENDC}");
         return 0;
     }
@@ -4736,14 +5052,15 @@ fn real_main() -> i32 {
         }
     }
 
-    if let Some(rename_target) = maybe_fast_rename_target {
-        if fast_rename_possible {
-            if fs::rename(&src_mnt, &rename_target).is_ok() {
-                log(
-                    requested_mode,
-                    &format!(
-                        "Fast-path rename on same filesystem: {} -> {}",
-                        src_mnt.display(),
+        if let Some(rename_target) = maybe_fast_rename_target {
+            if fast_rename_possible {
+                if fs::rename(&src_mnt, &rename_target).is_ok() {
+                    flush_destination_writes(&rename_target, use_sudo, requested_mode);
+                    log(
+                        requested_mode,
+                        &format!(
+                            "Fast-path rename on same filesystem: {} -> {}",
+                            src_mnt.display(),
                         rename_target.display()
                     ),
                     LogLevel::Info,
@@ -4905,6 +5222,7 @@ fn real_main() -> i32 {
                     }
 
                     if rc_transfer == 0 {
+                        flush_destination_writes(otp, use_sudo, requested_mode);
                         log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
                         return 0;
                     }
@@ -5005,6 +5323,7 @@ fn real_main() -> i32 {
                 deleted_cleanup_total.bytes += deleted_now.bytes;
                 deleted_cleanup_elapsed_s += delete_start.elapsed().as_secs_f64();
             }
+            flush_destination_writes(&dst_mnt, use_sudo, requested_mode);
             log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
             return 0;
         }
@@ -5083,6 +5402,7 @@ fn real_main() -> i32 {
         }
 
         if rc_transfer == 0 {
+            flush_destination_writes(&dst_mnt, use_sudo, requested_mode);
             log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
             return 0;
         }
@@ -5255,5 +5575,20 @@ Host dev-*
             RsyncStreamEvent::Text(line) => assert_eq!(line, "building file list ..."),
             RsyncStreamEvent::Progress(bytes) => panic!("expected text, got progress: {bytes}"),
         }
+    }
+
+    #[test]
+    fn format_hidden_top_summary_uses_requested_order_and_removed_and_separator() {
+        let line = format_hidden_top_summary(1, 1, 1, 1, 1).expect("summary");
+        assert_eq!(
+            line,
+            "1 more new 1 more modified 1 more identical 1 more uncollided and 1 more removed"
+        );
+    }
+
+    #[test]
+    fn format_hidden_top_summary_omits_zero_categories() {
+        let line = format_hidden_top_summary(0, 0, 0, 4, 0).expect("summary");
+        assert_eq!(line, "4 more uncollided");
     }
 }

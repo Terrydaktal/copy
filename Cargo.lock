@@ -47,7 +47,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "copy-rs"
-version = "0.0.9"
+version = "0.1.2"
 dependencies = [
  "filetime",
  "jemallocator",
@@ -55,6 +55,7 @@ dependencies = [
  "nix",
  "rayon",
  "regex",
+ "rustc-hash",
  "tempfile",
 ]
 
@@ -410,6 +411,12 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustix"

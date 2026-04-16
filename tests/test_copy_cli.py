@@ -398,25 +398,38 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertRegex(
                 out,
-                r"\.\.\. and (?:\d+ more (?:new|modified|unchanged|removed))(?: \d+ more (?:new|modified|unchanged|removed))*",
+                r"\.\.\. and (?:\d+ more (?:new|modified|identical|uncollided|unchanged))(?: \d+ more (?:new|modified|identical|uncollided|unchanged))*"
+                r"(?: and \d+ more removed)?",
             )
 
-    def test_non_verbose_top_level_truncates_to_15_with_summary(self):
+    def test_non_verbose_top_level_truncates_to_25_with_summary(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "A"
             dst = Path(td) / "dst"
-            for i in range(20):
+            for i in range(30):
                 write_file(src / f"f{i:02d}.txt", f"{i}\n")
             dst.mkdir(parents=True, exist_ok=True)
 
             rc, out, _ = run_copy([str(src), str(dst), "-c"])
             self.assertEqual(rc, 0)
             tree_rows = [line for line in out.splitlines() if line.startswith("├── ") or line.startswith("└── ")]
-            self.assertEqual(len(tree_rows), 15, msg=f"expected 15 visible rows, got {len(tree_rows)}\n{out}")
+            self.assertEqual(len(tree_rows), 25, msg=f"expected 25 visible rows, got {len(tree_rows)}\n{out}")
             self.assertRegex(
                 out,
-                r"\.\.\. and \d+ more new \d+ more modified \d+ more unchanged and \d+ more removed",
+                r"\.\.\. and (?:\d+ more (?:new|modified|unchanged|removed))(?: \d+ more (?:new|modified|unchanged|removed))*",
             )
+
+    def test_non_verbose_auto_uses_showall_when_it_fits(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "folder" / "child.txt", "x\n")
+            dst.mkdir(parents=True, exist_ok=True)
+
+            rc, out, _ = run_copy([str(src), str(dst), "-c"])
+            self.assertEqual(rc, 0)
+            # Auto mode should choose a hierarchical preview when it fits under the default line budget.
+            self.assertIn("folder/", out)
 
     def test_contents_only_uppercase_alias_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -438,7 +451,29 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("Planned transfer bytes:", out)
 
-    def test_regular_files_summary_uses_new_modified_identical_unaffected(self):
+    def test_double_verbose_alias_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "f.txt", "x\n")
+            dst.mkdir(parents=True)
+            rc, out, _ = run_copy(["--move", "-vv", str(src), str(dst)])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Planned transfer bytes:", out)
+
+    def test_double_verbose_expands_new_directories_all_levels(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            for i in range(8):
+                write_file(src / "newdir" / f"n{i}.txt", f"{i}\n")
+            dst.mkdir(parents=True)
+            rc, out, _ = run_copy(["-vv", "-c", str(src), str(dst)])
+            self.assertEqual(rc, 0, out)
+            for i in range(8):
+                self.assertIn(f"n{i}.txt", out, msg=out)
+
+    def test_regular_files_summary_uses_new_modified_identical_uncollided(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "A"
             dst = Path(td) / "dst"
@@ -458,7 +493,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertIn("Deleted (src)", out_move)
             self.assertRegex(out_move, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*1\s+\|\s*0")
 
-    def test_unaffected_counts_destination_only_files_for_contents_merge_named_target(self):
+    def test_uncollided_counts_destination_only_files_for_contents_merge_named_target(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "Android"
             dst = Path(td) / "dst" / "Android"

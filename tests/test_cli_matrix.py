@@ -108,9 +108,9 @@ def _make_matrix_test(scenario, move, overwrite, contents, verbose):
             no_changes = ("No changes detected; nothing to" in out)
             if not no_changes:
                 if move:
-                    self.assertIn("Proceed with move? [y/N]:", out)
+                    self.assertIn("Proceed with move? [Y/n]:", out)
                 else:
-                    self.assertIn("Proceed with copy? [y/N]:", out)
+                    self.assertIn("Proceed with copy? [Y/n]:", out)
             if verbose:
                 self.assertTrue(
                     ("... and " in out)
