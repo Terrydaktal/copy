@@ -16,7 +16,7 @@ use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -25,6 +25,7 @@ use tempfile::TempDir;
 static GLOBAL: Jemalloc = Jemalloc;
 
 const OKBLUE: &str = "\x1b[94m";
+const LIGHT_TEAL: &str = "\x1b[96m";
 const OKGREEN: &str = "\x1b[92m";
 const WARNING: &str = "\x1b[93m";
 const FAIL: &str = "\x1b[91m";
@@ -141,6 +142,7 @@ struct PreScan {
     mod_dirs: u64,
     uncollided_dirs: u64,
     change_preview: Vec<ChangeItem>,
+    source_display_paths: FxHashSet<String>,
     has_itemized_changes: bool,
     transfer_manifest: Option<TransferManifest>,
 }
@@ -160,6 +162,7 @@ impl Default for PreScan {
             mod_dirs: 0,
             uncollided_dirs: 0,
             change_preview: Vec::new(),
+            source_display_paths: FxHashSet::default(),
             has_itemized_changes: false,
             transfer_manifest: None,
         }
@@ -176,6 +179,7 @@ struct CliArgs {
     overwrite: bool,
     contents_only: bool,
     backup: bool,
+    showall: bool,
     tree_depth: Option<usize>,
     tree_trunc: usize,
     preview_only: bool,
@@ -191,23 +195,64 @@ struct TransferOutcome {
     rc: i32,
     bytes_done: u64,
     elapsed_s: f64,
-    io_read_bytes: Option<u64>,
-    io_write_bytes: Option<u64>,
+    progress_snapshot: Option<ProgressSnapshot>,
 }
 
 #[derive(Clone, Copy, Default)]
-struct DeviceIoRates {
-    src_read_bps: Option<f64>,
-    dst_write_bps: Option<f64>,
+struct TransferProgressRates {
+    write_all_bps: Option<f64>,
+    rchar_bps: Option<f64>,
+    wchar_bps: Option<f64>,
+    read_bytes_bps: Option<f64>,
+    write_bytes_bps: Option<f64>,
+    read_complete_bps: Option<f64>,
+    write_complete_bps: Option<f64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcIoCounters {
+    rchar: u64,
+    wchar: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcIoDeltas {
+    rchar: Option<u64>,
+    wchar: Option<u64>,
+    read_bytes: Option<u64>,
+    write_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DeviceIoDeltas {
+    read_complete: Option<u64>,
+    write_complete: Option<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProgressSnapshot {
+    elapsed_s: f64,
+    planned_bytes: u64,
+    write_all_total: Option<u64>,
+    phase_label: &'static str,
+    rates: TransferProgressRates,
+    proc_deltas: ProcIoDeltas,
+    device_deltas: DeviceIoDeltas,
 }
 
 #[derive(Default)]
 struct DeviceIoWindow {
     src_keys: Vec<(u64, u64)>,
     dst_keys: Vec<(u64, u64)>,
+}
+
+#[derive(Default)]
+struct ProcessIoWindow {
+    pid: u32,
     last_at: Option<Instant>,
-    last_src_read_bytes: Option<u64>,
-    last_dst_write_bytes: Option<u64>,
+    last_counters: Option<ProcIoCounters>,
 }
 
 struct InflightWriteLimiter {
@@ -276,6 +321,16 @@ fn log(mode: TransferMode, msg: &str, level: LogLevel) {
     }
 }
 
+fn log_transfer_complete(mode: TransferMode) {
+    if matches!(mode, TransferMode::Copy) {
+        println!();
+    }
+    log(mode, &format!("{} complete.", mode.word_cap()), LogLevel::Info);
+    if matches!(mode, TransferMode::Copy) {
+        println!();
+    }
+}
+
 fn fmt_hms_ms(total_seconds: f64) -> String {
     let ms_total = (total_seconds.max(0.0) * 1000.0).round() as i64;
     let h = ms_total / 3_600_000;
@@ -302,7 +357,9 @@ fn format_bytes_binary(byte_value: u64, decimals: usize) -> String {
         value /= 1024.0;
         idx += 1;
     }
-    while idx < units.len() - 1 && (value * 10f64.powi(decimals as i32)).round() / 10f64.powi(decimals as i32) >= 1024.0 {
+    while idx < units.len() - 1
+        && (value * 10f64.powi(decimals as i32)).round() / 10f64.powi(decimals as i32) >= 1024.0
+    {
         value /= 1024.0;
         idx += 1;
     }
@@ -314,45 +371,299 @@ fn format_bytes_binary(byte_value: u64, decimals: usize) -> String {
 }
 
 fn fmt_speed_bps(bps: f64) -> String {
-    let b = if bps.is_finite() && bps > 0.0 { bps as u64 } else { 0 };
+    let b = if bps.is_finite() && bps > 0.0 {
+        bps as u64
+    } else {
+        0
+    };
     format_bytes_binary(b, 2)
 }
 
-fn fmt_bytes_col_10(byte_value: u64) -> String {
-    let s = format_bytes_binary(byte_value, 2);
-    if s.len() >= 11 {
-        s
-    } else {
-        format!("{:>11}", s)
-    }
-}
-
-fn fmt_rate_col(bps: f64) -> String {
-    let raw = format!("{}/s", fmt_speed_bps(bps));
-    if raw.len() >= 14 {
-        raw
-    } else {
-        format!("{:>14}", raw)
-    }
-}
-
-fn fmt_rate_col_opt(bps: Option<f64>) -> String {
-    match bps {
-        Some(v) => fmt_rate_col(v),
-        None => format!("{:>14}", "--/s"),
-    }
-}
-
 fn print_transfer_columns_header() {
-    println!(
-        "{:<10} {:>7} {:>23} {:>14} {:>14} {:>14}",
-        "Time",
-        "%",
-        "Transferred / Total",
-        "Throughput",
-        "Read",
-        "Write"
-    );
+    reset_progress_render_state();
+    // Intentionally empty: live progress block prints its own structure.
+}
+
+fn terminal_columns() -> usize {
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 40)
+        .unwrap_or(120)
+}
+
+fn fmt_bytes_block_opt(byte_value: Option<u64>, decimals: usize) -> String {
+    match byte_value {
+        Some(v) => format_bytes_binary(v, decimals),
+        None => "--".to_string(),
+    }
+}
+
+fn fmt_rate_block_opt(bps: Option<f64>) -> String {
+    match bps {
+        Some(v) if v.is_finite() && v >= 0.0 => {
+            let mut value = v;
+            let units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+            let mut idx = 0usize;
+            while value >= 1024.0 && idx + 1 < units.len() {
+                value /= 1024.0;
+                idx += 1;
+            }
+            let number = if value >= 100.0 {
+                format!("{value:.1}")
+            } else if value >= 10.0 {
+                format!("{value:.2}")
+            } else {
+                format!("{value:.3}")
+            };
+            format!("{number} {}/s", units[idx])
+        }
+        _ => "--/s".to_string(),
+    }
+}
+
+fn build_progress_bar(pct: Option<f64>, width: usize) -> String {
+    let w = width.max(8);
+    match pct {
+        Some(v) => {
+            let clamped = v.clamp(0.0, 100.0);
+            if clamped >= 100.0 {
+                return "=".repeat(w);
+            }
+            let filled = ((clamped / 100.0) * (w as f64)).floor() as usize;
+            if filled == 0 {
+                format!(">{}", " ".repeat(w.saturating_sub(1)))
+            } else if filled >= w {
+                "=".repeat(w)
+            } else {
+                format!("{}>{}", "=".repeat(filled), " ".repeat(w - filled - 1))
+            }
+        }
+        None => " ".repeat(w),
+    }
+}
+
+fn clamp_line_for_term(mut line: String) -> String {
+    let max_cols = terminal_columns().saturating_sub(1).max(40);
+    if line.chars().count() > max_cols {
+        line = line.chars().take(max_cols).collect();
+    }
+    line
+}
+
+fn option_u64_saturating_sub(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_sub(y)),
+        _ => None,
+    }
+}
+
+fn option_u64_saturating_add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+fn option_f64_saturating_sub(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some((x - y).max(0.0)),
+        _ => None,
+    }
+}
+
+fn transfer_eta_s(done: Option<u64>, total: u64, bps: Option<f64>) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    let done = done?;
+    let bps = bps?;
+    if bps <= 0.0 {
+        return None;
+    }
+    let remain = total.saturating_sub(done.min(total));
+    Some(remain as f64 / bps)
+}
+
+#[derive(Default)]
+struct ProgressRenderState {
+    active: bool,
+    lines: usize,
+    finalized_lines: usize,
+}
+
+fn progress_render_state() -> &'static Mutex<ProgressRenderState> {
+    static STATE: OnceLock<Mutex<ProgressRenderState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(ProgressRenderState::default()))
+}
+
+fn print_transfer_progress_bars(
+    _elapsed_s: f64,
+    planned_bytes: u64,
+    write_all_total: Option<u64>,
+    phase_label: &str,
+    rates: TransferProgressRates,
+    proc_totals_delta: ProcIoDeltas,
+    device_totals_delta: DeviceIoDeltas,
+    finalize_line: bool,
+    flushing: bool,
+) {
+    const LINES: usize = 8;
+    const BAR_WIDTH: usize = 34;
+    const LABEL_COL_WIDTH: usize = 13;
+    const BYTES_COL_WIDTH: usize = 11;
+    const RATE_COL_WIDTH: usize = 14;
+
+    let done = write_all_total;
+    let pct = if planned_bytes > 0 {
+        done.map(|d| (d as f64 * 100.0 / planned_bytes as f64).clamp(0.0, 100.0))
+    } else {
+        None
+    };
+    let eta = transfer_eta_s(done, planned_bytes, rates.write_all_bps);
+
+    let transfer_total = done;
+    let transfer_rate = rates.write_all_bps;
+    let write_disk_total = proc_totals_delta.write_bytes;
+    let write_disk_rate = rates.write_bytes_bps;
+    let write_complete_total = device_totals_delta.write_complete;
+    let write_complete_rate = rates.write_complete_bps;
+    let read_disk_total = proc_totals_delta.read_bytes;
+    let read_disk_rate = rates.read_bytes_bps;
+    let read_complete_total = device_totals_delta.read_complete;
+    let read_complete_rate = rates.read_complete_bps;
+    let read_cache_total =
+        option_u64_saturating_sub(proc_totals_delta.rchar, proc_totals_delta.read_bytes);
+    let read_cache_rate = option_f64_saturating_sub(rates.rchar_bps, rates.read_bytes_bps);
+
+    let done_s = fmt_bytes_block_opt(transfer_total, 3);
+    let planned_s = if planned_bytes > 0 {
+        format_bytes_binary(planned_bytes, 3)
+    } else {
+        "--".to_string()
+    };
+    let eta_s = match eta {
+        Some(v) => fmt_hms_tenths(v.max(0.0)),
+        None => "--:--:--.-".to_string(),
+    };
+    let pct_s = match pct {
+        Some(v) => format!("{v:>6.2}%"),
+        None => "  ---%".to_string(),
+    };
+    let transfer_complete = pct.map(|p| p >= 100.0).unwrap_or(false);
+    let transfer_rate_display = if transfer_complete {
+        format!("{:>width$}", "Complete", width = RATE_COL_WIDTH)
+    } else {
+        format!(
+            "{:>width$}",
+            fmt_rate_block_opt(transfer_rate),
+            width = RATE_COL_WIDTH
+        )
+    };
+
+    let mut lines = vec![
+        clamp_line_for_term(format!(
+            "{pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta",
+            build_progress_bar(pct, BAR_WIDTH)
+        )),
+        String::new(),
+        clamp_line_for_term(format!(
+            "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
+            phase_label,
+            fmt_bytes_block_opt(transfer_total, 3),
+            transfer_rate_display,
+            label_width = LABEL_COL_WIDTH,
+            bytes_width = BYTES_COL_WIDTH,
+            rate_width = RATE_COL_WIDTH
+        )),
+        clamp_line_for_term(format!(
+            "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
+            "WriteDisk",
+            fmt_bytes_block_opt(write_disk_total, 3),
+            fmt_rate_block_opt(write_disk_rate),
+            label_width = LABEL_COL_WIDTH,
+            bytes_width = BYTES_COL_WIDTH,
+            rate_width = RATE_COL_WIDTH
+        )),
+        clamp_line_for_term(format!(
+            "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}{}",
+            "WriteComplete",
+            fmt_bytes_block_opt(write_complete_total, 3),
+            fmt_rate_block_opt(write_complete_rate),
+            if flushing { " flushing" } else { "" },
+            label_width = LABEL_COL_WIDTH,
+            bytes_width = BYTES_COL_WIDTH,
+            rate_width = RATE_COL_WIDTH
+        )),
+        clamp_line_for_term(format!(
+            "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
+            "ReadCache",
+            fmt_bytes_block_opt(read_cache_total, 3),
+            fmt_rate_block_opt(read_cache_rate),
+            label_width = LABEL_COL_WIDTH,
+            bytes_width = BYTES_COL_WIDTH,
+            rate_width = RATE_COL_WIDTH
+        )),
+        clamp_line_for_term(format!(
+            "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
+            "ReadDisk",
+            fmt_bytes_block_opt(read_disk_total, 3),
+            fmt_rate_block_opt(read_disk_rate),
+            label_width = LABEL_COL_WIDTH,
+            bytes_width = BYTES_COL_WIDTH,
+            rate_width = RATE_COL_WIDTH
+        )),
+        clamp_line_for_term(format!(
+            "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
+            "ReadComplete",
+            fmt_bytes_block_opt(read_complete_total, 3),
+            fmt_rate_block_opt(read_complete_rate),
+            label_width = LABEL_COL_WIDTH,
+            bytes_width = BYTES_COL_WIDTH,
+            rate_width = RATE_COL_WIDTH
+        )),
+    ];
+    if lines.len() > LINES {
+        lines.truncate(LINES);
+    }
+
+    if let Ok(mut state) = progress_render_state().lock() {
+        if state.active {
+            let up = state.lines.saturating_sub(1);
+            if up > 0 {
+                print!("\x1b[{}A", up);
+            }
+        } else if state.finalized_lines > 0 {
+            print!("\x1b[{}A", state.finalized_lines);
+        }
+        for (idx, line) in lines.iter().enumerate() {
+            print!("\r\x1b[2K{line}");
+            if idx + 1 < lines.len() {
+                print!("\n");
+            }
+        }
+        if finalize_line {
+            println!();
+            state.active = false;
+            state.lines = 0;
+            state.finalized_lines = lines.len();
+        } else {
+            state.active = true;
+            state.lines = lines.len();
+            state.finalized_lines = 0;
+        }
+    }
+    let _ = io::stdout().flush();
+}
+
+fn reset_progress_render_state() {
+    if let Ok(mut state) = progress_render_state().lock() {
+        state.active = false;
+        state.lines = 0;
+        state.finalized_lines = 0;
+    }
 }
 
 fn print_summary_rate_line(label: &str, bps: f64, duration_s: f64, total: bool) {
@@ -366,35 +677,43 @@ fn print_summary_rate_line(label: &str, bps: f64, duration_s: f64, total: bool) 
     );
 }
 
-fn print_duration_only_line(duration_s: f64, total: bool) {
-    let total_suffix = if total { " (total)" } else { "" };
-    println!("{:<38}| Duration: {}{}", "", fmt_hms_ms(duration_s), total_suffix);
-}
-
-fn print_move_speed_summary(
-    avg_transfer_bps: f64,
-    avg_read_bps: f64,
-    avg_write_bps: f64,
+fn print_copy_duration_summary(
     transfer_duration_s: f64,
-    avg_delete_bps: f64,
-    delete_duration_s: f64,
+    transfer_bps: f64,
+    flush_duration_s: f64,
+    flush_bps: f64,
+    cleanup: Option<(f64, f64, f64, f64)>,
     total_duration_s: f64,
 ) {
-    println!("{:<24}{}/s", "Average transfer speed:", fmt_speed_bps(avg_transfer_bps));
-    println!("{:<24}{}/s", "Average read speed:", fmt_speed_bps(avg_read_bps));
     println!(
-        "{:<24}{}/s | Duration: {}",
-        "Average write speed:",
-        fmt_speed_bps(avg_write_bps),
-        fmt_hms_ms(transfer_duration_s)
+        "{:<26}{}  ({}/s)",
+        "Transfer Duration:",
+        fmt_hms_ms(transfer_duration_s),
+        fmt_speed_bps(transfer_bps)
     );
     println!(
-        "{:<24}{}/s | Duration: {}",
-        "Average delete speed:",
-        fmt_speed_bps(avg_delete_bps),
-        fmt_hms_ms(delete_duration_s)
+        "{:<26}{}  ({}/s)",
+        "Transfer Flush Duration:",
+        fmt_hms_ms(flush_duration_s),
+        fmt_speed_bps(flush_bps)
     );
-    print_duration_only_line(total_duration_s, true);
+    if let Some((cleanup_duration_s, cleanup_bps, cleanup_flush_duration_s, cleanup_flush_bps)) =
+        cleanup
+    {
+        println!(
+            "{:<26}{}  ({}/s)",
+            "Cleanup Duration:",
+            fmt_hms_ms(cleanup_duration_s),
+            fmt_speed_bps(cleanup_bps)
+        );
+        println!(
+            "{:<26}{}  ({}/s)",
+            "Cleanup Flush Duration:",
+            fmt_hms_ms(cleanup_flush_duration_s),
+            fmt_speed_bps(cleanup_flush_bps)
+        );
+    }
+    println!("{:<26}{}", "Total Duration:", fmt_hms_ms(total_duration_s));
 }
 
 fn parse_env_threads() -> Option<usize> {
@@ -419,7 +738,9 @@ fn preferred_thread_count(media: MediaKind) -> usize {
     if let Some(n) = parse_env_threads() {
         return n;
     }
-    let logical = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let logical = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     match media {
         MediaKind::Hdd => logical.clamp(2, 2),
         MediaKind::Nvme => logical.clamp(2, 32),
@@ -473,7 +794,9 @@ fn configure_rayon_threads_for_media(media: MediaKind) {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let threads = preferred_thread_count(media);
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global();
     });
 }
 
@@ -522,7 +845,10 @@ fn read_diskstats_bytes() -> io::Result<HashMap<(u64, u64), (u64, u64)>> {
         };
         out.insert(
             (maj, min),
-            (sectors_read.saturating_mul(512), sectors_written.saturating_mul(512)),
+            (
+                sectors_read.saturating_mul(512),
+                sectors_written.saturating_mul(512),
+            ),
         );
     }
     Ok(out)
@@ -699,7 +1025,11 @@ fn sum_diskstats_counter(
     for key in keys {
         if let Some((read_bytes, write_bytes)) = table.get(key) {
             found = true;
-            let v = if read_counter { *read_bytes } else { *write_bytes };
+            let v = if read_counter {
+                *read_bytes
+            } else {
+                *write_bytes
+            };
             total = total.saturating_add(v);
         }
     }
@@ -727,7 +1057,9 @@ fn block_leaf_names_for_path(path: &Path) -> Vec<String> {
 }
 
 fn block_is_rotational(name: &str) -> Option<bool> {
-    let p = Path::new("/sys/class/block").join(name).join("queue/rotational");
+    let p = Path::new("/sys/class/block")
+        .join(name)
+        .join("queue/rotational");
     let raw = fs::read_to_string(p).ok()?;
     match raw.trim() {
         "1" => Some(true),
@@ -758,7 +1090,9 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 fn set_block_scheduler(name: &str, scheduler: &str, use_sudo: bool) -> bool {
-    let p = Path::new("/sys/class/block").join(name).join("queue/scheduler");
+    let p = Path::new("/sys/class/block")
+        .join(name)
+        .join("queue/scheduler");
     if fs::write(&p, scheduler).is_ok() {
         return true;
     }
@@ -771,7 +1105,9 @@ fn set_block_scheduler(name: &str, scheduler: &str, use_sudo: bool) -> bool {
         shell_single_quote(&p.display().to_string())
     );
     let cmd = vec!["sh".to_string(), "-c".to_string(), script];
-    run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false)
+    run_command_capture(&cmd, true)
+        .map(|o| o.code == 0)
+        .unwrap_or(false)
 }
 
 fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mode: TransferMode) {
@@ -791,7 +1127,9 @@ fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mode: Transfe
         if !matches!(block_is_rotational(&name), Some(true)) {
             continue;
         }
-        let sched_path = Path::new("/sys/class/block").join(&name).join("queue/scheduler");
+        let sched_path = Path::new("/sys/class/block")
+            .join(&name)
+            .join("queue/scheduler");
         let raw = match fs::read_to_string(&sched_path) {
             Ok(v) => v,
             Err(_) => continue,
@@ -836,6 +1174,80 @@ fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mode: Transfe
     }
 }
 
+fn read_proc_io_counters(pid: u32) -> Option<ProcIoCounters> {
+    let path = format!("/proc/{pid}/io");
+    let text = fs::read_to_string(path).ok()?;
+    let mut counters = ProcIoCounters::default();
+    let mut saw_rchar = false;
+    let mut saw_wchar = false;
+    let mut saw_read_bytes = false;
+    let mut saw_write_bytes = false;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let key = parts.next()?;
+        let value = parts.next()?.parse::<u64>().ok()?;
+        match key {
+            "rchar:" => {
+                counters.rchar = value;
+                saw_rchar = true;
+            }
+            "wchar:" => {
+                counters.wchar = value;
+                saw_wchar = true;
+            }
+            "read_bytes:" => {
+                counters.read_bytes = value;
+                saw_read_bytes = true;
+            }
+            "write_bytes:" => {
+                counters.write_bytes = value;
+                saw_write_bytes = true;
+            }
+            _ => {}
+        }
+    }
+    if saw_rchar && saw_wchar && saw_read_bytes && saw_write_bytes {
+        Some(counters)
+    } else {
+        None
+    }
+}
+
+impl ProcessIoWindow {
+    fn from_pid(pid: u32) -> Self {
+        Self {
+            pid,
+            ..Self::default()
+        }
+    }
+
+    fn sample(&mut self) -> TransferProgressRates {
+        let mut rates = TransferProgressRates::default();
+        let now = Instant::now();
+        let now_counters = read_proc_io_counters(self.pid);
+        if let Some(prev_at) = self.last_at {
+            let dt = now.duration_since(prev_at).as_secs_f64().max(1e-6);
+            if let (Some(cur), Some(prev)) = (now_counters, self.last_counters) {
+                rates.rchar_bps = Some(cur.rchar.saturating_sub(prev.rchar) as f64 / dt);
+                rates.wchar_bps = Some(cur.wchar.saturating_sub(prev.wchar) as f64 / dt);
+                rates.read_bytes_bps =
+                    Some(cur.read_bytes.saturating_sub(prev.read_bytes) as f64 / dt);
+                rates.write_bytes_bps =
+                    Some(cur.write_bytes.saturating_sub(prev.write_bytes) as f64 / dt);
+            }
+        }
+        self.last_at = Some(now);
+        if now_counters.is_some() {
+            self.last_counters = now_counters;
+        }
+        rates
+    }
+
+    fn current_totals(&self) -> Option<ProcIoCounters> {
+        read_proc_io_counters(self.pid)
+    }
+}
+
 impl DeviceIoWindow {
     fn from_transfer_paths(src_path: &str, dst_path: &str) -> Self {
         let src_keys = local_path_from_transfer_arg(src_path)
@@ -846,42 +1258,7 @@ impl DeviceIoWindow {
             .as_deref()
             .map(device_keys_for_path)
             .unwrap_or_default();
-        Self {
-            src_keys,
-            dst_keys,
-            ..Self::default()
-        }
-    }
-
-    fn sample(&mut self) -> DeviceIoRates {
-        let mut rates = DeviceIoRates::default();
-        let now = Instant::now();
-        let table = match read_diskstats_bytes() {
-            Ok(v) => v,
-            Err(_) => return rates,
-        };
-
-        let src_read_now = sum_diskstats_counter(&table, &self.src_keys, true);
-        let dst_write_now = sum_diskstats_counter(&table, &self.dst_keys, false);
-
-        if let Some(prev_at) = self.last_at {
-            let dt = now.duration_since(prev_at).as_secs_f64().max(1e-6);
-            if let (Some(cur), Some(prev)) = (src_read_now, self.last_src_read_bytes) {
-                rates.src_read_bps = Some(cur.saturating_sub(prev) as f64 / dt);
-            }
-            if let (Some(cur), Some(prev)) = (dst_write_now, self.last_dst_write_bytes) {
-                rates.dst_write_bps = Some(cur.saturating_sub(prev) as f64 / dt);
-            }
-        }
-
-        self.last_at = Some(now);
-        if src_read_now.is_some() {
-            self.last_src_read_bytes = src_read_now;
-        }
-        if dst_write_now.is_some() {
-            self.last_dst_write_bytes = dst_write_now;
-        }
-        rates
+        Self { src_keys, dst_keys }
     }
 
     fn current_totals(&self) -> (Option<u64>, Option<u64>) {
@@ -903,6 +1280,28 @@ fn counter_delta(start: Option<u64>, end: Option<u64>) -> Option<u64> {
     }
 }
 
+fn proc_io_deltas(start: Option<ProcIoCounters>, end: Option<ProcIoCounters>) -> ProcIoDeltas {
+    match (start, end) {
+        (Some(a), Some(b)) => ProcIoDeltas {
+            rchar: Some(b.rchar.saturating_sub(a.rchar)),
+            wchar: Some(b.wchar.saturating_sub(a.wchar)),
+            read_bytes: Some(b.read_bytes.saturating_sub(a.read_bytes)),
+            write_bytes: Some(b.write_bytes.saturating_sub(a.write_bytes)),
+        },
+        _ => ProcIoDeltas::default(),
+    }
+}
+
+fn device_io_deltas(
+    start: (Option<u64>, Option<u64>),
+    end: (Option<u64>, Option<u64>),
+) -> DeviceIoDeltas {
+    DeviceIoDeltas {
+        read_complete: counter_delta(start.0, end.0),
+        write_complete: counter_delta(start.1, end.1),
+    }
+}
+
 fn existing_probe_path(path: &Path) -> Option<PathBuf> {
     let mut probe = if path.as_os_str().is_empty() {
         PathBuf::from(".")
@@ -920,10 +1319,18 @@ fn existing_probe_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn destination_available_bytes(path: &Path) -> io::Result<(u64, PathBuf)> {
-    let probe = existing_probe_path(path)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No existing destination ancestor path found"))?;
-    let stats = statvfs(&probe)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("statvfs failed for {}: {e}", probe.display())))?;
+    let probe = existing_probe_path(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "No existing destination ancestor path found",
+        )
+    })?;
+    let stats = statvfs(&probe).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("statvfs failed for {}: {e}", probe.display()),
+        )
+    })?;
     let avail = stats
         .blocks_available()
         .saturating_mul(stats.fragment_size() as u64);
@@ -935,7 +1342,12 @@ fn can_fast_rename_same_fs(source: &Path, target: &Path) -> bool {
         .parent()
         .and_then(|p| fs::metadata(p).ok())
         .map(|m| m.dev())
-        .zip(target.parent().and_then(|p| fs::metadata(p).ok()).map(|m| m.dev()))
+        .zip(
+            target
+                .parent()
+                .and_then(|p| fs::metadata(p).ok())
+                .map(|m| m.dev()),
+        )
         .map(|(a, b)| a == b)
         .unwrap_or(false)
 }
@@ -958,7 +1370,9 @@ fn realpath_allow_missing(input: &Path) -> PathBuf {
     let abs = if input.is_absolute() {
         input.to_path_buf()
     } else {
-        env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(input)
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(input)
     };
 
     if abs.exists() {
@@ -1153,7 +1567,11 @@ fn endpoint_to_rsync(
 fn resolve_source(value: &str, mode: TransferMode) -> Result<(PathBuf, SrcObjKind), i32> {
     let p = to_real_path(value);
     if !p.exists() {
-        log(mode, &format!("Source path does not exist: {value}"), LogLevel::Error);
+        log(
+            mode,
+            &format!("Source path does not exist: {value}"),
+            LogLevel::Error,
+        );
         return Err(1);
     }
     if p.is_dir() {
@@ -1162,11 +1580,18 @@ fn resolve_source(value: &str, mode: TransferMode) -> Result<(PathBuf, SrcObjKin
     if p.is_file() {
         return Ok((p, SrcObjKind::File));
     }
-    log(mode, &format!("Source path must be a file or directory: {value}"), LogLevel::Error);
+    log(
+        mode,
+        &format!("Source path must be a file or directory: {value}"),
+        LogLevel::Error,
+    );
     Err(1)
 }
 
-fn resolve_destination_for_file(value: &str, mode: TransferMode) -> Result<(PathBuf, DstObjKind), i32> {
+fn resolve_destination_for_file(
+    value: &str,
+    mode: TransferMode,
+) -> Result<(PathBuf, DstObjKind), i32> {
     let dst_real = to_real_path(value);
     if dst_real.exists() {
         if dst_real.is_dir() {
@@ -1178,7 +1603,10 @@ fn resolve_destination_for_file(value: &str, mode: TransferMode) -> Result<(Path
     if !parent.is_dir() {
         log(
             mode,
-            &format!("Destination parent directory does not exist: {}", parent.display()),
+            &format!(
+                "Destination parent directory does not exist: {}",
+                parent.display()
+            ),
             LogLevel::Error,
         );
         return Err(1);
@@ -1210,7 +1638,10 @@ fn resolve_destination_for_dir(
     if !parent.is_dir() {
         log(
             mode,
-            &format!("Destination parent directory does not exist: {}", parent.display()),
+            &format!(
+                "Destination parent directory does not exist: {}",
+                parent.display()
+            ),
             LogLevel::Error,
         );
         return Err(1);
@@ -1218,28 +1649,21 @@ fn resolve_destination_for_dir(
     Ok((p, DstObjKind::DirNew))
 }
 
-fn destination_file_counts(destination_root: &Path, source_rel_files: &HashSet<String>) -> (u64, u64) {
+fn destination_file_counts(
+    destination_root: &Path,
+    source_rel_files: &HashSet<String>,
+) -> (u64, u64) {
     if !destination_root.is_dir() {
         return (0, 0);
     }
-
-    WalkDir::new(destination_root)
-        .sort(false)
-        .skip_hidden(false)
-        .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().is_file())
-        .fold((0u64, 0u64), |(total, uncollided), e| {
-            let rel = e
-                .path()
-                .strip_prefix(destination_root)
-                .ok()
-                .map(normalize_rel)
-                .unwrap_or_default();
-            let is_uncollided = !rel.is_empty() && !source_rel_files.contains(&rel);
-            (total + 1, uncollided + u64::from(is_uncollided))
-        })
+    let idx = build_destination_index(destination_root);
+    let total = idx.file_sizes.len() as u64;
+    let uncollided = idx
+        .file_sizes
+        .keys()
+        .filter(|rel| !source_rel_files.contains(*rel))
+        .count() as u64;
+    (total, uncollided)
 }
 
 fn count_directories_any(path: &Path, include_root: bool) -> u64 {
@@ -1249,7 +1673,9 @@ fn count_directories_any(path: &Path, include_root: bool) -> u64 {
     let descendants = WalkDir::new(path)
         .sort(false)
         .skip_hidden(false)
-        .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
+        .parallelism(jwalk::Parallelism::RayonDefaultPool {
+            busy_timeout: Duration::from_secs(0),
+        })
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_dir() && e.depth() > 0)
@@ -1288,9 +1714,12 @@ fn build_destination_index(destination_root: &Path) -> DestinationIndex {
         return DestinationIndex::default();
     }
 
-    let mut file_sizes: FxHashMap<String, u64> = FxHashMap::with_capacity_and_hasher(1024 * 1024, Default::default());
-    let mut dirs: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(65536, Default::default());
-    let mut symlinks: FxHashSet<String> = FxHashSet::with_capacity_and_hasher(4096, Default::default());
+    let mut file_sizes: FxHashMap<String, u64> =
+        FxHashMap::with_capacity_and_hasher(1024 * 1024, Default::default());
+    let mut dirs: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(65536, Default::default());
+    let mut symlinks: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(4096, Default::default());
 
     for ent in WalkDir::new(destination_root)
         .sort(false)
@@ -1310,10 +1739,11 @@ fn build_destination_index(destination_root: &Path) -> DestinationIndex {
 
         let fty = ent.file_type();
         if fty.is_file() {
-            let size = ent
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or_else(|_| fs::symlink_metadata(ent.path()).map(|m| m.len()).unwrap_or(0));
+            let size = ent.metadata().map(|m| m.len()).unwrap_or_else(|_| {
+                fs::symlink_metadata(ent.path())
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            });
             file_sizes.insert(rel, size);
         } else if fty.is_dir() && ent.depth() > 0 {
             dirs.insert(rel);
@@ -1359,13 +1789,13 @@ fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut FxHashSet<Strin
 
 fn usage() {
     eprintln!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v|-vv|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
     );
 }
 
 fn print_help() {
     println!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v|-vv|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
     );
     println!();
     println!("Standalone copy/move with preview/progress.");
@@ -1375,7 +1805,9 @@ fn print_help() {
     println!();
     println!("positional arguments:");
     println!("  source                Source path (file or directory)");
-    println!("  destination           Destination path (directory, or file path when source is a file)");
+    println!(
+        "  destination           Destination path (directory, or file path when source is a file)"
+    );
     println!();
     println!("options:");
     println!("  -h, --help            show this help message and exit");
@@ -1385,6 +1817,8 @@ fn print_help() {
     println!("  -c, --contents-only   Transfer source directory children into destination (like source/*; do not nest source basename).");
     println!("                        In --move mode, source directories are removed if they become empty.");
     println!("  -b, --backup          Create a timestamped backup when destination data will be merged or overwritten.");
+    println!("  -v, -vv, --verbose, --showall");
+    println!("                        Show full preview tree (new, modified, identical, uncollided, deleted).");
     println!("  -L depth              Max depth of preview tree (default: auto-fit deepest level within 27 lines, up to 20).");
     println!("  -T trunc              Max entries per folder before truncation (default: 25).");
     println!("  --preview             Run preview only (no prompt, no transfer).");
@@ -1412,6 +1846,7 @@ fn parse_args() -> Result<CliArgs, i32> {
             "-o" | "--overwrite" => args.overwrite = true,
             "-c" | "--contents-only" => args.contents_only = true,
             "-b" | "--backup" => args.backup = true,
+            "-v" | "-vv" | "--verbose" | "--showall" => args.showall = true,
             "-L" => {
                 i += 1;
                 if i >= argv.len() {
@@ -1481,28 +1916,18 @@ fn run_command_capture(cmd: &[String], sudo: bool) -> io::Result<CmdOutput> {
     })
 }
 
-fn flush_destination_writes(dst_path: &Path, use_sudo: bool, mode: TransferMode) {
-    let target = if dst_path.exists() {
-        if dst_path.is_dir() {
-            dst_path.to_path_buf()
-        } else {
-            dst_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf()
-        }
-    } else {
-        dst_path.parent().unwrap_or_else(|| Path::new("/")).to_path_buf()
-    };
-
-    let flush_start = Instant::now();
+fn run_flush_command(target: &Path, use_sudo: bool) -> bool {
     let mut ok = false;
-
     if use_sudo {
         let cmd = vec![
             "sync".to_string(),
             "-f".to_string(),
             target.display().to_string(),
         ];
-        ok = run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false);
-    } else if let Ok(f) = fs::File::open(&target) {
+        ok = run_command_capture(&cmd, true)
+            .map(|o| o.code == 0)
+            .unwrap_or(false);
+    } else if let Ok(f) = fs::File::open(target) {
         let rc = unsafe { nix::libc::syncfs(f.as_raw_fd()) };
         ok = rc == 0;
     }
@@ -1510,22 +1935,376 @@ fn flush_destination_writes(dst_path: &Path, use_sudo: bool, mode: TransferMode)
     if !ok {
         if use_sudo {
             let cmd = vec!["sync".to_string()];
-            let _ = run_command_capture(&cmd, true);
+            ok = run_command_capture(&cmd, true)
+                .map(|o| o.code == 0)
+                .unwrap_or(false);
         } else {
             unsafe {
                 nix::libc::sync();
             }
+            ok = true;
         }
     }
+    ok
+}
 
-    log(
+#[derive(Clone, Copy, Default)]
+struct FlushStats {
+    elapsed_s: f64,
+    flushed_bytes: Option<u64>,
+}
+
+fn flush_destination_writes(
+    dst_path: &Path,
+    use_sudo: bool,
+    mode: TransferMode,
+    progress: Option<ProgressSnapshot>,
+) -> FlushStats {
+    let target = if dst_path.exists() {
+        if dst_path.is_dir() {
+            dst_path.to_path_buf()
+        } else {
+            dst_path
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf()
+        }
+    } else {
+        dst_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    };
+
+    let target_key = target.display().to_string();
+    let flush_device_window = DeviceIoWindow::from_transfer_paths(&target_key, &target_key);
+    let flush_device_start = flush_device_window.current_totals();
+    let flush_write_start = flush_device_start.1;
+    let flush_start = Instant::now();
+    let proc_start = read_proc_io_counters(std::process::id());
+    let (flush_tx, flush_rx) = mpsc::channel::<bool>();
+    let target_for_flush = target.clone();
+    let flush_thread = thread::spawn(move || {
+        let ok = run_flush_command(&target_for_flush, use_sudo);
+        let _ = flush_tx.send(ok);
+    });
+
+    let mut flush_ok = false;
+    let mut last_proc_sample = proc_start;
+    let mut last_device_sample = flush_device_start;
+    let mut last_sample_at = flush_start;
+    let mut last_progress_rates = progress.map(|p| p.rates).unwrap_or_default();
+
+    loop {
+        match flush_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(ok) => {
+                flush_ok = ok;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(snapshot) = progress {
+                    let now = Instant::now();
+                    let proc_now = read_proc_io_counters(std::process::id());
+                    let proc_extra = proc_io_deltas(proc_start, proc_now);
+                    let device_now = flush_device_window.current_totals();
+                    let device_extra = device_io_deltas(flush_device_start, device_now);
+                    if let (Some(cur), Some(prev)) = (proc_now, last_proc_sample) {
+                        let dt = now.duration_since(last_sample_at).as_secs_f64().max(1e-6);
+                        last_progress_rates.rchar_bps =
+                            Some(cur.rchar.saturating_sub(prev.rchar) as f64 / dt);
+                        last_progress_rates.wchar_bps =
+                            Some(cur.wchar.saturating_sub(prev.wchar) as f64 / dt);
+                        last_progress_rates.read_bytes_bps =
+                            Some(cur.read_bytes.saturating_sub(prev.read_bytes) as f64 / dt);
+                        last_progress_rates.write_bytes_bps =
+                            Some(cur.write_bytes.saturating_sub(prev.write_bytes) as f64 / dt);
+                        last_progress_rates.read_complete_bps =
+                            counter_delta(last_device_sample.0, device_now.0)
+                                .map(|v| v as f64 / dt);
+                        last_progress_rates.write_complete_bps =
+                            counter_delta(last_device_sample.1, device_now.1)
+                                .map(|v| v as f64 / dt);
+                        last_proc_sample = proc_now;
+                        last_device_sample = device_now;
+                        last_sample_at = now;
+                    }
+                    let merged_proc_deltas = ProcIoDeltas {
+                        rchar: option_u64_saturating_add(
+                            snapshot.proc_deltas.rchar,
+                            proc_extra.rchar,
+                        ),
+                        wchar: option_u64_saturating_add(
+                            snapshot.proc_deltas.wchar,
+                            proc_extra.wchar,
+                        ),
+                        read_bytes: option_u64_saturating_add(
+                            snapshot.proc_deltas.read_bytes,
+                            proc_extra.read_bytes,
+                        ),
+                        write_bytes: option_u64_saturating_add(
+                            snapshot.proc_deltas.write_bytes,
+                            proc_extra.write_bytes,
+                        ),
+                    };
+                    let merged_device_deltas = DeviceIoDeltas {
+                        read_complete: option_u64_saturating_add(
+                            snapshot.device_deltas.read_complete,
+                            device_extra.read_complete,
+                        ),
+                        write_complete: option_u64_saturating_add(
+                            snapshot.device_deltas.write_complete,
+                            device_extra.write_complete,
+                        ),
+                    };
+                    let mut display_rates = snapshot.rates;
+                    display_rates.rchar_bps =
+                        last_progress_rates.rchar_bps.or(display_rates.rchar_bps);
+                    display_rates.wchar_bps =
+                        last_progress_rates.wchar_bps.or(display_rates.wchar_bps);
+                    display_rates.read_bytes_bps = last_progress_rates
+                        .read_bytes_bps
+                        .or(display_rates.read_bytes_bps);
+                    display_rates.write_bytes_bps = last_progress_rates
+                        .write_bytes_bps
+                        .or(display_rates.write_bytes_bps);
+                    display_rates.read_complete_bps = last_progress_rates
+                        .read_complete_bps
+                        .or(display_rates.read_complete_bps);
+                    display_rates.write_complete_bps = last_progress_rates
+                        .write_complete_bps
+                        .or(display_rates.write_complete_bps);
+                    print_transfer_progress_bars(
+                        snapshot.elapsed_s + now.duration_since(flush_start).as_secs_f64(),
+                        snapshot.planned_bytes,
+                        snapshot.write_all_total,
+                        snapshot.phase_label,
+                        display_rates,
+                        merged_proc_deltas,
+                        merged_device_deltas,
+                        false,
+                        true,
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    let _ = flush_thread.join();
+
+    let flush_elapsed_s = flush_start.elapsed().as_secs_f64();
+    let flush_device_end = flush_device_window.current_totals();
+    let flush_write_end = flush_device_end.1;
+
+    if let Some(snapshot) = progress {
+        let proc_end = read_proc_io_counters(std::process::id());
+        let proc_extra = proc_io_deltas(proc_start, proc_end);
+        let device_extra = device_io_deltas(flush_device_start, flush_device_end);
+        let merged_proc_deltas = ProcIoDeltas {
+            rchar: option_u64_saturating_add(snapshot.proc_deltas.rchar, proc_extra.rchar),
+            wchar: option_u64_saturating_add(snapshot.proc_deltas.wchar, proc_extra.wchar),
+            read_bytes: option_u64_saturating_add(
+                snapshot.proc_deltas.read_bytes,
+                proc_extra.read_bytes,
+            ),
+            write_bytes: option_u64_saturating_add(
+                snapshot.proc_deltas.write_bytes,
+                proc_extra.write_bytes,
+            ),
+        };
+        let merged_device_deltas = DeviceIoDeltas {
+            read_complete: option_u64_saturating_add(
+                snapshot.device_deltas.read_complete,
+                device_extra.read_complete,
+            ),
+            write_complete: option_u64_saturating_add(
+                snapshot.device_deltas.write_complete,
+                device_extra.write_complete,
+            ),
+        };
+        let mut display_rates = snapshot.rates;
+        display_rates.rchar_bps = last_progress_rates.rchar_bps.or(display_rates.rchar_bps);
+        display_rates.wchar_bps = last_progress_rates.wchar_bps.or(display_rates.wchar_bps);
+        display_rates.read_bytes_bps = last_progress_rates
+            .read_bytes_bps
+            .or(display_rates.read_bytes_bps);
+        display_rates.write_bytes_bps = last_progress_rates
+            .write_bytes_bps
+            .or(display_rates.write_bytes_bps);
+        display_rates.read_complete_bps = last_progress_rates
+            .read_complete_bps
+            .or(display_rates.read_complete_bps);
+        display_rates.write_complete_bps = last_progress_rates
+            .write_complete_bps
+            .or(display_rates.write_complete_bps);
+        print_transfer_progress_bars(
+            snapshot.elapsed_s + flush_elapsed_s,
+            snapshot.planned_bytes,
+            snapshot.write_all_total,
+            snapshot.phase_label,
+            display_rates,
+            merged_proc_deltas,
+            merged_device_deltas,
+            true,
+            true,
+        );
+    }
+    let flushed_bytes = counter_delta(flush_write_start, flush_write_end);
+    if flushed_bytes.is_none() && !flush_ok {
+        log(
+            mode,
+            "Flush phase could not be measured via disk counters.",
+            LogLevel::Warn,
+        );
+    }
+    FlushStats {
+        elapsed_s: flush_elapsed_s,
+        flushed_bytes,
+    }
+}
+
+fn flush_source_cleanup_writes(src_path: &Path, use_sudo: bool, mode: TransferMode) -> FlushStats {
+    let target = if src_path.exists() {
+        if src_path.is_dir() {
+            src_path.to_path_buf()
+        } else {
+            src_path
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf()
+        }
+    } else {
+        src_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    };
+    let target_key = target.display().to_string();
+    let device_window = DeviceIoWindow::from_transfer_paths(&target_key, &target_key);
+    let start_totals = device_window.current_totals();
+    let start = Instant::now();
+    let ok = run_flush_command(&target, use_sudo);
+    let elapsed_s = start.elapsed().as_secs_f64();
+    let end_totals = device_window.current_totals();
+    let flushed_bytes = counter_delta(start_totals.1, end_totals.1);
+    if !ok {
+        log(
+            mode,
+            "Source cleanup flush may be incomplete.",
+            LogLevel::Warn,
+        );
+    }
+    FlushStats {
+        elapsed_s,
+        flushed_bytes,
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CleanupPhaseStats {
+    deleted: DeleteCleanupOutcome,
+    cleanup_elapsed_s: f64,
+    flush: FlushStats,
+}
+
+fn run_move_cleanup_phase(
+    src_path: &str,
+    dst_path: &str,
+    src_mnt: &Path,
+    src_obj_kind: SrcObjKind,
+    contents_mode_requested: bool,
+    source_contents_mode: bool,
+    rename_dir_to_new_path: bool,
+    use_sudo: bool,
+    mode: TransferMode,
+    transfer_manifest: Option<&TransferManifest>,
+    expected_files: u64,
+    expected_bytes: u64,
+) -> CleanupPhaseStats {
+    log(mode, "Starting cleanup", LogLevel::Info);
+    println!();
+    reset_progress_render_state();
+
+    let pid = std::process::id();
+    let proc_start = read_proc_io_counters(pid);
+    let device_window = DeviceIoWindow::from_transfer_paths(src_path, src_path);
+    let device_start = device_window.current_totals();
+
+    let cleanup_start = Instant::now();
+    let deleted = prune_move_source_duplicates(
+        src_path,
+        dst_path,
+        src_obj_kind,
+        contents_mode_requested && src_obj_kind == SrcObjKind::Dir,
+        use_sudo,
         mode,
-        &format!(
-            "Destination flush complete ({}).",
-            fmt_hms_ms(flush_start.elapsed().as_secs_f64())
-        ),
-        LogLevel::Info,
+        transfer_manifest,
+        expected_files,
+        expected_bytes,
     );
+    if src_obj_kind == SrcObjKind::Dir {
+        let remove_root = (!source_contents_mode) || rename_dir_to_new_path;
+        cleanup_source_dirs(src_mnt, remove_root, use_sudo, mode);
+    }
+    let cleanup_elapsed_s = cleanup_start.elapsed().as_secs_f64();
+
+    let flush = flush_source_cleanup_writes(src_mnt, use_sudo, mode);
+    let total_elapsed_s = (cleanup_elapsed_s + flush.elapsed_s).max(1e-6);
+    let proc_end = read_proc_io_counters(pid);
+    let proc_delta = proc_io_deltas(proc_start, proc_end);
+    let device_end = device_window.current_totals();
+    let device_delta = device_io_deltas(device_start, device_end);
+
+    let mut rates = TransferProgressRates::default();
+    if cleanup_elapsed_s > 0.0 {
+        rates.write_all_bps = Some(deleted.bytes as f64 / cleanup_elapsed_s.max(1e-6));
+    }
+    rates.rchar_bps = proc_delta.rchar.map(|v| v as f64 / total_elapsed_s);
+    rates.wchar_bps = proc_delta.wchar.map(|v| v as f64 / total_elapsed_s);
+    rates.read_bytes_bps = proc_delta.read_bytes.map(|v| v as f64 / total_elapsed_s);
+    rates.write_bytes_bps = proc_delta.write_bytes.map(|v| v as f64 / total_elapsed_s);
+    rates.read_complete_bps = device_delta
+        .read_complete
+        .map(|v| v as f64 / total_elapsed_s);
+    rates.write_complete_bps = if flush.elapsed_s > 0.0 {
+        flush
+            .flushed_bytes
+            .map(|v| v as f64 / flush.elapsed_s.max(1e-6))
+            .or_else(|| {
+                device_delta
+                    .write_complete
+                    .map(|v| v as f64 / total_elapsed_s)
+            })
+    } else {
+        device_delta
+            .write_complete
+            .map(|v| v as f64 / total_elapsed_s)
+    };
+
+    let delete_total = if deleted.bytes > 0 {
+        deleted.bytes
+    } else {
+        expected_bytes
+    };
+    print_transfer_progress_bars(
+        total_elapsed_s,
+        delete_total,
+        Some(delete_total),
+        "Delete",
+        rates,
+        proc_delta,
+        device_delta,
+        true,
+        true,
+    );
+
+    log(mode, "Cleanup complete.", LogLevel::Info);
+    CleanupPhaseStats {
+        deleted,
+        cleanup_elapsed_s,
+        flush,
+    }
 }
 
 fn fmt_mode_word(label: &str, active: bool) -> String {
@@ -1561,7 +2340,10 @@ fn print_preview_root_line(preview_root: &Path, highlight_new_leaf: bool, emphas
         return;
     }
 
-    let parent = p.parent().map(|x| x.display().to_string()).unwrap_or_default();
+    let parent = p
+        .parent()
+        .map(|x| x.display().to_string())
+        .unwrap_or_default();
     let parent_trimmed = parent.trim_end_matches('/');
     if parent_trimmed.is_empty() {
         if p.is_absolute() {
@@ -1590,8 +2372,12 @@ fn chrono_like_stamp() -> String {
     // YYYYMMDD-HHMMSS localtime without external crates.
     // Falls back to unix seconds formatting if conversion fails.
     let now = SystemTime::now();
-    let secs = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs() as i64;
-    let t = libc_time::LocalTime::from_unix(secs).unwrap_or_else(|| libc_time::LocalTime::fallback(secs));
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs() as i64;
+    let t = libc_time::LocalTime::from_unix(secs)
+        .unwrap_or_else(|| libc_time::LocalTime::fallback(secs));
     format!(
         "{:04}{:02}{:02}-{:02}{:02}{:02}",
         t.year, t.month, t.day, t.hour, t.min, t.sec
@@ -1732,11 +2518,20 @@ fn remove_path_recursive(path: &Path, use_sudo: bool, mode: TransferMode) -> boo
         return true;
     }
     if use_sudo {
-        let cmd = vec!["rm".to_string(), "-rf".to_string(), "--".to_string(), path.display().to_string()];
+        let cmd = vec![
+            "rm".to_string(),
+            "-rf".to_string(),
+            "--".to_string(),
+            path.display().to_string(),
+        ];
         match run_command_capture(&cmd, true) {
             Ok(out) if out.code == 0 => true,
             _ => {
-                log(mode, &format!("Failed to remove existing path: {}", path.display()), LogLevel::Error);
+                log(
+                    mode,
+                    &format!("Failed to remove existing path: {}", path.display()),
+                    LogLevel::Error,
+                );
                 false
             }
         }
@@ -1747,14 +2542,23 @@ fn remove_path_recursive(path: &Path, use_sudo: bool, mode: TransferMode) -> boo
             fs::remove_file(path)
         };
         if res.is_err() {
-            log(mode, &format!("Failed to remove existing path: {}", path.display()), LogLevel::Error);
+            log(
+                mode,
+                &format!("Failed to remove existing path: {}", path.display()),
+                LogLevel::Error,
+            );
             return false;
         }
         true
     }
 }
 
-fn backup_path_with_base(path: &Path, use_sudo: bool, base: &Path, mode: TransferMode) -> Option<PathBuf> {
+fn backup_path_with_base(
+    path: &Path,
+    use_sudo: bool,
+    base: &Path,
+    mode: TransferMode,
+) -> Option<PathBuf> {
     if path == Path::new("/") {
         log(mode, "Refusing to backup root path.", LogLevel::Error);
         return None;
@@ -1777,7 +2581,9 @@ fn backup_path_with_base(path: &Path, use_sudo: bool, base: &Path, mode: Transfe
                 path.display().to_string(),
                 candidate.display().to_string(),
             ];
-            run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false)
+            run_command_capture(&cmd, true)
+                .map(|o| o.code == 0)
+                .unwrap_or(false)
         } else {
             fs::rename(path, &candidate).is_ok()
         };
@@ -1787,11 +2593,23 @@ fn backup_path_with_base(path: &Path, use_sudo: bool, base: &Path, mode: Transfe
         }
     }
 
-    log(mode, &format!("Failed to create unique backup name for: {}", path.display()), LogLevel::Error);
+    log(
+        mode,
+        &format!(
+            "Failed to create unique backup name for: {}",
+            path.display()
+        ),
+        LogLevel::Error,
+    );
     None
 }
 
-fn copy_path_to_backup(path: &Path, backup_path: &Path, use_sudo: bool, mode: TransferMode) -> Option<PathBuf> {
+fn copy_path_to_backup(
+    path: &Path,
+    backup_path: &Path,
+    use_sudo: bool,
+    mode: TransferMode,
+) -> Option<PathBuf> {
     let ok = if use_sudo {
         let cmd = vec![
             "cp".to_string(),
@@ -1800,13 +2618,19 @@ fn copy_path_to_backup(path: &Path, backup_path: &Path, use_sudo: bool, mode: Tr
             path.display().to_string(),
             backup_path.display().to_string(),
         ];
-        run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false)
+        run_command_capture(&cmd, true)
+            .map(|o| o.code == 0)
+            .unwrap_or(false)
     } else {
         copy_path_recursive(path, backup_path).is_ok()
     };
 
     if !ok {
-        log(mode, &format!("Failed to create backup copy: {}", path.display()), LogLevel::Error);
+        log(
+            mode,
+            &format!("Failed to create backup copy: {}", path.display()),
+            LogLevel::Error,
+        );
         return None;
     }
     Some(backup_path.to_path_buf())
@@ -1869,7 +2693,14 @@ fn cleanup_source_dirs(src_root: &Path, remove_root: bool, use_sudo: bool, mode:
         ]);
         if let Ok(out) = run_command_capture(&cmd, true) {
             if out.code != 0 {
-                log(mode, &format!("Source cleanup failed: find exited with status {}.", out.code), LogLevel::Warn);
+                log(
+                    mode,
+                    &format!(
+                        "Source cleanup failed: find exited with status {}.",
+                        out.code
+                    ),
+                    LogLevel::Warn,
+                );
             }
         }
     } else {
@@ -1911,70 +2742,11 @@ fn prune_move_source_duplicates(
     use_sudo: bool,
     mode: TransferMode,
     manifest: Option<&TransferManifest>,
-    expected_files: u64,
-    expected_bytes: u64,
+    _expected_files: u64,
+    _expected_bytes: u64,
 ) -> DeleteCleanupOutcome {
     let mut removed = DeleteCleanupOutcome::default();
-    let mut last_report = Instant::now();
-    let mut last_report_bytes: u64 = 0;
-
-    let mut report_progress = |force: bool, removed: &DeleteCleanupOutcome| {
-        let now = Instant::now();
-        if !force && now.duration_since(last_report) < Duration::from_millis(500) {
-            return;
-        }
-        if force && removed.files == 0 {
-            return;
-        }
-        let dt = now.duration_since(last_report).as_secs_f64().max(1e-6);
-        let speed_bps = removed.bytes.saturating_sub(last_report_bytes) as f64 / dt;
-        let cleanup_pct = if expected_bytes > 0 {
-            (removed.bytes as f64 * 100.0 / expected_bytes as f64).min(100.0)
-        } else if expected_files > 0 {
-            (removed.files as f64 * 100.0 / expected_files as f64).min(100.0)
-        } else {
-            -1.0
-        };
-        if expected_bytes > 0 {
-            if expected_files > 0 {
-                println!(
-                    "Cleanup: {cleanup_pct:6.2}% {} / {} | {} | Deleted files: {} / {}",
-                    fmt_bytes_col_10(removed.bytes),
-                    format_bytes_binary(expected_bytes, 2),
-                    fmt_rate_col(speed_bps),
-                    format_number(removed.files),
-                    format_number(expected_files)
-                );
-            } else {
-                println!(
-                    "Cleanup: {cleanup_pct:6.2}% {} / {} | {} | Deleted files: {}",
-                    fmt_bytes_col_10(removed.bytes),
-                    format_bytes_binary(expected_bytes, 2),
-                    fmt_rate_col(speed_bps),
-                    format_number(removed.files)
-                );
-            }
-        } else {
-            if expected_files > 0 {
-                println!(
-                    "Cleanup: {cleanup_pct:6.2}% {} | {} | Deleted files: {} / {}",
-                    fmt_bytes_col_10(removed.bytes),
-                    fmt_rate_col(speed_bps),
-                    format_number(removed.files),
-                    format_number(expected_files)
-                );
-            } else {
-                println!(
-                    "Cleanup: ---% {} | {} | Deleted files: {}",
-                    fmt_bytes_col_10(removed.bytes),
-                    fmt_rate_col(speed_bps),
-                    format_number(removed.files)
-                );
-            }
-        }
-        last_report = now;
-        last_report_bytes = removed.bytes;
-    };
+    let report_progress = |_force: bool, _removed: &DeleteCleanupOutcome| {};
 
     match src_obj_kind {
         SrcObjKind::File => {
@@ -1998,7 +2770,11 @@ fn prune_move_source_duplicates(
             };
             if same && remove_single_file(src, use_sudo, mode) {
                 removed.files += 1;
-                removed.bytes += if src_lmd.file_type().is_symlink() { 0 } else { src_lmd.len() };
+                removed.bytes += if src_lmd.file_type().is_symlink() {
+                    0
+                } else {
+                    src_lmd.len()
+                };
             }
             report_progress(false, &removed);
         }
@@ -2061,11 +2837,8 @@ fn prune_move_source_duplicates(
                         while idx < files.len() {
                             let end = (idx + SUDO_DELETE_CHUNK).min(files.len());
                             let chunk = &files[idx..end];
-                            let mut cmd = vec![
-                                "rm".to_string(),
-                                "-f".to_string(),
-                                "--".to_string(),
-                            ];
+                            let mut cmd =
+                                vec!["rm".to_string(), "-f".to_string(), "--".to_string()];
                             for (src_file, _) in chunk {
                                 cmd.push(src_file.display().to_string());
                             }
@@ -2096,7 +2869,9 @@ fn prune_move_source_duplicates(
             for ent in WalkDir::new(src_root)
                 .sort(false)
                 .skip_hidden(false)
-                .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
+                .parallelism(jwalk::Parallelism::RayonDefaultPool {
+                    busy_timeout: Duration::from_secs(0),
+                })
                 .into_iter()
                 .filter_map(Result::ok)
             {
@@ -2183,7 +2958,12 @@ fn map_display_rel(include_root: bool, src_base: &str, rel: &str) -> String {
     }
 }
 
-fn map_dir_dest(include_root: bool, src_base: &str, rel: &str, dst_base: &Path) -> (PathBuf, String) {
+fn map_dir_dest(
+    include_root: bool,
+    src_base: &str,
+    rel: &str,
+    dst_base: &Path,
+) -> (PathBuf, String) {
     (
         map_dir_dest_path(include_root, src_base, rel, dst_base),
         map_display_rel(include_root, src_base, rel),
@@ -2265,6 +3045,7 @@ fn pre_scan_directory(
     dst_path: &str,
     src_mnt: &Path,
     build_manifest: bool,
+    build_source_display_paths: bool,
 ) -> PreScan {
     let src_no_trailing = src_path.trim_end_matches('/');
     let include_root = !src_path.ends_with('/');
@@ -2286,28 +3067,66 @@ fn pre_scan_directory(
     // all source content is guaranteed "new", so skip destination path construction/stat checks.
     let src_dev = fs::metadata(src_root).ok().map(|m| m.dev());
     let dst_dev = fs::metadata(&destination_root).ok().map(|m| m.dev());
-    let can_parallel_scans = !destination_missing && src_dev.is_some() && dst_dev.is_some() && src_dev != dst_dev;
-    let (mut dirs, files, destination_index): (Vec<String>, Vec<(String, Option<PathBuf>, u64, bool)>, Option<DestinationIndex>) =
-        if destination_missing {
+    let can_parallel_scans =
+        !destination_missing && src_dev.is_some() && dst_dev.is_some() && src_dev != dst_dev;
+    let (mut dirs, files, destination_index): (
+        Vec<String>,
+        Vec<(String, Option<PathBuf>, u64, bool)>,
+        Option<DestinationIndex>,
+    ) = if destination_missing {
+        let (d, f) = scan_source_entries(src_root);
+        (d, f, None)
+    } else if can_parallel_scans {
+        std::thread::scope(|scope| {
+            let idx_handle = scope.spawn(|| build_destination_index(&destination_root));
             let (d, f) = scan_source_entries(src_root);
-            (d, f, None)
-        } else if can_parallel_scans {
-            std::thread::scope(|scope| {
-                let idx_handle = scope.spawn(|| build_destination_index(&destination_root));
-                let (d, f) = scan_source_entries(src_root);
-                let idx = idx_handle.join().unwrap_or_else(|_| build_destination_index(&destination_root));
-                (d, f, Some(idx))
-            })
-        } else {
-            let (d, f) = scan_source_entries(src_root);
-            let idx = build_destination_index(&destination_root);
+            let idx = idx_handle
+                .join()
+                .unwrap_or_else(|_| build_destination_index(&destination_root));
             (d, f, Some(idx))
-        };
+        })
+    } else {
+        let (d, f) = scan_source_entries(src_root);
+        let idx = build_destination_index(&destination_root);
+        (d, f, Some(idx))
+    };
 
     let mut out = PreScan::default();
     out.planned_bytes_exact = true;
-    out.total_regular_files = Some(files.iter().filter(|(_, _, _, is_symlink)| !*is_symlink).count() as u64);
-    out.total_regular_bytes = Some(files.iter().filter(|(_, _, _, is_symlink)| !*is_symlink).map(|(_, _, size, _)| *size).sum());
+    out.total_regular_files = Some(
+        files
+            .iter()
+            .filter(|(_, _, _, is_symlink)| !*is_symlink)
+            .count() as u64,
+    );
+    out.total_regular_bytes = Some(
+        files
+            .iter()
+            .filter(|(_, _, _, is_symlink)| !*is_symlink)
+            .map(|(_, _, size, _)| *size)
+            .sum(),
+    );
+    if build_source_display_paths {
+        let mut source_display_paths: FxHashSet<String> = FxHashSet::default();
+        if include_root && !src_base.is_empty() {
+            source_display_paths.insert(src_base.clone());
+        }
+        for rel in &dirs {
+            let mapped = map_display_rel(include_root, &src_base, rel);
+            let key = mapped.trim_end_matches('/').to_string();
+            if !key.is_empty() {
+                source_display_paths.insert(key);
+            }
+        }
+        for (rel, _, _, _) in &files {
+            let mapped = map_display_rel(include_root, &src_base, rel);
+            let key = mapped.trim_end_matches('/').to_string();
+            if !key.is_empty() {
+                source_display_paths.insert(key);
+            }
+        }
+        out.source_display_paths = source_display_paths;
+    }
     let source_rel_dirs: FxHashSet<String> = dirs.iter().cloned().collect();
     let root_new_dir = include_root && !destination_root.is_dir();
     out.total_dirs = Some(dirs.len() as u64 + u64::from(include_root));
@@ -2378,16 +3197,18 @@ fn pre_scan_directory(
     ): FileReduce = files
         .par_iter()
         .fold(
-            || (
-                0,
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                FxHashSet::default(),
-                0,
-            ),
+            || {
+                (
+                    0,
+                    0,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    FxHashSet::default(),
+                    0,
+                )
+            },
             |mut acc, (rel, src_file, size, is_symlink)| {
                 let dst_idx = destination_index.as_ref();
                 let mut dst_file: Option<PathBuf> = None;
@@ -2507,16 +3328,18 @@ fn pre_scan_directory(
             },
         )
         .reduce(
-            || (
-                0,
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                FxHashSet::default(),
-                0,
-            ),
+            || {
+                (
+                    0,
+                    0,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    FxHashSet::default(),
+                    0,
+                )
+            },
             |mut a, b| {
                 a.0 += b.0;
                 a.1 += b.1;
@@ -2537,7 +3360,9 @@ fn pre_scan_directory(
     if destination_missing {
         out.uncollided_files = 0;
     } else {
-        let idx = destination_index.as_ref().expect("destination index should exist when destination is present");
+        let idx = destination_index
+            .as_ref()
+            .expect("destination index should exist when destination is present");
         let dest_total_files = idx.file_sizes.len() as u64;
         let source_regular_total = out.total_regular_files.unwrap_or(0);
         let overlap_files = source_regular_total.saturating_sub(add_files);
@@ -2555,7 +3380,8 @@ fn pre_scan_directory(
             if rel.is_empty() {
                 include_root && !root_new_dir
             } else {
-                source_rel_dirs.contains(rel.as_str()) && !missing_dir_prefixes.contains(rel.as_str())
+                source_rel_dirs.contains(rel.as_str())
+                    && !missing_dir_prefixes.contains(rel.as_str())
             }
         })
         .count() as u64;
@@ -2564,7 +3390,9 @@ fn pre_scan_directory(
     if destination_missing {
         out.uncollided_dirs = 0;
     } else {
-        let idx = destination_index.as_ref().expect("destination index should exist when destination is present");
+        let idx = destination_index
+            .as_ref()
+            .expect("destination index should exist when destination is present");
         let dest_total_dirs = idx.dirs.len() as u64;
         let uncollided_dirs_by_scan = idx
             .dirs
@@ -2572,7 +3400,8 @@ fn pre_scan_directory(
             .filter(|rel| !source_rel_dirs.contains(rel.as_str()))
             .count() as u64;
         let source_dir_total_no_root = source_dir_count as u64;
-        let source_dirs_not_new = source_dir_total_no_root.saturating_sub(missing_dir_prefixes.len() as u64);
+        let source_dirs_not_new =
+            source_dir_total_no_root.saturating_sub(missing_dir_prefixes.len() as u64);
         let uncollided_dirs_by_overlap = dest_total_dirs.saturating_sub(source_dirs_not_new);
         out.uncollided_dirs = uncollided_dirs_by_scan.max(uncollided_dirs_by_overlap);
     }
@@ -2603,7 +3432,12 @@ fn pre_scan_directory(
     out
 }
 
-fn pre_scan_file(src_mnt: &Path, dst_path: &str, dst_obj_kind: DstObjKind) -> PreScan {
+fn pre_scan_file(
+    src_mnt: &Path,
+    dst_path: &str,
+    dst_obj_kind: DstObjKind,
+    build_source_display_paths: bool,
+) -> PreScan {
     let mut out = PreScan::default();
     out.planned_bytes_exact = true;
     let src_lmd = match fs::symlink_metadata(src_mnt) {
@@ -2628,16 +3462,6 @@ fn pre_scan_file(src_mnt: &Path, dst_path: &str, dst_obj_kind: DstObjKind) -> Pr
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "source".to_string());
 
-    if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
-        let base = Path::new(dst_path.trim_end_matches('/'));
-        if base.is_dir() {
-            let mut source_rel_files = HashSet::new();
-            source_rel_files.insert(src_name.clone());
-            let (_dest_total, uncollided_by_scan) = destination_file_counts(base, &source_rel_files);
-            out.uncollided_files = uncollided_by_scan;
-        }
-    }
-
     let (dst_file, display_rel) = match dst_obj_kind {
         DstObjKind::Dir | DstObjKind::DirExisting => {
             let base = Path::new(dst_path.trim_end_matches('/'));
@@ -2653,9 +3477,41 @@ fn pre_scan_file(src_mnt: &Path, dst_path: &str, dst_obj_kind: DstObjKind) -> Pr
         }
     };
 
+    let destination_root = match dst_obj_kind {
+        DstObjKind::Dir | DstObjKind::DirExisting => {
+            Some(PathBuf::from(dst_path.trim_end_matches('/')))
+        }
+        _ => dst_file.parent().map(|p| {
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        }),
+    };
+    if let Some(root) = destination_root {
+        if root.is_dir() {
+            let mut source_rel_files = HashSet::new();
+            let rel_key = display_rel.trim_end_matches('/').to_string();
+            if !rel_key.is_empty() {
+                source_rel_files.insert(rel_key);
+            }
+            let (_dest_total, uncollided_by_scan) =
+                destination_file_counts(&root, &source_rel_files);
+            out.uncollided_files = uncollided_by_scan;
+        }
+    }
+
+    if build_source_display_paths && !display_rel.is_empty() {
+        out.source_display_paths
+            .insert(display_rel.trim_end_matches('/').to_string());
+    }
+
     let change = if src_is_symlink {
         match fs::symlink_metadata(&dst_file) {
-            Ok(dm) if dm.file_type().is_symlink() && symlink_targets_equal(src_mnt, &dst_file) => None,
+            Ok(dm) if dm.file_type().is_symlink() && symlink_targets_equal(src_mnt, &dst_file) => {
+                None
+            }
             Ok(_) => Some(ChangeKind::ModFile),
             Err(_) => Some(ChangeKind::NewFile),
         }
@@ -2682,7 +3538,10 @@ fn pre_scan_file(src_mnt: &Path, dst_path: &str, dst_obj_kind: DstObjKind) -> Pr
                 }
             }
         }
-        out.change_preview.push(ChangeItem { kind: ch, rel: display_rel });
+        out.change_preview.push(ChangeItem {
+            kind: ch,
+            rel: display_rel,
+        });
     }
 
     out
@@ -2692,7 +3551,10 @@ fn parse_progress2_bytes(line: &str) -> Option<u64> {
     let re = Regex::new(r"^\s*([0-9][0-9,]*(?:\.[0-9]+)?)([kKmMgGtTpPeE]?)\s+[0-9]{1,3}%").ok()?;
     let caps = re.captures(line)?;
     let num_txt = caps.get(1)?.as_str().replace(',', "");
-    let unit = caps.get(2).map(|m| m.as_str().to_ascii_uppercase()).unwrap_or_default();
+    let unit = caps
+        .get(2)
+        .map(|m| m.as_str().to_ascii_uppercase())
+        .unwrap_or_default();
     let mut val: f64 = num_txt.parse().ok()?;
     let mult = match unit.as_str() {
         "K" => 1024f64,
@@ -2719,7 +3581,10 @@ fn handle_rsync_stream_line(tx: &mpsc::Sender<RsyncStreamEvent>, line: &str) {
     }
 }
 
-fn spawn_rsync_stdout_reader(stdout: impl Read + Send + 'static, tx: mpsc::Sender<RsyncStreamEvent>) -> thread::JoinHandle<()> {
+fn spawn_rsync_stdout_reader(
+    stdout: impl Read + Send + 'static,
+    tx: mpsc::Sender<RsyncStreamEvent>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let reader = io::BufReader::new(stdout);
         for line in reader.lines().flatten() {
@@ -2728,7 +3593,10 @@ fn spawn_rsync_stdout_reader(stdout: impl Read + Send + 'static, tx: mpsc::Sende
     })
 }
 
-fn spawn_rsync_stderr_reader(stderr: impl Read + Send + 'static, tx: mpsc::Sender<RsyncStreamEvent>) -> thread::JoinHandle<()> {
+fn spawn_rsync_stderr_reader(
+    stderr: impl Read + Send + 'static,
+    tx: mpsc::Sender<RsyncStreamEvent>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = io::BufReader::new(stderr);
         let mut buf = [0u8; 8192];
@@ -2805,8 +3673,7 @@ fn run_rsync_transfer(
                 rc: 1,
                 bytes_done: 0,
                 elapsed_s: 0.0,
-                io_read_bytes: None,
-                io_write_bytes: None,
+                progress_snapshot: None,
             }
         }
     };
@@ -2814,12 +3681,17 @@ fn run_rsync_transfer(
     let transfer_start = Instant::now();
     print_transfer_columns_header();
     let mut done_bytes: u64 = 0;
-    let mut last_report_bytes: u64 = 0;
     let mut last_report = transfer_start;
-    let mut io_window = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let mut last_done_bytes: u64 = 0;
+    let mut last_done_at = transfer_start;
+    let mut io_window = ProcessIoWindow::from_pid(child.id());
     let _ = io_window.sample();
-    let (io_start_read, io_start_write) = io_window.current_totals();
-    let mut last_io_rates = DeviceIoRates::default();
+    let io_start_counters = io_window.current_totals();
+    let device_window = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let device_start_totals = device_window.current_totals();
+    let mut last_device_totals = device_start_totals;
+    let mut last_device_at = transfer_start;
+    let mut last_io_rates = TransferProgressRates::default();
 
     let (event_tx, event_rx) = mpsc::channel::<RsyncStreamEvent>();
     let stdout_handle = child
@@ -2831,29 +3703,7 @@ fn run_rsync_transfer(
         .take()
         .map(|stderr| spawn_rsync_stderr_reader(stderr, event_tx.clone()));
     drop(event_tx);
-
-    let print_progress = |done: u64, speed_bps: f64, io_rates: DeviceIoRates, elapsed_s: f64| {
-        let timer = fmt_hms_tenths(elapsed_s);
-        if planned_bytes > 0 {
-            let pct = (done as f64 * 100.0 / planned_bytes as f64).min(100.0);
-            println!(
-                "{timer} {pct:6.2}% {} / {} {} {} {}",
-                fmt_bytes_col_10(done),
-                format_bytes_binary(planned_bytes, 2),
-                fmt_rate_col(speed_bps),
-                fmt_rate_col_opt(io_rates.src_read_bps),
-                fmt_rate_col_opt(io_rates.dst_write_bps),
-            );
-        } else {
-            println!(
-                "{timer} ---% {} {} {} {}",
-                fmt_bytes_col_10(done),
-                fmt_rate_col(speed_bps),
-                fmt_rate_col_opt(io_rates.src_read_bps),
-                fmt_rate_col_opt(io_rates.dst_write_bps),
-            );
-        }
-    };
+    let mut progress_line_active = false;
 
     let rc: i32 = loop {
         match event_rx.recv_timeout(Duration::from_millis(200)) {
@@ -2862,18 +3712,48 @@ fn run_rsync_transfer(
                     done_bytes = bytes;
                 }
             }
-            Ok(RsyncStreamEvent::Text(line)) => println!("{line}"),
+            Ok(RsyncStreamEvent::Text(line)) => {
+                if progress_line_active {
+                    println!();
+                    reset_progress_render_state();
+                    progress_line_active = false;
+                }
+                println!("{line}");
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
 
         let now = Instant::now();
-        if now.duration_since(last_report) >= Duration::from_millis(500) {
-            let dt = now.duration_since(last_report).as_secs_f64().max(1e-6);
-            let speed = done_bytes.saturating_sub(last_report_bytes) as f64 / dt;
+        if now.duration_since(last_report) >= Duration::from_millis(200) {
             last_io_rates = io_window.sample();
-            print_progress(done_bytes, speed, last_io_rates, now.duration_since(transfer_start).as_secs_f64());
-            last_report_bytes = done_bytes;
+            let io_delta = proc_io_deltas(io_start_counters, io_window.last_counters);
+            let device_now_totals = device_window.current_totals();
+            let device_delta = device_io_deltas(device_start_totals, device_now_totals);
+            let dt = now.duration_since(last_done_at).as_secs_f64().max(1e-6);
+            last_io_rates.write_all_bps =
+                Some(done_bytes.saturating_sub(last_done_bytes) as f64 / dt);
+            let dt_dev = now.duration_since(last_device_at).as_secs_f64().max(1e-6);
+            last_io_rates.read_complete_bps =
+                counter_delta(last_device_totals.0, device_now_totals.0).map(|v| v as f64 / dt_dev);
+            last_io_rates.write_complete_bps =
+                counter_delta(last_device_totals.1, device_now_totals.1).map(|v| v as f64 / dt_dev);
+            last_device_totals = device_now_totals;
+            last_device_at = now;
+            last_done_bytes = done_bytes;
+            last_done_at = now;
+            print_transfer_progress_bars(
+                now.duration_since(transfer_start).as_secs_f64(),
+                planned_bytes,
+                Some(done_bytes),
+                "Transfer",
+                last_io_rates,
+                io_delta,
+                device_delta,
+                false,
+                false,
+            );
+            progress_line_active = true;
             last_report = now;
         }
 
@@ -2885,7 +3765,14 @@ fn run_rsync_transfer(
                             done_bytes = bytes;
                         }
                     }
-                    RsyncStreamEvent::Text(line) => println!("{line}"),
+                    RsyncStreamEvent::Text(line) => {
+                        if progress_line_active {
+                            println!();
+                            reset_progress_render_state();
+                            progress_line_active = false;
+                        }
+                        println!("{line}");
+                    }
                 }
             }
             break status.code().unwrap_or(1);
@@ -2904,42 +3791,61 @@ fn run_rsync_transfer(
     } else {
         done_bytes
     };
-
-    if planned_bytes > 0 {
-        let pct = (final_done as f64 * 100.0 / planned_bytes as f64).min(100.0);
-        let now = Instant::now();
-        let dt = now.duration_since(last_report).as_secs_f64().max(1e-6);
-        let final_speed = if final_done > last_report_bytes {
-            (final_done - last_report_bytes) as f64 / dt
-        } else {
-            final_done as f64 / now.duration_since(transfer_start).as_secs_f64().max(1e-6)
-        };
-        println!(
-            "{} {pct:6.2}% {} / {} {} {} {}",
-            fmt_hms_tenths(now.duration_since(transfer_start).as_secs_f64()),
-            fmt_bytes_col_10(final_done),
-            format_bytes_binary(planned_bytes, 2),
-            fmt_rate_col(final_speed),
-            fmt_rate_col_opt(last_io_rates.src_read_bps),
-            fmt_rate_col_opt(last_io_rates.dst_write_bps),
-        );
-    } else {
-        println!(
-            "{} ---% {} {} {} {}",
-            fmt_hms_tenths(transfer_start.elapsed().as_secs_f64()),
-            fmt_bytes_col_10(final_done),
-            fmt_rate_col(0.0),
-            fmt_rate_col_opt(last_io_rates.src_read_bps),
-            fmt_rate_col_opt(last_io_rates.dst_write_bps),
-        );
+    let io_end_totals = io_window.current_totals();
+    let io_delta = proc_io_deltas(io_start_counters, io_end_totals);
+    let device_end_totals = device_window.current_totals();
+    let device_delta = device_io_deltas(device_start_totals, device_end_totals);
+    let total_elapsed_s = transfer_start.elapsed().as_secs_f64().max(1e-6);
+    if last_io_rates.write_all_bps.is_none() {
+        last_io_rates.write_all_bps = Some(final_done as f64 / total_elapsed_s);
     }
+    if last_io_rates.rchar_bps.is_none() {
+        last_io_rates.rchar_bps = io_delta.rchar.map(|v| v as f64 / total_elapsed_s);
+    }
+    if last_io_rates.wchar_bps.is_none() {
+        last_io_rates.wchar_bps = io_delta.wchar.map(|v| v as f64 / total_elapsed_s);
+    }
+    if last_io_rates.read_bytes_bps.is_none() {
+        last_io_rates.read_bytes_bps = io_delta.read_bytes.map(|v| v as f64 / total_elapsed_s);
+    }
+    if last_io_rates.write_bytes_bps.is_none() {
+        last_io_rates.write_bytes_bps = io_delta.write_bytes.map(|v| v as f64 / total_elapsed_s);
+    }
+    if last_io_rates.read_complete_bps.is_none() {
+        last_io_rates.read_complete_bps = device_delta
+            .read_complete
+            .map(|v| v as f64 / total_elapsed_s);
+    }
+    if last_io_rates.write_complete_bps.is_none() {
+        last_io_rates.write_complete_bps = device_delta
+            .write_complete
+            .map(|v| v as f64 / total_elapsed_s);
+    }
+    print_transfer_progress_bars(
+        transfer_start.elapsed().as_secs_f64(),
+        planned_bytes,
+        Some(final_done),
+        "Transfer",
+        last_io_rates,
+        io_delta,
+        device_delta,
+        true,
+        false,
+    );
 
     TransferOutcome {
         rc,
         bytes_done: final_done,
         elapsed_s: transfer_start.elapsed().as_secs_f64(),
-        io_read_bytes: counter_delta(io_start_read, io_window.current_totals().0),
-        io_write_bytes: counter_delta(io_start_write, io_window.current_totals().1),
+        progress_snapshot: Some(ProgressSnapshot {
+            elapsed_s: transfer_start.elapsed().as_secs_f64(),
+            planned_bytes,
+            write_all_total: Some(final_done),
+            phase_label: "Transfer",
+            rates: last_io_rates,
+            proc_deltas: io_delta,
+            device_deltas: device_delta,
+        }),
     }
 }
 
@@ -2954,59 +3860,74 @@ fn run_rust_transfer(
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
     let copy_buf_bytes = copy_chunk_bytes_for_media(media);
-    let inflight_limiter = inflight_max_bytes_for_media(media).map(InflightWriteLimiter::new).map(Arc::new);
+    let inflight_limiter = inflight_max_bytes_for_media(media)
+        .map(InflightWriteLimiter::new)
+        .map(Arc::new);
     let transfer_start = Instant::now();
     print_transfer_columns_header();
-    let io_window_for_avg = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
-    let (io_start_read, io_start_write) = io_window_for_avg.current_totals();
+    let io_window_for_avg = ProcessIoWindow::from_pid(std::process::id());
+    let io_start_counters = io_window_for_avg.current_totals();
+    let device_window_for_avg = DeviceIoWindow::from_transfer_paths(src_path, dst_path);
+    let device_start_totals = device_window_for_avg.current_totals();
     let transfer_start_for_ticker = transfer_start;
+    let io_start_counters_for_ticker = io_start_counters;
+    let device_start_totals_for_ticker = device_start_totals;
     let src_path_for_ticker = src_path.to_string();
     let dst_path_for_ticker = dst_path.to_string();
 
     let done_for_ticker = Arc::clone(&done);
-    let io_rates_shared = Arc::new(Mutex::new(DeviceIoRates::default()));
+    let io_rates_shared = Arc::new(Mutex::new(TransferProgressRates::default()));
     let io_rates_for_ticker = Arc::clone(&io_rates_shared);
     let (ticker_stop_tx, ticker_stop_rx) = mpsc::channel::<()>();
     let ticker = thread::spawn(move || {
-        let mut last_report = Instant::now();
-        let mut last_report_bytes: u64 = 0;
-        let mut io_window = DeviceIoWindow::from_transfer_paths(&src_path_for_ticker, &dst_path_for_ticker);
+        let mut io_window = ProcessIoWindow::from_pid(std::process::id());
         let _ = io_window.sample();
+        let device_window =
+            DeviceIoWindow::from_transfer_paths(&src_path_for_ticker, &dst_path_for_ticker);
+        let mut last_device_totals = device_start_totals_for_ticker;
+        let mut last_device_at = transfer_start_for_ticker;
+        let mut last_done_bytes: u64 = 0;
+        let mut last_done_at = transfer_start_for_ticker;
         loop {
-            match ticker_stop_rx.recv_timeout(Duration::from_millis(500)) {
+            match ticker_stop_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
                     let done_bytes = done_for_ticker.load(Ordering::Relaxed);
-                    let dt = now.duration_since(last_report).as_secs_f64().max(1e-6);
-                    let speed = done_bytes.saturating_sub(last_report_bytes) as f64 / dt;
-                    let io_rates = io_window.sample();
+                    let mut io_rates = io_window.sample();
+                    let dt = now.duration_since(last_done_at).as_secs_f64().max(1e-6);
+                    io_rates.write_all_bps =
+                        Some(done_bytes.saturating_sub(last_done_bytes) as f64 / dt);
+                    last_done_bytes = done_bytes;
+                    last_done_at = now;
+                    let io_delta =
+                        proc_io_deltas(io_start_counters_for_ticker, io_window.last_counters);
+                    let device_now_totals = device_window.current_totals();
+                    let device_delta =
+                        device_io_deltas(device_start_totals_for_ticker, device_now_totals);
+                    let dt_dev = now.duration_since(last_device_at).as_secs_f64().max(1e-6);
+                    io_rates.read_complete_bps =
+                        counter_delta(last_device_totals.0, device_now_totals.0)
+                            .map(|v| v as f64 / dt_dev);
+                    io_rates.write_complete_bps =
+                        counter_delta(last_device_totals.1, device_now_totals.1)
+                            .map(|v| v as f64 / dt_dev);
+                    last_device_totals = device_now_totals;
+                    last_device_at = now;
                     if let Ok(mut g) = io_rates_for_ticker.lock() {
                         *g = io_rates;
                     }
-                    if planned_bytes > 0 {
-                        let pct = (done_bytes as f64 * 100.0 / planned_bytes as f64).min(100.0);
-                        println!(
-                            "{} {pct:6.2}% {} / {} {} {} {}",
-                            fmt_hms_tenths(now.duration_since(transfer_start_for_ticker).as_secs_f64()),
-                            fmt_bytes_col_10(done_bytes),
-                            format_bytes_binary(planned_bytes, 2),
-                            fmt_rate_col(speed),
-                            fmt_rate_col_opt(io_rates.src_read_bps),
-                            fmt_rate_col_opt(io_rates.dst_write_bps),
-                        );
-                    } else {
-                        println!(
-                            "{} ---% {} {} {} {}",
-                            fmt_hms_tenths(now.duration_since(transfer_start_for_ticker).as_secs_f64()),
-                            fmt_bytes_col_10(done_bytes),
-                            fmt_rate_col(speed),
-                            fmt_rate_col_opt(io_rates.src_read_bps),
-                            fmt_rate_col_opt(io_rates.dst_write_bps),
-                        );
-                    }
-                    last_report = now;
-                    last_report_bytes = done_bytes;
+                    print_transfer_progress_bars(
+                        now.duration_since(transfer_start_for_ticker).as_secs_f64(),
+                        planned_bytes,
+                        Some(done_bytes),
+                        "Transfer",
+                        io_rates,
+                        io_delta,
+                        device_delta,
+                        false,
+                        false,
+                    );
                 }
             }
         }
@@ -3016,38 +3937,60 @@ fn run_rust_transfer(
         ($rc:expr) => {{
             let final_done = done.load(Ordering::Relaxed);
             let elapsed = transfer_start.elapsed().as_secs_f64().max(1e-6);
-            let final_speed = final_done as f64 / elapsed;
-            let final_io_rates = io_rates_shared.lock().map(|g| *g).unwrap_or_default();
-            if planned_bytes > 0 {
-                let pct = (final_done as f64 * 100.0 / planned_bytes as f64).min(100.0);
-                println!(
-                    "{} {pct:6.2}% {} / {} {} {} {}",
-                    fmt_hms_tenths(elapsed),
-                    fmt_bytes_col_10(final_done),
-                    format_bytes_binary(planned_bytes, 2),
-                    fmt_rate_col(final_speed),
-                    fmt_rate_col_opt(final_io_rates.src_read_bps),
-                    fmt_rate_col_opt(final_io_rates.dst_write_bps),
-                );
-            } else {
-                println!(
-                    "{} ---% {} {} {} {}",
-                    fmt_hms_tenths(elapsed),
-                    fmt_bytes_col_10(final_done),
-                    fmt_rate_col(final_speed),
-                    fmt_rate_col_opt(final_io_rates.src_read_bps),
-                    fmt_rate_col_opt(final_io_rates.dst_write_bps),
-                );
+            let io_end_totals = io_window_for_avg.current_totals();
+            let io_delta = proc_io_deltas(io_start_counters, io_end_totals);
+            let device_end_totals = device_window_for_avg.current_totals();
+            let device_delta = device_io_deltas(device_start_totals, device_end_totals);
+            let mut final_io_rates = io_rates_shared.lock().map(|g| *g).unwrap_or_default();
+            if final_io_rates.write_all_bps.is_none() {
+                final_io_rates.write_all_bps = Some(final_done as f64 / elapsed);
+            }
+            if final_io_rates.rchar_bps.is_none() {
+                final_io_rates.rchar_bps = io_delta.rchar.map(|v| v as f64 / elapsed);
+            }
+            if final_io_rates.wchar_bps.is_none() {
+                final_io_rates.wchar_bps = io_delta.wchar.map(|v| v as f64 / elapsed);
+            }
+            if final_io_rates.read_bytes_bps.is_none() {
+                final_io_rates.read_bytes_bps = io_delta.read_bytes.map(|v| v as f64 / elapsed);
+            }
+            if final_io_rates.write_bytes_bps.is_none() {
+                final_io_rates.write_bytes_bps = io_delta.write_bytes.map(|v| v as f64 / elapsed);
+            }
+            if final_io_rates.read_complete_bps.is_none() {
+                final_io_rates.read_complete_bps =
+                    device_delta.read_complete.map(|v| v as f64 / elapsed);
+            }
+            if final_io_rates.write_complete_bps.is_none() {
+                final_io_rates.write_complete_bps =
+                    device_delta.write_complete.map(|v| v as f64 / elapsed);
             }
             let _ = ticker_stop_tx.send(());
             let _ = ticker.join();
-            let (io_end_read, io_end_write) = io_window_for_avg.current_totals();
+            print_transfer_progress_bars(
+                elapsed,
+                planned_bytes,
+                Some(final_done),
+                "Transfer",
+                final_io_rates,
+                io_delta,
+                device_delta,
+                true,
+                false,
+            );
             return TransferOutcome {
                 rc: $rc,
                 bytes_done: final_done,
                 elapsed_s: elapsed,
-                io_read_bytes: counter_delta(io_start_read, io_end_read),
-                io_write_bytes: counter_delta(io_start_write, io_end_write),
+                progress_snapshot: Some(ProgressSnapshot {
+                    elapsed_s: elapsed,
+                    planned_bytes,
+                    write_all_total: Some(final_done),
+                    phase_label: "Transfer",
+                    rates: final_io_rates,
+                    proc_deltas: io_delta,
+                    device_deltas: device_delta,
+                }),
             };
         }};
     }
@@ -3076,7 +4019,8 @@ fn run_rust_transfer(
                 Err(_) => true,
             };
             if needs_copy {
-                let _permit = acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
+                let _permit =
+                    acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
                 if copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
                     done.fetch_add(n, Ordering::Relaxed);
                 })
@@ -3118,7 +4062,8 @@ fn run_rust_transfer(
                     .par_iter()
                     .map(|entry| {
                         let src_file = src_root.join(&entry.rel);
-                        let (dst_item, _) = map_dir_dest(include_root, &src_base, &entry.rel, dst_base);
+                        let (dst_item, _) =
+                            map_dir_dest(include_root, &src_base, &entry.rel, dst_base);
                         let src_md = match fs::symlink_metadata(&src_file) {
                             Ok(md) => md,
                             Err(_) => return false,
@@ -3126,11 +4071,19 @@ fn run_rust_transfer(
                         if src_md.file_type().is_symlink() {
                             copy_symlink(&src_file, &dst_item).is_ok()
                         } else if src_md.is_file() {
-                            let _permit =
-                                acquire_file_write_permit(inflight_limiter.as_ref(), src_md.len(), media);
-                            copy_file_preserve_with_progress_buf(&src_file, &dst_item, copy_buf_bytes, |n| {
-                                done.fetch_add(n, Ordering::Relaxed);
-                            })
+                            let _permit = acquire_file_write_permit(
+                                inflight_limiter.as_ref(),
+                                src_md.len(),
+                                media,
+                            );
+                            copy_file_preserve_with_progress_buf(
+                                &src_file,
+                                &dst_item,
+                                copy_buf_bytes,
+                                |n| {
+                                    done.fetch_add(n, Ordering::Relaxed);
+                                },
+                            )
                             .is_ok()
                         } else {
                             true
@@ -3144,7 +4097,9 @@ fn run_rust_transfer(
                 let mut entries: Vec<PathBuf> = WalkDir::new(src_root)
                     .sort(false)
                     .skip_hidden(false)
-                    .parallelism(jwalk::Parallelism::RayonDefaultPool { busy_timeout: Duration::from_secs(0) })
+                    .parallelism(jwalk::Parallelism::RayonDefaultPool {
+                        busy_timeout: Duration::from_secs(0),
+                    })
                     .into_iter()
                     .filter_map(Result::ok)
                     .map(|e| e.path().to_path_buf())
@@ -3182,10 +4137,16 @@ fn run_rust_transfer(
                         Err(_) => true,
                     };
                     if needs_copy {
-                        let _permit = acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
-                        if copy_file_preserve_with_progress_buf(&p, &dst_item, copy_buf_bytes, |n| {
-                            done.fetch_add(n, Ordering::Relaxed);
-                        })
+                        let _permit =
+                            acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
+                        if copy_file_preserve_with_progress_buf(
+                            &p,
+                            &dst_item,
+                            copy_buf_bytes,
+                            |n| {
+                                done.fetch_add(n, Ordering::Relaxed);
+                            },
+                        )
                         .is_err()
                         {
                             finish_transfer!(1);
@@ -3222,7 +4183,9 @@ fn dev_media_kind(path: &Path) -> MediaKind {
             if n.starts_with("nvme") {
                 saw_nvme = true;
             }
-            let q = Path::new("/sys/class/block").join(n.as_ref()).join("queue/rotational");
+            let q = Path::new("/sys/class/block")
+                .join(n.as_ref())
+                .join("queue/rotational");
             if let Ok(s) = fs::read_to_string(&q) {
                 let t = s.trim();
                 if t == "0" {
@@ -3285,11 +4248,14 @@ fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
         let mut node = &mut root;
         for (idx, part) in parts.iter().enumerate() {
             let is_leaf = idx == parts.len() - 1;
-            node = node.children.entry((*part).to_string()).or_insert_with(|| TreeNode {
-                children: FxHashMap::default(),
-                state: None,
-                is_dir: true,
-            });
+            node = node
+                .children
+                .entry((*part).to_string())
+                .or_insert_with(|| TreeNode {
+                    children: FxHashMap::default(),
+                    state: None,
+                    is_dir: true,
+                });
 
             if is_leaf {
                 node.is_dir = leaf_is_dir;
@@ -3326,10 +4292,72 @@ struct LevelEntry {
     node: Option<TreeNode>,
 }
 
+#[derive(Default, Clone, Copy)]
+struct HiddenStateCounts {
+    new_count: usize,
+    modified_count: usize,
+    identical_count: usize,
+    uncollided_count: usize,
+    deleted_count: usize,
+}
+
+impl HiddenStateCounts {
+    fn total(self) -> usize {
+        self.new_count
+            + self.modified_count
+            + self.identical_count
+            + self.uncollided_count
+            + self.deleted_count
+    }
+}
+
+fn join_rel(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn remap_item_under_prefix(item: &str, prefix: &str) -> String {
+    if item.is_empty() {
+        return format!("{prefix}/");
+    }
+    if item == prefix || item.starts_with(&format!("{prefix}/")) {
+        item.to_string()
+    } else {
+        format!("{prefix}/{item}")
+    }
+}
+
+fn remap_path_set_under_prefix(paths: &HashSet<String>, prefix: &str) -> HashSet<String> {
+    paths
+        .iter()
+        .map(|item| {
+            remap_item_under_prefix(item, prefix)
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .collect()
+}
+
+fn state_sort_priority(state: &str) -> u8 {
+    match state {
+        "modified" | "replaced" => 0,
+        "added" => 1,
+        "removed" => 2,
+        "identical" => 3,
+        "uncollided" => 4,
+        _ => 9,
+    }
+}
+
 fn collect_level_entries(
     abs_dir: &Path,
     node: Option<&TreeNode>,
     extra: &HashMap<String, String>,
+    source_display_paths: &HashSet<String>,
+    rel_prefix: &str,
     dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
 ) -> Vec<LevelEntry> {
     let existing = dir_cache
@@ -3375,14 +4403,29 @@ fn collect_level_entries(
         if state.is_none() {
             state = child.as_ref().and_then(|c| c.state.clone());
         }
-        let state = state.unwrap_or_else(|| "unchanged".to_string());
+        let mut state = state.unwrap_or_else(|| "unchanged".to_string());
+        if state == "unchanged" {
+            if !source_display_paths.is_empty() {
+                let rel = join_rel(rel_prefix, &name);
+                state = if source_display_paths.contains(rel.as_str()) {
+                    "identical".to_string()
+                } else {
+                    "uncollided".to_string()
+                };
+            }
+        }
         let full = abs_dir.join(&name);
         let is_dir = child
             .as_ref()
             .map(|c| c.is_dir)
             .or_else(|| existing_is_dir.get(&name).copied())
             .unwrap_or_else(|| full.is_dir());
-        out.push(LevelEntry { name, state, is_dir, node: child });
+        out.push(LevelEntry {
+            name,
+            state,
+            is_dir,
+            node: child,
+        });
     }
     out
 }
@@ -3390,47 +4433,47 @@ fn collect_level_entries(
 fn select_level_entries(
     entries: &[LevelEntry],
     max_entries: usize,
-) -> (Vec<LevelEntry>, usize, usize) {
-    let mut changed: Vec<LevelEntry> = entries
-        .iter()
-        .filter(|e| e.state != "unchanged")
-        .cloned()
-        .collect();
-
-    changed.sort_by(|a, b| {
-        let pa = match a.state.as_str() {
-            "modified" | "replaced" => 0,
-            "added" => 1,
-            "removed" => 2,
-            _ => 9,
-        };
-        let pb = match b.state.as_str() {
-            "modified" | "replaced" => 0,
-            "added" => 1,
-            "removed" => 2,
-            _ => 9,
-        };
+    include_unchanged: bool,
+) -> (Vec<LevelEntry>, HiddenStateCounts) {
+    let mut ordered: Vec<LevelEntry> = if include_unchanged {
+        entries.to_vec()
+    } else {
+        entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.state.as_str(),
+                    "added" | "modified" | "replaced" | "removed"
+                )
+            })
+            .cloned()
+            .collect()
+    };
+    ordered.sort_by(|a, b| {
+        let pa = state_sort_priority(a.state.as_str());
+        let pb = state_sort_priority(b.state.as_str());
         pa.cmp(&pb).then(a.name.cmp(&b.name))
     });
 
-    let selected: Vec<LevelEntry> = changed.into_iter().take(max_entries).collect();
+    let selected: Vec<LevelEntry> = ordered.iter().take(max_entries).cloned().collect();
     let selected_names: HashSet<String> = selected.iter().map(|e| e.name.clone()).collect();
 
-    let mut hidden_dirs = 0usize;
-    let mut hidden_files = 0usize;
+    let mut hidden = HiddenStateCounts::default();
 
     for e in entries {
         if selected_names.contains(&e.name) {
             continue;
         }
-        if e.is_dir {
-            hidden_dirs += 1;
-        } else {
-            hidden_files += 1;
+        match e.state.as_str() {
+            "added" => hidden.new_count += 1,
+            "removed" => hidden.deleted_count += 1,
+            "identical" => hidden.identical_count += 1,
+            "uncollided" | "unchanged" => hidden.uncollided_count += 1,
+            _ => hidden.modified_count += 1,
         }
     }
 
-    (selected, hidden_dirs, hidden_files)
+    (selected, hidden)
 }
 
 fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
@@ -3445,6 +4488,8 @@ fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
         "removed" => format!("{FAIL}{}{} (removed){ENDC}", entry.name, suffix),
         "added" => format!("{OKGREEN}{}{}{ENDC}", entry.name, suffix),
         "modified" => format!("{WARNING}{}{}{ENDC}", entry.name, suffix),
+        "identical" => format!("{LIGHT_TEAL}{}{}{ENDC}", entry.name, suffix),
+        "uncollided" => format!("{WHITE}{}{}{ENDC}", entry.name, suffix),
         _ => format!("{WHITE}{}{}{ENDC}", entry.name, suffix),
     }
 }
@@ -3454,6 +4499,9 @@ fn render_showall_level(
     node: Option<&TreeNode>,
     prefix: &str,
     extras: &HashMap<String, String>,
+    source_display_paths: &HashSet<String>,
+    rel_prefix: &str,
+    include_unchanged: bool,
     depth: usize,
     max_depth: usize,
     trunc: usize,
@@ -3462,12 +4510,19 @@ fn render_showall_level(
     max_lines: Option<usize>,
     line_count: &mut usize,
 ) -> bool {
-    let entries = collect_level_entries(abs_dir, node, extras, dir_cache);
-    let (selected, hidden_dirs, hidden_files) = select_level_entries(&entries, trunc);
+    let entries = collect_level_entries(
+        abs_dir,
+        node,
+        extras,
+        source_display_paths,
+        rel_prefix,
+        dir_cache,
+    );
+    let (selected, hidden) = select_level_entries(&entries, trunc, include_unchanged);
 
     enum Unit {
         Entry(LevelEntry, Option<&'static str>),
-        Summary(usize, usize),
+        Summary(HiddenStateCounts),
     }
 
     let mut units: Vec<Unit> = Vec::new();
@@ -3480,8 +4535,8 @@ fn render_showall_level(
         }
     }
 
-    if hidden_dirs + hidden_files > 0 {
-        units.push(Unit::Summary(hidden_dirs, hidden_files));
+    if hidden.total() > 0 {
+        units.push(Unit::Summary(hidden));
     }
 
     for (idx, unit) in units.iter().enumerate() {
@@ -3489,24 +4544,21 @@ fn render_showall_level(
         let branch = if last { "└── " } else { "├── " };
 
         match unit {
-            Unit::Summary(hid_dirs, hid_files) => {
+            Unit::Summary(hidden) => {
                 if max_lines.map(|m| *line_count >= m).unwrap_or(false) {
                     return false;
                 }
-                let mut parts: Vec<String> = Vec::new();
-                if *hid_dirs > 0 {
-                    let suffix = if *hid_dirs == 1 { "dir" } else { "dirs" };
-                    parts.push(format!("{hid_dirs} more {suffix}"));
+                if let Some(summary) = format_hidden_top_summary(
+                    hidden.new_count,
+                    hidden.modified_count,
+                    hidden.identical_count,
+                    hidden.uncollided_count,
+                    hidden.deleted_count,
+                    !include_unchanged,
+                ) {
+                    let _ = writeln!(out, "{prefix}{branch}... and {summary}");
+                    *line_count += 1;
                 }
-                if *hid_files > 0 {
-                    let suffix = if *hid_files == 1 { "file" } else { "files" };
-                    parts.push(format!("{hid_files} more {suffix}"));
-                }
-                if parts.is_empty() {
-                    parts.push(format!("{} more", hid_dirs + hid_files));
-                }
-                let _ = writeln!(out, "{prefix}{branch}... and {}", parts.join(" "));
-                *line_count += 1;
             }
             Unit::Entry(entry, row_kind) => {
                 if max_lines.map(|m| *line_count >= m).unwrap_or(false) {
@@ -3516,16 +4568,20 @@ fn render_showall_level(
                 *line_count += 1;
                 let should_expand = row_kind.is_none()
                     && entry.is_dir
-                    && depth + 1 <= max_depth
-                    && (entry.state == "modified" || entry.state == "added");
+                    && depth + 1 < max_depth
+                    && entry.state != "removed";
                 if should_expand {
                     let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+                    let child_rel = join_rel(rel_prefix, &entry.name);
                     let empty: HashMap<String, String> = HashMap::new();
                     if !render_showall_level(
                         &abs_dir.join(&entry.name),
                         entry.node.as_ref(),
                         &child_prefix,
                         &empty,
+                        source_display_paths,
+                        &child_rel,
+                        include_unchanged,
                         depth + 1,
                         max_depth,
                         trunc,
@@ -3543,9 +4599,11 @@ fn render_showall_level(
     true
 }
 
-fn render_showall_preview_to_string(
+fn render_showall_preview_to_string_with_cache(
     preview_root: &Path,
     preview_items: &[ChangeItem],
+    source_display_paths: &HashSet<String>,
+    include_unchanged: bool,
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
@@ -3553,6 +4611,7 @@ fn render_showall_preview_to_string(
     max_depth: usize,
     trunc: usize,
     max_lines: Option<usize>,
+    dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
 ) -> Option<String> {
     let mut root_extra: HashMap<String, String> = HashMap::new();
     for n in extra_added {
@@ -3571,7 +4630,6 @@ fn render_showall_preview_to_string(
     }
 
     let tree = build_change_tree(preview_items);
-    let mut dir_cache: HashMap<PathBuf, Vec<(String, bool)>> = HashMap::new();
     let mut out = String::new();
     let mut line_count = 0usize;
     let ok = render_showall_level(
@@ -3579,10 +4637,13 @@ fn render_showall_preview_to_string(
         Some(&tree),
         "",
         &root_extra,
+        source_display_paths,
+        "",
+        include_unchanged,
         0,
         max_depth,
         trunc,
-        &mut dir_cache,
+        dir_cache,
         &mut out,
         max_lines,
         &mut line_count,
@@ -3605,6 +4666,7 @@ fn collect_top_level_preview(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
@@ -3623,6 +4685,8 @@ fn collect_top_level_preview(
 
     let mut top_states: HashMap<String, String> = HashMap::new();
     let mut top_is_dir: HashMap<String, bool> = HashMap::new();
+    let mut unchanged_identical = 0usize;
+    let mut unchanged_uncollided = 0usize;
 
     for it in preview_items {
         let mut item = it.rel.trim().trim_start_matches("./").to_string();
@@ -3679,25 +4743,34 @@ fn collect_top_level_preview(
     }
 
     for name in top_states.clone().keys() {
-        if top_states.get(name).map(|s| s.as_str()) == Some("added") && existing_entries.contains(name) {
+        if top_states.get(name).map(|s| s.as_str()) == Some("added")
+            && existing_entries.contains(name)
+        {
             top_states.insert(name.clone(), "modified".to_string());
         }
     }
 
-    let mut all_entries: BTreeSet<String> = BTreeSet::new();
-    all_entries.extend(existing_entries.iter().cloned());
-    all_entries.extend(top_states.keys().cloned());
-
-    let mut unchanged_identical = 0usize;
-    let mut unchanged_uncollided = 0usize;
-    for name in &existing_entries {
-        if top_states.contains_key(name) {
-            continue;
+    if include_unchanged {
+        for name in &existing_entries {
+            if top_states.contains_key(name) {
+                continue;
+            }
+            if source_top_entries.contains(name.as_str()) {
+                top_states.insert(name.clone(), "identical".to_string());
+            } else {
+                top_states.insert(name.clone(), "uncollided".to_string());
+            }
         }
-        if source_top_entries.contains(name) {
-            unchanged_identical += 1;
-        } else {
-            unchanged_uncollided += 1;
+    } else {
+        for name in &existing_entries {
+            if top_states.contains_key(name) {
+                continue;
+            }
+            if source_top_entries.contains(name.as_str()) {
+                unchanged_identical += 1;
+            } else {
+                unchanged_uncollided += 1;
+            }
         }
     }
 
@@ -3737,7 +4810,8 @@ fn collect_source_top_entries(
         SrcObjKind::File => {
             if let Some(name) = rename_target_name {
                 out.insert(name);
-            } else if let Some(name) = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()) {
+            } else if let Some(name) = src_mnt.file_name().map(|s| s.to_string_lossy().to_string())
+            {
                 out.insert(name);
             }
         }
@@ -3745,7 +4819,9 @@ fn collect_source_top_entries(
             if include_root {
                 if let Some(name) = rename_target_name {
                     out.insert(name);
-                } else if let Some(name) = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()) {
+                } else if let Some(name) =
+                    src_mnt.file_name().map(|s| s.to_string_lossy().to_string())
+                {
                     out.insert(name);
                 }
             } else if let Ok(rd) = fs::read_dir(src_mnt) {
@@ -3762,6 +4838,7 @@ fn render_changed_top_preview_to_string(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
@@ -3772,28 +4849,52 @@ fn render_changed_top_preview_to_string(
         preview_root,
         preview_items,
         source_top_entries,
+        include_unchanged,
         extra_added,
         extra_modified,
         extra_replaced,
         extra_removed,
     );
 
-    let mut changed_names: Vec<String> = d.top_states.keys().cloned().collect();
-    changed_names.sort();
+    let mut visible_ordered_names: Vec<(String, String)> = d
+        .top_states
+        .iter()
+        .map(|(name, state)| (name.clone(), state.clone()))
+        .collect();
+    visible_ordered_names.sort_by(|(name_a, state_a), (name_b, state_b)| {
+        state_sort_priority(state_a.as_str())
+            .cmp(&state_sort_priority(state_b.as_str()))
+            .then(name_a.cmp(name_b))
+    });
 
-    let visible_names: Vec<String> = changed_names.iter().take(max_top_entries).cloned().collect();
-    let hidden_names: Vec<String> = changed_names.iter().skip(max_top_entries).cloned().collect();
+    let visible_names: Vec<String> = visible_ordered_names
+        .iter()
+        .take(max_top_entries)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let hidden_names: Vec<String> = visible_ordered_names
+        .iter()
+        .skip(max_top_entries)
+        .map(|(name, _)| name.clone())
+        .collect();
 
     let mut hidden_new = 0usize;
     let mut hidden_modified = 0usize;
+    let mut hidden_identical = d.unchanged_identical;
+    let mut hidden_uncollided = d.unchanged_uncollided;
     let mut hidden_removed = 0usize;
-    let hidden_identical = d.unchanged_identical;
-    let hidden_uncollided = d.unchanged_uncollided;
 
     for n in hidden_names {
-        match d.top_states.get(&n).map(|s| s.as_str()).unwrap_or("modified") {
+        match d
+            .top_states
+            .get(&n)
+            .map(|s| s.as_str())
+            .unwrap_or("modified")
+        {
             "added" => hidden_new += 1,
             "removed" => hidden_removed += 1,
+            "identical" => hidden_identical += 1,
+            "uncollided" => hidden_uncollided += 1,
             _ => hidden_modified += 1,
         }
     }
@@ -3807,6 +4908,7 @@ fn render_changed_top_preview_to_string(
             hidden_identical,
             hidden_uncollided,
             hidden_removed,
+            !include_unchanged,
         ) {
             let _ = writeln!(out, "... and {summary}");
         }
@@ -3817,7 +4919,11 @@ fn render_changed_top_preview_to_string(
         for name in visible_names {
             let full = d.root.join(&name);
             let is_dir = *d.top_is_dir.get(&name).unwrap_or(&full.is_dir());
-            let state = d.top_states.get(&name).cloned().unwrap_or_else(|| "modified".to_string());
+            let state = d
+                .top_states
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| "modified".to_string());
             if state == "replaced" {
                 rows.push(("replaced_old".to_string(), name.clone(), is_dir));
                 rows.push(("replaced_new".to_string(), name.clone(), is_dir));
@@ -3830,7 +4936,11 @@ fn render_changed_top_preview_to_string(
             let last = idx + 1 == rows.len();
             let branch = if last { "└── " } else { "├── " };
             let suffix = if *is_dir { "/" } else { "" };
-            let state = d.top_states.get(name).map(|s| s.as_str()).unwrap_or("modified");
+            let state = d
+                .top_states
+                .get(name)
+                .map(|s| s.as_str())
+                .unwrap_or("modified");
             let (color, label) = if kind == "replaced_old" {
                 (FAIL, " (old)")
             } else if kind == "replaced_new" {
@@ -3839,6 +4949,10 @@ fn render_changed_top_preview_to_string(
                 (FAIL, " (removed)")
             } else if state == "added" {
                 (OKGREEN, "")
+            } else if state == "identical" {
+                (LIGHT_TEAL, "")
+            } else if state == "uncollided" {
+                (WHITE, "")
             } else {
                 (WARNING, "")
             };
@@ -3850,6 +4964,7 @@ fn render_changed_top_preview_to_string(
             hidden_identical,
             hidden_uncollided,
             hidden_removed,
+            !include_unchanged,
         ) {
             let _ = writeln!(out, "... and {summary}");
         }
@@ -3861,6 +4976,7 @@ fn print_changed_top_preview(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
     extra_added: &HashSet<String>,
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
@@ -3871,6 +4987,7 @@ fn print_changed_top_preview(
         preview_root,
         preview_items,
         source_top_entries,
+        include_unchanged,
         extra_added,
         extra_modified,
         extra_replaced,
@@ -3886,7 +5003,8 @@ fn format_hidden_top_summary(
     hidden_modified: usize,
     hidden_identical: usize,
     hidden_uncollided: usize,
-    hidden_removed: usize,
+    hidden_deleted: usize,
+    combine_unchanged: bool,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if hidden_new > 0 {
@@ -3895,20 +5013,23 @@ fn format_hidden_top_summary(
     if hidden_modified > 0 {
         parts.push(format!("{hidden_modified} more modified"));
     }
-    if hidden_identical > 0 {
-        parts.push(format!("{hidden_identical} more identical"));
-    }
-    if hidden_uncollided > 0 {
-        parts.push(format!("{hidden_uncollided} more uncollided"));
-    }
-
-    if hidden_removed > 0 {
-        if parts.is_empty() {
-            Some(format!("{hidden_removed} more removed"))
-        } else {
-            Some(format!("{} and {hidden_removed} more removed", parts.join(" ")))
+    if combine_unchanged {
+        let combined = hidden_identical + hidden_uncollided;
+        if combined > 0 {
+            parts.push(format!("{combined} more identical/uncollided"));
         }
-    } else if !parts.is_empty() {
+    } else {
+        if hidden_identical > 0 {
+            parts.push(format!("{hidden_identical} more identical"));
+        }
+        if hidden_uncollided > 0 {
+            parts.push(format!("{hidden_uncollided} more uncollided"));
+        }
+    }
+    if hidden_deleted > 0 {
+        parts.push(format!("{hidden_deleted} more deleted"));
+    }
+    if !parts.is_empty() {
         Some(parts.join(" "))
     } else {
         None
@@ -4015,7 +5136,9 @@ fn run_remote_transfer_mode(
             if let Some(kind) = local_src_kind {
                 let resolved = match kind {
                     SrcObjKind::File => resolve_destination_for_file(destination, requested_mode),
-                    SrcObjKind::Dir => resolve_destination_for_dir(destination, requested_mode, false),
+                    SrcObjKind::Dir => {
+                        resolve_destination_for_dir(destination, requested_mode, false)
+                    }
                 };
                 match resolved {
                     Ok((p, _)) => Endpoint::Local(p),
@@ -4028,7 +5151,10 @@ fn run_remote_transfer_mode(
                     if !parent.is_dir() {
                         log(
                             requested_mode,
-                            &format!("Destination parent directory does not exist: {}", parent.display()),
+                            &format!(
+                                "Destination parent directory does not exist: {}",
+                                parent.display()
+                            ),
                             LogLevel::Error,
                         );
                         return 1;
@@ -4054,7 +5180,8 @@ fn run_remote_transfer_mode(
         );
     }
 
-    let contents_active = contents_mode_requested && !matches!(local_src_kind, Some(SrcObjKind::File));
+    let contents_active =
+        contents_mode_requested && !matches!(local_src_kind, Some(SrcObjKind::File));
     let mode_dir_active = matches!(local_src_kind, Some(SrcObjKind::Dir)) && !contents_active;
     println!(
         "{}",
@@ -4075,7 +5202,9 @@ fn run_remote_transfer_mode(
 
     let src_path = endpoint_to_rsync(&source_ep, true, contents_active, local_src_kind);
     let dst_path = endpoint_to_rsync(&destination_ep, false, false, local_src_kind);
-    println!("{WARNING}Remote rsync mode: detailed pre-scan is skipped for remote endpoints.{ENDC}");
+    println!(
+        "{WARNING}Remote rsync mode: detailed pre-scan is skipped for remote endpoints.{ENDC}"
+    );
     println!("Source: {WHITE}{src_path}{ENDC}");
     println!("Destination: {WHITE}{dst_path}{ENDC}");
     println!();
@@ -4111,7 +5240,8 @@ fn run_remote_transfer_mode(
     let start_ts = Instant::now();
     let transfer = run_rsync_transfer(&src_path, &dst_path, 0, use_sudo, is_move);
 
-    if is_move && (transfer.rc == 0 || transfer.rc == 24) && matches!(source_ep, Endpoint::Local(_)) {
+    if is_move && (transfer.rc == 0 || transfer.rc == 24) && matches!(source_ep, Endpoint::Local(_))
+    {
         if let (Endpoint::Local(src_local), Some(SrcObjKind::Dir)) = (&source_ep, local_src_kind) {
             cleanup_source_dirs(src_local, !contents_active, use_sudo, requested_mode);
         }
@@ -4119,13 +5249,14 @@ fn run_remote_transfer_mode(
 
     let result = if transfer.rc == 0 {
         if let Endpoint::Local(dst_local) = &destination_ep {
-            flush_destination_writes(dst_local, use_sudo, requested_mode);
+            let _ = flush_destination_writes(
+                dst_local,
+                use_sudo,
+                requested_mode,
+                transfer.progress_snapshot,
+            );
         }
-        log(
-            requested_mode,
-            &format!("{} complete.", requested_mode.word_cap()),
-            LogLevel::Info,
-        );
+        log_transfer_complete(requested_mode);
         0
     } else if transfer.rc == 24 {
         log(
@@ -4161,7 +5292,12 @@ fn run_remote_transfer_mode(
     } else {
         0.0
     };
-    print_summary_rate_line("Average transfer speed", avg_transfer_bps, transfer.elapsed_s, false);
+    print_summary_rate_line(
+        "Average transfer speed",
+        avg_transfer_bps,
+        transfer.elapsed_s,
+        false,
+    );
     print_summary_rate_line("Overall throughput", avg_total_bps, total_elapsed_s, true);
     result
 }
@@ -4176,7 +5312,11 @@ fn real_main() -> i32 {
         Err(code) => return code,
     };
 
-    let requested_mode = if args.move_mode { TransferMode::Move } else { TransferMode::Copy };
+    let requested_mode = if args.move_mode {
+        TransferMode::Move
+    } else {
+        TransferMode::Copy
+    };
     let is_move = requested_mode == TransferMode::Move;
 
     if !args.extra.is_empty() {
@@ -4235,26 +5375,44 @@ fn real_main() -> i32 {
             Ok(v) => v,
             Err(code) => return code,
         },
-        SrcObjKind::Dir => match resolve_destination_for_dir(&destination, requested_mode, overwrite) {
-            Ok(v) => v,
-            Err(code) => return code,
-        },
+        SrcObjKind::Dir => {
+            match resolve_destination_for_dir(&destination, requested_mode, overwrite) {
+                Ok(v) => v,
+                Err(code) => return code,
+            }
+        }
     };
 
     let source_contents_mode = source_glob_contents && !force;
-    let dest_tail_raw = destination.trim_end_matches('/').split('/').last().unwrap_or("");
-    let destination_is_dir_ref = destination.ends_with('/') || dest_tail_raw.is_empty() || dest_tail_raw == "." || dest_tail_raw == "..";
+    let dest_tail_raw = destination
+        .trim_end_matches('/')
+        .split('/')
+        .last()
+        .unwrap_or("");
+    let destination_is_dir_ref = destination.ends_with('/')
+        || dest_tail_raw.is_empty()
+        || dest_tail_raw == "."
+        || dest_tail_raw == "..";
 
     let mut rename_dir_to_new_path = false;
     let mut merge_child_into_parent = false;
     let mut source_already_in_destination = false;
     let mut overwrite_parent_from_child = false;
 
-    if src_obj_kind == SrcObjKind::Dir && matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
-        let dst_slot_for_src = realpath_allow_missing(&dst_mnt.join(src_mnt.file_name().unwrap_or_default()));
+    if src_obj_kind == SrcObjKind::Dir
+        && matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting)
+    {
+        let dst_slot_for_src =
+            realpath_allow_missing(&dst_mnt.join(src_mnt.file_name().unwrap_or_default()));
         if dst_slot_for_src == src_mnt {
-            let src_base = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            let dst_base = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let src_base = src_mnt
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let dst_base = dst_mnt
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             if src_base == dst_base {
                 source_already_in_destination = true;
                 if force && !source_contents_mode {
@@ -4271,7 +5429,8 @@ fn real_main() -> i32 {
                 }
             }
         } else {
-            let src_parent_real = realpath_allow_missing(src_mnt.parent().unwrap_or_else(|| Path::new(".")));
+            let src_parent_real =
+                realpath_allow_missing(src_mnt.parent().unwrap_or_else(|| Path::new(".")));
             if dst_slot_for_src == src_parent_real {
                 source_already_in_destination = true;
                 if force && !source_contents_mode {
@@ -4299,7 +5458,11 @@ fn real_main() -> i32 {
         overwrite_rename_dir_target = true;
     }
 
-    if overwrite && src_obj_kind == SrcObjKind::Dir && dst_obj_kind == DstObjKind::FileExistingForDir && !source_contents_mode {
+    if overwrite
+        && src_obj_kind == SrcObjKind::Dir
+        && dst_obj_kind == DstObjKind::FileExistingForDir
+        && !source_contents_mode
+    {
         overwrite_replace_file_target = true;
     }
 
@@ -4312,7 +5475,10 @@ fn real_main() -> i32 {
         && !overwrite_rename_dir_target;
 
     if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
-        if overwrite_rename_dir_target || force_merge_dir_target || (merge_child_into_parent && src_obj_kind == SrcObjKind::Dir) {
+        if overwrite_rename_dir_target
+            || force_merge_dir_target
+            || (merge_child_into_parent && src_obj_kind == SrcObjKind::Dir)
+        {
             target_dir_for_name = dst_mnt.parent().map(|p| p.to_path_buf());
             target_name_for_conflict = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string());
         } else {
@@ -4325,7 +5491,10 @@ fn real_main() -> i32 {
     } else if dst_obj_kind == DstObjKind::DirNew && src_obj_kind == SrcObjKind::Dir {
         target_dir_for_name = dst_mnt.parent().map(|p| p.to_path_buf());
         target_name_for_conflict = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string());
-    } else if matches!(dst_obj_kind, DstObjKind::File | DstObjKind::FileExistingForDir) {
+    } else if matches!(
+        dst_obj_kind,
+        DstObjKind::File | DstObjKind::FileExistingForDir
+    ) {
         target_dir_for_name = dst_mnt.parent().map(|p| p.to_path_buf());
         target_name_for_conflict = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string());
     }
@@ -4344,7 +5513,11 @@ fn real_main() -> i32 {
     if overwrite_rename_dir_target {
         let candidate_real = realpath_allow_missing(&dst_mnt);
         if candidate_real == src_mnt {
-            log(requested_mode, "Refusing to overwrite source directory itself.", LogLevel::Error);
+            log(
+                requested_mode,
+                "Refusing to overwrite source directory itself.",
+                LogLevel::Error,
+            );
             return 1;
         }
         overwrite_target_path = Some(candidate_real);
@@ -4352,7 +5525,11 @@ fn real_main() -> i32 {
     } else if overwrite_replace_file_target {
         let candidate_real = realpath_allow_missing(&dst_mnt);
         if candidate_real == src_mnt {
-            log(requested_mode, "Refusing to overwrite source directory itself.", LogLevel::Error);
+            log(
+                requested_mode,
+                "Refusing to overwrite source directory itself.",
+                LogLevel::Error,
+            );
             return 1;
         }
         overwrite_target_path = Some(candidate_real);
@@ -4369,7 +5546,11 @@ fn real_main() -> i32 {
             if candidate.exists() && candidate.is_dir() {
                 let candidate_real = realpath_allow_missing(&candidate);
                 if candidate_real == src_mnt {
-                    log(requested_mode, "Refusing to overwrite source directory itself.", LogLevel::Error);
+                    log(
+                        requested_mode,
+                        "Refusing to overwrite source directory itself.",
+                        LogLevel::Error,
+                    );
                     return 1;
                 }
                 overwrite_target_path = Some(candidate_real);
@@ -4405,25 +5586,41 @@ fn real_main() -> i32 {
     };
 
     let dst_path = if overwrite_rename_dir_target || overwrite_replace_file_target {
-        dst_mnt.display().to_string().trim_end_matches('/').to_string()
+        dst_mnt
+            .display()
+            .to_string()
+            .trim_end_matches('/')
+            .to_string()
     } else if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
         format!("{}/", dst_mnt.display().to_string().trim_end_matches('/'))
     } else {
-        dst_mnt.display().to_string().trim_end_matches('/').to_string()
+        dst_mnt
+            .display()
+            .to_string()
+            .trim_end_matches('/')
+            .to_string()
     };
 
-    let src_base = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let src_parent = src_mnt.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let src_base = src_mnt
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let src_parent = src_mnt
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let target_base = target_name_for_conflict.clone().unwrap_or_default();
     let target_parent = target_dir_for_name.clone().unwrap_or_default();
 
-    let mut _mode_move = realpath_allow_missing(&src_parent) != realpath_allow_missing(&target_parent);
+    let mut _mode_move =
+        realpath_allow_missing(&src_parent) != realpath_allow_missing(&target_parent);
     if merge_child_into_parent || overwrite_parent_from_child {
         _mode_move = false;
     }
 
-    let mut mode_rename = !src_base.is_empty() && !target_base.is_empty() && src_base != target_base;
+    let mut mode_rename =
+        !src_base.is_empty() && !target_base.is_empty() && src_base != target_base;
     if force_merge_dir_target || merge_child_into_parent {
         mode_rename = false;
     }
@@ -4454,7 +5651,10 @@ fn real_main() -> i32 {
             backup_source_path = Some(otp.clone());
             backup_source_kind = overwrite_target_kind;
         } else if (mode_merge || mode_overwrite)
-            && target_conflict_path.as_ref().map(|p| p.exists()).unwrap_or(false)
+            && target_conflict_path
+                .as_ref()
+                .map(|p| p.exists())
+                .unwrap_or(false)
         {
             if let Some(tp) = &target_conflict_path {
                 let p = realpath_allow_missing(tp);
@@ -4511,8 +5711,9 @@ fn real_main() -> i32 {
         TransferBackend::Rust
     };
     configure_rayon_threads_for_media(media);
-    let build_transfer_manifest =
-        !preview_only && src_obj_kind == SrcObjKind::Dir && (matches!(backend, TransferBackend::Rust) || is_move);
+    let build_transfer_manifest = !preview_only
+        && src_obj_kind == SrcObjKind::Dir
+        && (matches!(backend, TransferBackend::Rust) || is_move);
 
     let prescan = if source_already_in_destination {
         PreScan::default()
@@ -4522,22 +5723,24 @@ fn real_main() -> i32 {
 
         if src_obj_kind == SrcObjKind::Dir && overwrite_target_path.is_some() {
             let pre_parent = dst_mnt.parent().unwrap_or_else(|| Path::new("."));
-            if let Ok(td) = tempfile::Builder::new().prefix(&format!(".{}-preflight-", requested_mode.word())).tempdir_in(pre_parent) {
+            if let Ok(td) = tempfile::Builder::new()
+                .prefix(&format!(".{}-preflight-", requested_mode.word()))
+                .tempdir_in(pre_parent)
+            {
                 pre_dst_path = td.path().join("target").display().to_string();
                 preflight_tmpdir = Some(td);
             }
         }
 
         let ps = match src_obj_kind {
-            SrcObjKind::Dir => {
-                pre_scan_directory(
-                    &src_path,
-                    &pre_dst_path,
-                    &src_mnt,
-                    build_transfer_manifest,
-                )
-            }
-            SrcObjKind::File => pre_scan_file(&src_mnt, &pre_dst_path, dst_obj_kind),
+            SrcObjKind::Dir => pre_scan_directory(
+                &src_path,
+                &pre_dst_path,
+                &src_mnt,
+                build_transfer_manifest,
+                args.showall,
+            ),
+            SrcObjKind::File => pre_scan_file(&src_mnt, &pre_dst_path, dst_obj_kind, args.showall),
         };
 
         drop(preflight_tmpdir);
@@ -4557,6 +5760,11 @@ fn real_main() -> i32 {
     let uncollided_dirs = prescan.uncollided_dirs;
     let transfer_manifest = prescan.transfer_manifest;
     let mut display_change_preview = prescan.change_preview.clone();
+    let mut source_display_paths: HashSet<String> = if args.showall {
+        prescan.source_display_paths.iter().cloned().collect()
+    } else {
+        HashSet::new()
+    };
     let has_itemized_changes = prescan.has_itemized_changes;
 
     let (manifest_cleanup_files, manifest_cleanup_bytes) = if is_move {
@@ -4579,7 +5787,10 @@ fn real_main() -> i32 {
         (0, 0)
     };
 
-    let dst_preview_root = if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting | DstObjKind::DirNew) {
+    let dst_preview_root = if matches!(
+        dst_obj_kind,
+        DstObjKind::Dir | DstObjKind::DirExisting | DstObjKind::DirNew
+    ) {
         PathBuf::from(format!("{}/", dst_path.trim_end_matches('/')))
     } else {
         PathBuf::from(
@@ -4599,11 +5810,27 @@ fn real_main() -> i32 {
     let mut rename_target_is_dir = false;
 
     if src_obj_kind == SrcObjKind::Dir && rename_dir_to_new_path {
-        let src_base = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let dst_base = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let src_parent = src_mnt.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"));
-        let dst_parent = dst_mnt.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"));
-        if src_parent == dst_parent && !src_base.is_empty() && !dst_base.is_empty() && src_base != dst_base {
+        let src_base = src_mnt
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dst_base = dst_mnt
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let src_parent = src_mnt
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let dst_parent = dst_mnt
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        if src_parent == dst_parent
+            && !src_base.is_empty()
+            && !dst_base.is_empty()
+            && src_base != dst_base
+        {
             simple_rename_src = Some(src_base);
             simple_rename_dst = Some(dst_base);
             simple_rename_parent = Some(src_parent);
@@ -4612,79 +5839,117 @@ fn real_main() -> i32 {
             rename_target_is_dir = true;
         }
     } else if src_obj_kind == SrcObjKind::File && dst_obj_kind == DstObjKind::File {
-        let src_base = src_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let dst_base = dst_mnt.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let src_parent = src_mnt.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"));
-        let dst_parent = dst_mnt.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("/"));
-        if src_parent == dst_parent && !src_base.is_empty() && !dst_base.is_empty() && src_base != dst_base {
+        let src_base = src_mnt
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dst_base = dst_mnt
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let src_parent = src_mnt
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let dst_parent = dst_mnt
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        if src_parent == dst_parent
+            && !src_base.is_empty()
+            && !dst_base.is_empty()
+            && src_base != dst_base
+        {
             simple_rename_src = Some(src_base);
             simple_rename_dst = Some(dst_base);
             simple_rename_parent = Some(src_parent);
-        } else if !src_base.is_empty() && !dst_base.is_empty() && (src_parent != dst_parent || src_base != dst_base) {
+        } else if !src_base.is_empty()
+            && !dst_base.is_empty()
+            && (src_parent != dst_parent || src_base != dst_base)
+        {
             rename_target_only = Some(dst_base);
         }
     }
 
-    let preview_inside_target_dir = rename_target_only.is_some() && rename_target_is_dir && overwrite_target_path.is_some();
+    let preview_inside_target_dir =
+        rename_target_only.is_some() && rename_target_is_dir && overwrite_target_path.is_some();
 
     let mut preview_root = if let Some(parent) = &simple_rename_parent {
-        PathBuf::from(format!("{}/", parent.display().to_string().trim_end_matches('/')))
+        PathBuf::from(format!(
+            "{}/",
+            parent.display().to_string().trim_end_matches('/')
+        ))
     } else if rename_target_only.is_some() && !preview_inside_target_dir && !rename_target_is_dir {
         let rename_parent = if rename_target_is_dir {
             dst_mnt.parent().unwrap_or_else(|| Path::new("/"))
         } else {
             dst_mnt.parent().unwrap_or_else(|| Path::new("/"))
         };
-        PathBuf::from(format!("{}/", rename_parent.display().to_string().trim_end_matches('/')))
+        PathBuf::from(format!(
+            "{}/",
+            rename_parent.display().to_string().trim_end_matches('/')
+        ))
     } else {
         dst_preview_root.clone()
     };
 
-    if simple_rename_parent.is_some() && src_obj_kind == SrcObjKind::Dir && simple_rename_dst.is_some() && !display_change_preview.is_empty() {
+    if args.showall
+        && simple_rename_parent.is_some()
+        && src_obj_kind == SrcObjKind::Dir
+        && simple_rename_dst.is_some()
+    {
         let dst_name = simple_rename_dst.clone().unwrap_or_default();
-        let mut remapped = Vec::new();
-        for ch in display_change_preview {
-            let item = ch.rel.trim_start_matches("./").to_string();
-            let rel = if item.starts_with(&format!("{dst_name}/")) || item == dst_name {
-                item
-            } else if item.is_empty() {
-                format!("{dst_name}/")
-            } else {
-                format!("{dst_name}/{item}")
-            };
-            remapped.push(ChangeItem { kind: ch.kind, rel });
+        source_display_paths = remap_path_set_under_prefix(&source_display_paths, &dst_name);
+        if !display_change_preview.is_empty() {
+            let mut remapped = Vec::new();
+            for ch in display_change_preview {
+                let item = ch.rel.trim_start_matches("./").to_string();
+                let rel = remap_item_under_prefix(&item, &dst_name);
+                remapped.push(ChangeItem { kind: ch.kind, rel });
+            }
+            display_change_preview = remapped;
         }
-        display_change_preview = remapped;
     }
 
     if let Some(pb) = &planned_backup_path {
         if overwrite_target_path.is_none() {
             let backup_parent = pb.parent().unwrap_or_else(|| Path::new("/"));
-            let current_root = PathBuf::from(preview_root.to_string_lossy().trim_end_matches('/').to_string());
+            let current_root = PathBuf::from(
+                preview_root
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string(),
+            );
             if realpath_allow_missing(backup_parent) != realpath_allow_missing(&current_root) {
-                let current_root_name = current_root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                if !current_root_name.is_empty() && !display_change_preview.is_empty() {
-                    let mut remapped = Vec::new();
-                    for ch in display_change_preview {
-                        let item = ch.rel.trim_start_matches("./").to_string();
-                        let rel = if item.starts_with(&format!("{current_root_name}/")) || item == current_root_name {
-                            item
-                        } else if item.is_empty() {
-                            format!("{current_root_name}/")
-                        } else {
-                            format!("{current_root_name}/{item}")
-                        };
-                        remapped.push(ChangeItem { kind: ch.kind, rel });
+                let current_root_name = current_root
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if args.showall && !current_root_name.is_empty() {
+                    source_display_paths =
+                        remap_path_set_under_prefix(&source_display_paths, &current_root_name);
+                    if !display_change_preview.is_empty() {
+                        let mut remapped = Vec::new();
+                        for ch in display_change_preview {
+                            let item = ch.rel.trim_start_matches("./").to_string();
+                            let rel = remap_item_under_prefix(&item, &current_root_name);
+                            remapped.push(ChangeItem { kind: ch.kind, rel });
+                        }
+                        display_change_preview = remapped;
                     }
-                    display_change_preview = remapped;
                 }
-                preview_root = PathBuf::from(format!("{}/", backup_parent.display().to_string().trim_end_matches('/')));
+                preview_root = PathBuf::from(format!(
+                    "{}/",
+                    backup_parent.display().to_string().trim_end_matches('/')
+                ));
             }
         }
     }
 
     if is_move && merge_child_into_parent && src_obj_kind == SrcObjKind::Dir {
-        let preview_root_real = realpath_allow_missing(Path::new(preview_root.to_string_lossy().trim_end_matches('/')));
+        let preview_root_real = realpath_allow_missing(Path::new(
+            preview_root.to_string_lossy().trim_end_matches('/'),
+        ));
         let src_real = realpath_allow_missing(&src_mnt);
         if let Ok(removed_rel) = src_real.strip_prefix(&preview_root_real) {
             let rel = normalize_rel(removed_rel);
@@ -4702,12 +5967,17 @@ fn real_main() -> i32 {
     let highlight_new_preview_leaf = src_obj_kind == SrcObjKind::Dir
         && matches!(dst_obj_kind, DstObjKind::DirNew)
         && !preview_root_trimmed.exists();
-    let overwrite_requires_action = overwrite_target_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let overwrite_requires_action = overwrite_target_path
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
     let has_move_cleanup_work = is_move
         && !source_already_in_destination
         && (manifest_cleanup_files > 0 || manifest_cleanup_bytes > 0);
-    let emphasize_preview_root =
-        has_itemized_changes || planned_bytes > 0 || overwrite_requires_action || has_move_cleanup_work;
+    let emphasize_preview_root = has_itemized_changes
+        || planned_bytes > 0
+        || overwrite_requires_action
+        || has_move_cleanup_work;
     print_preview_root_line(
         &preview_root,
         highlight_new_preview_leaf,
@@ -4755,20 +6025,24 @@ fn real_main() -> i32 {
         }
     }
 
-    let preview_root_trimmed_owned = preview_root.to_string_lossy().trim_end_matches('/').to_string();
+    let preview_root_trimmed_owned = preview_root
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string();
     let preview_root_path = Path::new(&preview_root_trimmed_owned);
     {
-        const TOTAL_LINES: usize = 27;
-        const BODY_MAX_LINES: usize = TOTAL_LINES - 1;
-        const DEFAULT_MAX_DEPTH: usize = 20;
-        let max_depth = args.tree_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-        let trunc = args.tree_trunc;
+        const BODY_MAX_LINES: usize = 25;
+        let max_depth = args.tree_depth.unwrap_or(1);
+        let trunc = args.tree_trunc.max(1);
+        let mut dir_cache: HashMap<PathBuf, Vec<(String, bool)>> = HashMap::new();
 
         let mut best_render: Option<String> = None;
         for try_depth in 1..=max_depth {
-            if let Some(rendered) = render_showall_preview_to_string(
+            if let Some(rendered) = render_showall_preview_to_string_with_cache(
                 preview_root_path,
                 &display_change_preview,
+                &source_display_paths,
+                args.showall,
                 &extra_added,
                 &extra_modified,
                 &extra_replaced,
@@ -4776,6 +6050,7 @@ fn real_main() -> i32 {
                 try_depth,
                 trunc,
                 Some(BODY_MAX_LINES),
+                &mut dir_cache,
             ) {
                 best_render = Some(rendered);
             } else {
@@ -4799,6 +6074,7 @@ fn real_main() -> i32 {
                 preview_root_path,
                 &display_change_preview,
                 &source_top_entries,
+                args.showall,
                 &extra_added,
                 &extra_modified,
                 &extra_replaced,
@@ -4885,15 +6161,11 @@ fn real_main() -> i32 {
     if file_row.is_some() || dir_row.is_some() {
         println!(
             "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
-            "Type",
-            "New",
-            "Modified",
-            "Identical",
-            "Uncollided",
-            "Deleted (src)",
-            "Deleted (dest)"
+            "Type", "New", "Modified", "Identical", "Uncollided", "Deleted (src)", "Deleted (dest)"
         );
-        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) = file_row {
+        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) =
+            file_row
+        {
             println!(
                 "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
                 "Files",
@@ -4905,7 +6177,9 @@ fn real_main() -> i32 {
                 format_number(deleted_dest_v)
             );
         }
-        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) = dir_row {
+        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) =
+            dir_row
+        {
             println!(
                 "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
                 "Dirs",
@@ -4940,10 +6214,15 @@ fn real_main() -> i32 {
     }
 
     let no_changes_planned = source_already_in_destination
-        || ((planned_bytes == 0 && !has_itemized_changes && !overwrite_requires_action) && !move_cleanup_only);
+        || ((planned_bytes == 0 && !has_itemized_changes && !overwrite_requires_action)
+            && !move_cleanup_only);
 
     if overwrite_requires_action && planned_bytes == 0 && !has_itemized_changes {
-        log(requested_mode, "Overwrite requested: destination conflict will be replaced.", LogLevel::Info);
+        log(
+            requested_mode,
+            "Overwrite requested: destination conflict will be replaced.",
+            LogLevel::Info,
+        );
     }
     if no_changes_planned {
         log(
@@ -4972,7 +6251,11 @@ fn real_main() -> i32 {
     }
 
     if source_already_in_destination {
-        log(requested_mode, "No changes: source is already in destination directory.", LogLevel::Info);
+        log(
+            requested_mode,
+            "No changes: source is already in destination directory.",
+            LogLevel::Info,
+        );
         return 0;
     }
 
@@ -4997,7 +6280,9 @@ fn real_main() -> i32 {
                 }
             }
             SrcObjKind::Dir => match dst_obj_kind {
-                DstObjKind::Dir | DstObjKind::DirExisting => src_mnt.file_name().map(|n| dst_mnt.join(n)),
+                DstObjKind::Dir | DstObjKind::DirExisting => {
+                    src_mnt.file_name().map(|n| dst_mnt.join(n))
+                }
                 DstObjKind::DirNew => Some(dst_mnt.clone()),
                 _ => None,
             },
@@ -5027,7 +6312,10 @@ fn real_main() -> i32 {
                         format_number(available_bytes),
                         format_bytes_binary(available_bytes, 2)
                     );
-                    if overwrite_target_path.is_some() && !backup_requested && !overwrite_parent_from_child {
+                    if overwrite_target_path.is_some()
+                        && !backup_requested
+                        && !overwrite_parent_from_child
+                    {
                         log(
                             requested_mode,
                             &format!(
@@ -5052,20 +6340,20 @@ fn real_main() -> i32 {
         }
     }
 
-        if let Some(rename_target) = maybe_fast_rename_target {
-            if fast_rename_possible {
-                if fs::rename(&src_mnt, &rename_target).is_ok() {
-                    flush_destination_writes(&rename_target, use_sudo, requested_mode);
-                    log(
-                        requested_mode,
-                        &format!(
-                            "Fast-path rename on same filesystem: {} -> {}",
-                            src_mnt.display(),
+    if let Some(rename_target) = maybe_fast_rename_target {
+        if fast_rename_possible {
+            if fs::rename(&src_mnt, &rename_target).is_ok() {
+                let _ = flush_destination_writes(&rename_target, use_sudo, requested_mode, None);
+                log(
+                    requested_mode,
+                    &format!(
+                        "Fast-path rename on same filesystem: {} -> {}",
+                        src_mnt.display(),
                         rename_target.display()
                     ),
                     LogLevel::Info,
                 );
-                log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
+                log_transfer_complete(requested_mode);
                 return 0;
             }
         }
@@ -5110,28 +6398,39 @@ fn real_main() -> i32 {
     let start_ts = Instant::now();
     let mut transferred_bytes_total: u64 = 0;
     let mut transferred_elapsed_total_s: f64 = 0.0;
-    let mut transfer_read_bytes_total: u64 = 0;
-    let mut transfer_write_bytes_total: u64 = 0;
-    let mut transfer_read_elapsed_s: f64 = 0.0;
-    let mut transfer_write_elapsed_s: f64 = 0.0;
     let mut deleted_cleanup_total = DeleteCleanupOutcome::default();
-    let mut deleted_cleanup_elapsed_s: f64 = 0.0;
-    let mut cleanup_notice_emitted = false;
+    let mut cleanup_elapsed_total_s: f64 = 0.0;
+    let mut cleanup_flush_elapsed_s: f64 = 0.0;
+    let mut cleanup_flush_bytes_total: u64 = 0;
+    let mut transfer_flush_elapsed_s: f64 = 0.0;
+    let mut transfer_flush_bytes_total: u64 = 0;
 
     let result: i32 = (|| {
         if backup_requested {
             if let Some(bsp) = &backup_source_path {
                 if overwrite_target_path.is_none() {
                     if backup_source_kind == Some("file") {
-                        log(requested_mode, &format!("Backing up existing file: {}", bsp.display()), LogLevel::Info);
+                        log(
+                            requested_mode,
+                            &format!("Backing up existing file: {}", bsp.display()),
+                            LogLevel::Info,
+                        );
                     } else {
-                        log(requested_mode, &format!("Backing up existing directory: {}", bsp.display()), LogLevel::Info);
+                        log(
+                            requested_mode,
+                            &format!("Backing up existing directory: {}", bsp.display()),
+                            LogLevel::Info,
+                        );
                     }
                     if let Some(pbp) = &planned_backup_path {
                         if copy_path_to_backup(bsp, pbp, use_sudo, requested_mode).is_none() {
                             return 1;
                         }
-                        log(requested_mode, &format!("Backup saved as: {}", pbp.display()), LogLevel::Info);
+                        log(
+                            requested_mode,
+                            &format!("Backup saved as: {}", pbp.display()),
+                            LogLevel::Info,
+                        );
                     }
                 }
             }
@@ -5146,17 +6445,29 @@ fn real_main() -> i32 {
                 {
                     Ok(td) => td.keep(),
                     Err(_) => {
-                        log(requested_mode, "Failed to create staging directory.", LogLevel::Error);
+                        log(
+                            requested_mode,
+                            "Failed to create staging directory.",
+                            LogLevel::Error,
+                        );
                         return 1;
                     }
                 };
 
-                log(requested_mode, &format!("Staging source before overwrite: {}", stage_path.display()), LogLevel::Info);
+                log(
+                    requested_mode,
+                    &format!("Staging source before overwrite: {}", stage_path.display()),
+                    LogLevel::Info,
+                );
 
                 let transfer = match backend {
-                    TransferBackend::Rsync => {
-                        run_rsync_transfer(&src_path, &stage_path.display().to_string(), planned_bytes, use_sudo, false)
-                    }
+                    TransferBackend::Rsync => run_rsync_transfer(
+                        &src_path,
+                        &stage_path.display().to_string(),
+                        planned_bytes,
+                        use_sudo,
+                        false,
+                    ),
                     TransferBackend::Rust => run_rust_transfer(
                         &src_path,
                         &stage_path.display().to_string(),
@@ -5169,33 +6480,33 @@ fn real_main() -> i32 {
                 };
                 transferred_bytes_total += transfer.bytes_done;
                 transferred_elapsed_total_s += transfer.elapsed_s;
-                if let Some(rb) = transfer.io_read_bytes {
-                    transfer_read_bytes_total = transfer_read_bytes_total.saturating_add(rb);
-                    transfer_read_elapsed_s += transfer.elapsed_s;
-                }
-                if let Some(wb) = transfer.io_write_bytes {
-                    transfer_write_bytes_total = transfer_write_bytes_total.saturating_add(wb);
-                    transfer_write_elapsed_s += transfer.elapsed_s;
-                }
                 let rc_transfer = transfer.rc;
 
                 if rc_transfer == 0 || rc_transfer == 24 {
-                    if is_move {
-                        cleanup_source_dirs(&src_mnt, true, use_sudo, requested_mode);
-                    }
                     if backup_requested {
-                        log(requested_mode, &format!("Backing up existing directory: {}", otp.display()), LogLevel::Info);
-                        let backup_base = planned_backup_path.clone().or_else(|| backup_base_path(otp));
+                        log(
+                            requested_mode,
+                            &format!("Backing up existing directory: {}", otp.display()),
+                            LogLevel::Info,
+                        );
+                        let backup_base = planned_backup_path
+                            .clone()
+                            .or_else(|| backup_base_path(otp));
                         if let Some(bb) = backup_base {
                             if backup_path_with_base(otp, use_sudo, &bb, requested_mode).is_none() {
-                                let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
+                                let _ =
+                                    remove_path_recursive(&stage_path, use_sudo, requested_mode);
                                 return 1;
                             }
                         } else {
                             return 1;
                         }
                     } else {
-                        log(requested_mode, &format!("Overwriting existing directory: {}", otp.display()), LogLevel::Info);
+                        log(
+                            requested_mode,
+                            &format!("Overwriting existing directory: {}", otp.display()),
+                            LogLevel::Info,
+                        );
                         if !remove_path_recursive(otp, use_sudo, requested_mode) {
                             let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
                             return 1;
@@ -5209,22 +6520,97 @@ fn real_main() -> i32 {
                             stage_path.display().to_string(),
                             otp.display().to_string(),
                         ];
-                        let mv_ok = run_command_capture(&cmd, true).map(|o| o.code == 0).unwrap_or(false);
+                        let mv_ok = run_command_capture(&cmd, true)
+                            .map(|o| o.code == 0)
+                            .unwrap_or(false);
                         if !mv_ok {
-                            log(requested_mode, "Failed to place staged directory into destination.", LogLevel::Error);
+                            log(
+                                requested_mode,
+                                "Failed to place staged directory into destination.",
+                                LogLevel::Error,
+                            );
                             let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
                             return 1;
                         }
                     } else if fs::rename(&stage_path, otp).is_err() {
-                        log(requested_mode, "Failed to place staged directory into destination.", LogLevel::Error);
+                        log(
+                            requested_mode,
+                            "Failed to place staged directory into destination.",
+                            LogLevel::Error,
+                        );
                         let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
                         return 1;
                     }
 
                     if rc_transfer == 0 {
-                        flush_destination_writes(otp, use_sudo, requested_mode);
-                        log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
+                        let flush_stats = flush_destination_writes(
+                            otp,
+                            use_sudo,
+                            requested_mode,
+                            transfer.progress_snapshot,
+                        );
+                        transfer_flush_elapsed_s += flush_stats.elapsed_s;
+                        if let Some(b) = flush_stats.flushed_bytes {
+                            transfer_flush_bytes_total =
+                                transfer_flush_bytes_total.saturating_add(b);
+                        }
+                        log_transfer_complete(requested_mode);
+                        if is_move {
+                            let cleanup = run_move_cleanup_phase(
+                                &src_path,
+                                &stage_path.display().to_string(),
+                                &src_mnt,
+                                src_obj_kind,
+                                contents_mode_requested,
+                                source_contents_mode,
+                                true,
+                                use_sudo,
+                                requested_mode,
+                                transfer_manifest.as_ref(),
+                                likely_cleanup_files,
+                                likely_cleanup_bytes,
+                            );
+                            deleted_cleanup_total.files = deleted_cleanup_total
+                                .files
+                                .saturating_add(cleanup.deleted.files);
+                            deleted_cleanup_total.bytes = deleted_cleanup_total
+                                .bytes
+                                .saturating_add(cleanup.deleted.bytes);
+                            cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
+                            cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
+                            if let Some(b) = cleanup.flush.flushed_bytes {
+                                cleanup_flush_bytes_total =
+                                    cleanup_flush_bytes_total.saturating_add(b);
+                            }
+                        }
                         return 0;
+                    }
+                    if is_move {
+                        let cleanup = run_move_cleanup_phase(
+                            &src_path,
+                            &stage_path.display().to_string(),
+                            &src_mnt,
+                            src_obj_kind,
+                            contents_mode_requested,
+                            source_contents_mode,
+                            true,
+                            use_sudo,
+                            requested_mode,
+                            transfer_manifest.as_ref(),
+                            likely_cleanup_files,
+                            likely_cleanup_bytes,
+                        );
+                        deleted_cleanup_total.files = deleted_cleanup_total
+                            .files
+                            .saturating_add(cleanup.deleted.files);
+                        deleted_cleanup_total.bytes = deleted_cleanup_total
+                            .bytes
+                            .saturating_add(cleanup.deleted.bytes);
+                        cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
+                        cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
+                        if let Some(b) = cleanup.flush.flushed_bytes {
+                            cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+                        }
                     }
                     log(
                         requested_mode,
@@ -5233,7 +6619,10 @@ fn real_main() -> i32 {
                     );
                     log(
                         requested_mode,
-                        &format!("Re-run {} to converge once the source tree is stable.", requested_mode.word()),
+                        &format!(
+                            "Re-run {} to converge once the source tree is stable.",
+                            requested_mode.word()
+                        ),
                         LogLevel::Error,
                     );
                     return 1;
@@ -5241,7 +6630,11 @@ fn real_main() -> i32 {
 
                 log(
                     requested_mode,
-                    &format!("{} failed: rsync exited with status {}.", requested_mode.word_cap(), rc_transfer),
+                    &format!(
+                        "{} failed: rsync exited with status {}.",
+                        requested_mode.word_cap(),
+                        rc_transfer
+                    ),
                     LogLevel::Error,
                 );
                 let _ = remove_path_recursive(&stage_path, use_sudo, requested_mode);
@@ -5250,14 +6643,28 @@ fn real_main() -> i32 {
 
             if backup_requested {
                 if overwrite_target_kind == Some("file") {
-                    log(requested_mode, &format!("Backing up existing file: {}", otp.display()), LogLevel::Info);
+                    log(
+                        requested_mode,
+                        &format!("Backing up existing file: {}", otp.display()),
+                        LogLevel::Info,
+                    );
                 } else {
-                    log(requested_mode, &format!("Backing up existing directory: {}", otp.display()), LogLevel::Info);
+                    log(
+                        requested_mode,
+                        &format!("Backing up existing directory: {}", otp.display()),
+                        LogLevel::Info,
+                    );
                 }
-                let backup_base = planned_backup_path.clone().or_else(|| backup_base_path(otp));
+                let backup_base = planned_backup_path
+                    .clone()
+                    .or_else(|| backup_base_path(otp));
                 if let Some(bb) = backup_base {
                     if let Some(bp) = backup_path_with_base(otp, use_sudo, &bb, requested_mode) {
-                        log(requested_mode, &format!("Backup saved as: {}", bp.display()), LogLevel::Info);
+                        log(
+                            requested_mode,
+                            &format!("Backup saved as: {}", bp.display()),
+                            LogLevel::Info,
+                        );
                     } else {
                         return 1;
                     }
@@ -5266,9 +6673,17 @@ fn real_main() -> i32 {
                 }
             } else {
                 if overwrite_target_kind == Some("file") {
-                    log(requested_mode, &format!("Overwriting existing file: {}", otp.display()), LogLevel::Info);
+                    log(
+                        requested_mode,
+                        &format!("Overwriting existing file: {}", otp.display()),
+                        LogLevel::Info,
+                    );
                 } else {
-                    log(requested_mode, &format!("Overwriting existing directory: {}", otp.display()), LogLevel::Info);
+                    log(
+                        requested_mode,
+                        &format!("Overwriting existing directory: {}", otp.display()),
+                        LogLevel::Info,
+                    );
                 }
                 if !remove_path_recursive(otp, use_sudo, requested_mode) {
                     return 1;
@@ -5277,59 +6692,39 @@ fn real_main() -> i32 {
         }
 
         if move_cleanup_only {
-            if !cleanup_notice_emitted {
-                if likely_cleanup_files > 0 {
-                    if likely_cleanup_bytes > 0 {
-                        log(
-                            requested_mode,
-                            &format!(
-                                "Finalizing move: deleting source files from prescan: {} files ({}).",
-                                format_number(likely_cleanup_files),
-                                format_bytes_binary(likely_cleanup_bytes, 2)
-                            ),
-                            LogLevel::Info,
-                        );
-                    } else {
-                        log(
-                            requested_mode,
-                            &format!(
-                                "Finalizing move: deleting source files from prescan: {} files.",
-                                format_number(likely_cleanup_files)
-                            ),
-                            LogLevel::Info,
-                        );
-                    }
-                }
-                cleanup_notice_emitted = true;
-            }
-            let delete_start = Instant::now();
-            let deleted_now = prune_move_source_duplicates(
+            let cleanup = run_move_cleanup_phase(
                 &src_path,
                 &dst_path,
+                &src_mnt,
                 src_obj_kind,
-                contents_mode_requested && src_obj_kind == SrcObjKind::Dir,
+                contents_mode_requested,
+                source_contents_mode,
+                rename_dir_to_new_path,
                 use_sudo,
                 requested_mode,
                 transfer_manifest.as_ref(),
                 likely_cleanup_files,
                 likely_cleanup_bytes,
             );
-            if src_obj_kind == SrcObjKind::Dir {
-                let remove_root = (!source_contents_mode) || rename_dir_to_new_path;
-                cleanup_source_dirs(&src_mnt, remove_root, use_sudo, requested_mode);
+            deleted_cleanup_total.files = deleted_cleanup_total
+                .files
+                .saturating_add(cleanup.deleted.files);
+            deleted_cleanup_total.bytes = deleted_cleanup_total
+                .bytes
+                .saturating_add(cleanup.deleted.bytes);
+            cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
+            cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
+            if let Some(b) = cleanup.flush.flushed_bytes {
+                cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
             }
-            if deleted_now.files > 0 {
-                deleted_cleanup_total.files += deleted_now.files;
-                deleted_cleanup_total.bytes += deleted_now.bytes;
-                deleted_cleanup_elapsed_s += delete_start.elapsed().as_secs_f64();
-            }
-            flush_destination_writes(&dst_mnt, use_sudo, requested_mode);
-            log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
+            log_transfer_complete(requested_mode);
             return 0;
         }
 
         let transfer = match backend {
-            TransferBackend::Rsync => run_rsync_transfer(&src_path, &dst_path, planned_bytes, use_sudo, false),
+            TransferBackend::Rsync => {
+                run_rsync_transfer(&src_path, &dst_path, planned_bytes, use_sudo, false)
+            }
             TransferBackend::Rust => run_rust_transfer(
                 &src_path,
                 &dst_path,
@@ -5342,79 +6737,91 @@ fn real_main() -> i32 {
         };
         transferred_bytes_total += transfer.bytes_done;
         transferred_elapsed_total_s += transfer.elapsed_s;
-        if let Some(rb) = transfer.io_read_bytes {
-            transfer_read_bytes_total = transfer_read_bytes_total.saturating_add(rb);
-            transfer_read_elapsed_s += transfer.elapsed_s;
-        }
-        if let Some(wb) = transfer.io_write_bytes {
-            transfer_write_bytes_total = transfer_write_bytes_total.saturating_add(wb);
-            transfer_write_elapsed_s += transfer.elapsed_s;
-        }
         let rc_transfer = transfer.rc;
 
-        if is_move && (rc_transfer == 0 || rc_transfer == 24) {
-            if !cleanup_notice_emitted {
-                if likely_cleanup_files > 0 {
-                    if likely_cleanup_bytes > 0 {
-                        log(
-                            requested_mode,
-                            &format!(
-                                "Finalizing move: deleting source files from prescan: {} files ({}).",
-                                format_number(likely_cleanup_files),
-                                format_bytes_binary(likely_cleanup_bytes, 2)
-                            ),
-                            LogLevel::Info,
-                        );
-                    } else {
-                        log(
-                            requested_mode,
-                            &format!(
-                                "Finalizing move: deleting source files from prescan: {} files.",
-                                format_number(likely_cleanup_files)
-                            ),
-                            LogLevel::Info,
-                        );
-                    }
-                }
-                cleanup_notice_emitted = true;
-            }
-            let delete_start = Instant::now();
-            let deleted_now = prune_move_source_duplicates(
-                &src_path,
-                &dst_path,
-                src_obj_kind,
-                contents_mode_requested && src_obj_kind == SrcObjKind::Dir,
+        if rc_transfer == 0 {
+            let flush_stats = flush_destination_writes(
+                &dst_mnt,
                 use_sudo,
                 requested_mode,
-                transfer_manifest.as_ref(),
-                likely_cleanup_files,
-                likely_cleanup_bytes,
+                transfer.progress_snapshot,
             );
-            if src_obj_kind == SrcObjKind::Dir {
-                let remove_root = (!source_contents_mode) || rename_dir_to_new_path;
-                cleanup_source_dirs(&src_mnt, remove_root, use_sudo, requested_mode);
+            transfer_flush_elapsed_s += flush_stats.elapsed_s;
+            if let Some(b) = flush_stats.flushed_bytes {
+                transfer_flush_bytes_total = transfer_flush_bytes_total.saturating_add(b);
             }
-            if deleted_now.files > 0 {
-                deleted_cleanup_total.files += deleted_now.files;
-                deleted_cleanup_total.bytes += deleted_now.bytes;
-                deleted_cleanup_elapsed_s += delete_start.elapsed().as_secs_f64();
+            log_transfer_complete(requested_mode);
+            if is_move {
+                let cleanup = run_move_cleanup_phase(
+                    &src_path,
+                    &dst_path,
+                    &src_mnt,
+                    src_obj_kind,
+                    contents_mode_requested,
+                    source_contents_mode,
+                    rename_dir_to_new_path,
+                    use_sudo,
+                    requested_mode,
+                    transfer_manifest.as_ref(),
+                    likely_cleanup_files,
+                    likely_cleanup_bytes,
+                );
+                deleted_cleanup_total.files = deleted_cleanup_total
+                    .files
+                    .saturating_add(cleanup.deleted.files);
+                deleted_cleanup_total.bytes = deleted_cleanup_total
+                    .bytes
+                    .saturating_add(cleanup.deleted.bytes);
+                cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
+                cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
+                if let Some(b) = cleanup.flush.flushed_bytes {
+                    cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+                }
             }
-        }
-
-        if rc_transfer == 0 {
-            flush_destination_writes(&dst_mnt, use_sudo, requested_mode);
-            log(requested_mode, &format!("{} complete.", requested_mode.word_cap()), LogLevel::Info);
             return 0;
         }
         if rc_transfer == 24 {
+            if is_move {
+                let cleanup = run_move_cleanup_phase(
+                    &src_path,
+                    &dst_path,
+                    &src_mnt,
+                    src_obj_kind,
+                    contents_mode_requested,
+                    source_contents_mode,
+                    rename_dir_to_new_path,
+                    use_sudo,
+                    requested_mode,
+                    transfer_manifest.as_ref(),
+                    likely_cleanup_files,
+                    likely_cleanup_bytes,
+                );
+                deleted_cleanup_total.files = deleted_cleanup_total
+                    .files
+                    .saturating_add(cleanup.deleted.files);
+                deleted_cleanup_total.bytes = deleted_cleanup_total
+                    .bytes
+                    .saturating_add(cleanup.deleted.bytes);
+                cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
+                cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
+                if let Some(b) = cleanup.flush.flushed_bytes {
+                    cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+                }
+            }
             log(
                 requested_mode,
-                &format!("{} failed: some source files vanished during transfer (rsync exit 24).", requested_mode.word_cap()),
+                &format!(
+                    "{} failed: some source files vanished during transfer (rsync exit 24).",
+                    requested_mode.word_cap()
+                ),
                 LogLevel::Error,
             );
             log(
                 requested_mode,
-                &format!("Re-run {} to converge once the source tree is stable.", requested_mode.word()),
+                &format!(
+                    "Re-run {} to converge once the source tree is stable.",
+                    requested_mode.word()
+                ),
                 LogLevel::Error,
             );
             return 1;
@@ -5422,7 +6829,11 @@ fn real_main() -> i32 {
 
         log(
             requested_mode,
-            &format!("{} failed: transfer exited with status {}.", requested_mode.word_cap(), rc_transfer),
+            &format!(
+                "{} failed: transfer exited with status {}.",
+                requested_mode.word_cap(),
+                rc_transfer
+            ),
             LogLevel::Error,
         );
         1
@@ -5434,48 +6845,39 @@ fn real_main() -> i32 {
     } else {
         0.0
     };
-    let avg_read_bps = if transfer_read_elapsed_s > 0.0 {
-        transfer_read_bytes_total as f64 / transfer_read_elapsed_s
+    let transfer_flush_bps = if transfer_flush_elapsed_s > 0.0 {
+        transfer_flush_bytes_total as f64 / transfer_flush_elapsed_s
     } else {
         0.0
     };
-    let avg_write_bps = if transfer_write_elapsed_s > 0.0 {
-        transfer_write_bytes_total as f64 / transfer_write_elapsed_s
-    } else {
-        0.0
-    };
-    let total_work_bytes = transferred_bytes_total.saturating_add(deleted_cleanup_total.bytes);
-    let avg_total_bps = if total_elapsed_s > 0.0 {
-        total_work_bytes as f64 / total_elapsed_s
-    } else {
-        0.0
-    };
-    if is_move {
-        let avg_delete_bps = if deleted_cleanup_elapsed_s > 0.0 {
-            deleted_cleanup_total.bytes as f64 / deleted_cleanup_elapsed_s.max(1e-6)
+    let cleanup_summary = if is_move {
+        let cleanup_bps = if cleanup_elapsed_total_s > 0.0 {
+            deleted_cleanup_total.bytes as f64 / cleanup_elapsed_total_s.max(1e-6)
         } else {
             0.0
         };
-        print_move_speed_summary(
-            avg_transfer_bps,
-            avg_read_bps,
-            avg_write_bps,
-            transferred_elapsed_total_s,
-            avg_delete_bps,
-            deleted_cleanup_elapsed_s,
-            total_elapsed_s,
-        );
+        let cleanup_flush_bps = if cleanup_flush_elapsed_s > 0.0 {
+            cleanup_flush_bytes_total as f64 / cleanup_flush_elapsed_s.max(1e-6)
+        } else {
+            0.0
+        };
+        Some((
+            cleanup_elapsed_total_s,
+            cleanup_bps,
+            cleanup_flush_elapsed_s,
+            cleanup_flush_bps,
+        ))
     } else {
-        if transferred_elapsed_total_s > 0.0 {
-            print_summary_rate_line(
-                "Average transfer speed",
-                avg_transfer_bps,
-                transferred_elapsed_total_s,
-                false,
-            );
-        }
-        print_summary_rate_line("Overall throughput", avg_total_bps, total_elapsed_s, true);
-    }
+        None
+    };
+    print_copy_duration_summary(
+        transferred_elapsed_total_s,
+        avg_transfer_bps,
+        transfer_flush_elapsed_s,
+        transfer_flush_bps,
+        cleanup_summary,
+        total_elapsed_s,
+    );
     result
 }
 
@@ -5496,6 +6898,8 @@ fn format_number(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_remote_spec_accepts_user_host_path() {
@@ -5578,17 +6982,48 @@ Host dev-*
     }
 
     #[test]
-    fn format_hidden_top_summary_uses_requested_order_and_removed_and_separator() {
-        let line = format_hidden_top_summary(1, 1, 1, 1, 1).expect("summary");
+    fn format_hidden_top_summary_uses_requested_order_with_deleted_suffix() {
+        let line = format_hidden_top_summary(1, 1, 1, 1, 1, false).expect("summary");
         assert_eq!(
             line,
-            "1 more new 1 more modified 1 more identical 1 more uncollided and 1 more removed"
+            "1 more new 1 more modified 1 more identical 1 more uncollided 1 more deleted"
         );
     }
 
     #[test]
     fn format_hidden_top_summary_omits_zero_categories() {
-        let line = format_hidden_top_summary(0, 0, 0, 4, 0).expect("summary");
+        let line = format_hidden_top_summary(0, 0, 0, 4, 0, false).expect("summary");
         assert_eq!(line, "4 more uncollided");
+    }
+
+    #[test]
+    fn format_hidden_top_summary_combines_identical_and_unchanged_when_requested() {
+        let line = format_hidden_top_summary(0, 0, 3, 4, 0, true).expect("summary");
+        assert_eq!(line, "7 more identical/uncollided");
+    }
+
+    #[test]
+    fn pre_scan_file_counts_uncollided_siblings_for_file_target() {
+        let td = tempdir().expect("tempdir");
+        let src = td.path().join("src").join("auth.json");
+        let dst_dir = td.path().join("dst").join("accounts");
+        let dst_file = dst_dir.join("personal2.json");
+        fs::create_dir_all(src.parent().expect("src parent")).expect("mkdir src");
+        fs::create_dir_all(&dst_dir).expect("mkdir dst");
+        fs::write(&src, b"token\n").expect("write src");
+        fs::write(dst_dir.join("other.json"), b"other\n").expect("write sibling");
+
+        let mut src_rel_files = HashSet::new();
+        src_rel_files.insert("personal2.json".to_string());
+        let (_total, uncollided) = destination_file_counts(&dst_dir, &src_rel_files);
+        assert_eq!(uncollided, 1);
+
+        let ps = pre_scan_file(
+            &src,
+            &dst_file.display().to_string(),
+            DstObjKind::File,
+            false,
+        );
+        assert_eq!(ps.uncollided_files, 1);
     }
 }

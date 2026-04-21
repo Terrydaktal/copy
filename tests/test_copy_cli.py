@@ -60,7 +60,8 @@ class CopyCliIntegrationTests(unittest.TestCase):
         self.assertIn("-m, --move", out)
         self.assertIn("-s, --sudo", out)
         self.assertIn("-c, --contents-only", out)
-        self.assertIn("-v, --verbose, --showall", out)
+        self.assertIn("--verbose", out)
+        self.assertIn("--showall", out)
 
     def test_copy_fails_preflight_when_destination_space_is_insufficient(self):
         with tempfile.TemporaryDirectory() as td:
@@ -391,16 +392,65 @@ class CopyCliIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "change"
             dst = Path(td) / "dst"
-            for i in range(8):
+            for i in range(20):
                 write_file(src / f"n{i}.txt", f"{i}\n")
                 write_file(dst / f"u{i}.txt", "u\n")
             rc, out, _ = run_copy(["-v", "-c", str(src), str(dst)])
             self.assertEqual(rc, 0)
             self.assertRegex(
                 out,
-                r"\.\.\. and (?:\d+ more (?:new|modified|identical|uncollided|unchanged))(?: \d+ more (?:new|modified|identical|uncollided|unchanged))*"
-                r"(?: and \d+ more removed)?",
+                r"\.\.\. and (?:\d+ more (?:new|modified|identical|uncollided|deleted))(?: \d+ more (?:new|modified|identical|uncollided|deleted))*",
             )
+
+    def test_showall_lists_identical_and_uncollided_with_expected_colors(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "same.txt", "same\n")
+            write_file(src / "new.txt", "new\n")
+            write_file(dst / "same.txt", "same\n")
+            write_file(dst / "extra.txt", "extra\n")
+
+            rc, out, raw = run_copy([str(src), str(dst), "-c", "--showall", "-L", "1"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("same.txt", out)
+            self.assertIn("extra.txt", out)
+            self.assertRegex(raw, r"\x1b\[96m[^\n]*same\.txt\x1b\[0m")
+            self.assertRegex(raw, r"\x1b\[97m[^\n]*extra\.txt\x1b\[0m")
+
+    def test_showall_fallback_orders_modified_new_identical_then_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            for i in range(10):
+                write_file(src / f"m{i:02d}.txt", "mod\n")
+                write_file(dst / f"m{i:02d}.txt", "different-size\n")
+                write_file(src / f"n{i:02d}.txt", "new\n")
+                write_file(src / f"i{i:02d}.txt", "same\n")
+                write_file(dst / f"i{i:02d}.txt", "same\n")
+                write_file(dst / f"u{i:02d}.txt", "unchanged\n")
+
+            rc, out, _ = run_copy([str(src), str(dst), "-c", "--showall", "-L", "1", "-T", "100"])
+            self.assertEqual(rc, 0, out)
+            rows = [
+                line[4:]
+                for line in out.splitlines()
+                if line.startswith("├── ") or line.startswith("└── ")
+            ]
+            self.assertTrue(rows, out)
+
+            first_m = next((idx for idx, name in enumerate(rows) if name.startswith("m")), None)
+            first_n = next((idx for idx, name in enumerate(rows) if name.startswith("n")), None)
+            first_i = next((idx for idx, name in enumerate(rows) if name.startswith("i")), None)
+            first_u = next((idx for idx, name in enumerate(rows) if name.startswith("u")), None)
+
+            self.assertIsNotNone(first_m, out)
+            self.assertIsNotNone(first_n, out)
+            self.assertIsNotNone(first_i, out)
+            self.assertIsNotNone(first_u, out)
+            self.assertLess(first_m, first_n, out)
+            self.assertLess(first_n, first_i, out)
+            self.assertLess(first_i, first_u, out)
 
     def test_non_verbose_top_level_truncates_to_25_with_summary(self):
         with tempfile.TemporaryDirectory() as td:
@@ -413,11 +463,31 @@ class CopyCliIntegrationTests(unittest.TestCase):
             rc, out, _ = run_copy([str(src), str(dst), "-c"])
             self.assertEqual(rc, 0)
             tree_rows = [line for line in out.splitlines() if line.startswith("├── ") or line.startswith("└── ")]
-            self.assertEqual(len(tree_rows), 25, msg=f"expected 25 visible rows, got {len(tree_rows)}\n{out}")
+            self.assertEqual(
+                len(tree_rows),
+                25,
+                msg=f"expected 25 visible tree entries at default truncation, got {len(tree_rows)}\n{out}",
+            )
             self.assertRegex(
                 out,
-                r"\.\.\. and (?:\d+ more (?:new|modified|unchanged|removed))(?: \d+ more (?:new|modified|unchanged|removed))*",
+                r"\.\.\. and (?:\d+ more (?:new|modified|identical|uncollided|deleted))(?: \d+ more (?:new|modified|identical|uncollided|deleted))*",
             )
+
+    def test_non_showall_hides_identical_and_uncollided_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "same.txt", "same\n")
+            write_file(src / "new.txt", "new\n")
+            write_file(dst / "same.txt", "same\n")
+            write_file(dst / "extra.txt", "extra\n")
+
+            rc, out, _ = run_copy([str(src), str(dst), "-c", "-L", "1"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("new.txt", out)
+            self.assertNotIn("same.txt", out)
+            self.assertNotIn("extra.txt", out)
+            self.assertRegex(out, r"\.\.\. and .*more identical/uncollided")
 
     def test_non_verbose_auto_uses_showall_when_it_fits(self):
         with tempfile.TemporaryDirectory() as td:
@@ -430,6 +500,38 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             # Auto mode should choose a hierarchical preview when it fits under the default line budget.
             self.assertIn("folder/", out)
+
+    def test_default_depth_is_one_when_l_not_specified(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "l1" / "l2" / "leaf.txt", "x\n")
+            dst.mkdir(parents=True, exist_ok=True)
+
+            rc, out, _ = run_copy([str(src), str(dst), "-c"])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("l1/", out)
+            self.assertNotIn("l2/", out)
+            self.assertNotIn("leaf.txt", out)
+
+    def test_tree_depth_flag_limits_visible_levels_exactly(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "l1" / "l2" / "leaf.txt", "x\n")
+            dst.mkdir(parents=True, exist_ok=True)
+
+            rc1, out1, _ = run_copy([str(src), str(dst), "-c", "-L", "1"])
+            self.assertEqual(rc1, 0, out1)
+            self.assertIn("l1/", out1)
+            self.assertNotIn("l2/", out1)
+            self.assertNotIn("leaf.txt", out1)
+
+            rc2, out2, _ = run_copy([str(src), str(dst), "-c", "-L", "2"])
+            self.assertEqual(rc2, 0, out2)
+            self.assertIn("l1/", out2)
+            self.assertIn("l2/", out2)
+            self.assertNotIn("leaf.txt", out2)
 
     def test_contents_only_uppercase_alias_rejected(self):
         with tempfile.TemporaryDirectory() as td:
@@ -506,6 +608,18 @@ class CopyCliIntegrationTests(unittest.TestCase):
             rc, out, _ = run_copy([str(src), str(dst), "-c"])
             self.assertEqual(rc, 0, out)
             self.assertRegex(out, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*1\s+\|\s*2\s+\|\s*0\s+\|\s*0")
+
+    def test_file_to_file_preview_counts_destination_sibling_as_uncollided(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "auth.json"
+            dst_dir = Path(td) / "dst" / "accounts"
+            dst = dst_dir / "personal2.json"
+            write_file(src, "token\n")
+            write_file(dst_dir / "other.json", "other\n")
+
+            rc, out, _ = run_copy([str(src), str(dst)])
+            self.assertEqual(rc, 0, out)
+            self.assertRegex(out, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0")
 
     def test_backup_merge_copy_creates_backup_dir(self):
         with tempfile.TemporaryDirectory() as td:
