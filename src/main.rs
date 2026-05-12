@@ -3461,18 +3461,19 @@ fn pre_scan_file(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "source".to_string());
+    let src_name_key = src_name.clone();
 
     let (dst_file, display_rel) = match dst_obj_kind {
         DstObjKind::Dir | DstObjKind::DirExisting => {
             let base = Path::new(dst_path.trim_end_matches('/'));
-            (base.join(&src_name), src_name)
+            (base.join(&src_name), src_name.clone())
         }
         _ => {
             let p = Path::new(dst_path);
             let n = p
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or(src_name);
+                .unwrap_or(src_name.clone());
             (p.to_path_buf(), n)
         }
     };
@@ -3495,6 +3496,16 @@ fn pre_scan_file(
             let rel_key = display_rel.trim_end_matches('/').to_string();
             if !rel_key.is_empty() {
                 source_rel_files.insert(rel_key);
+            }
+            // For file-to-file moves within the same destination directory (rename case),
+            // exclude the source filename from uncollided totals. It is part of the move
+            // operation and should not be treated as unrelated destination-only content.
+            let src_parent = src_mnt.parent().unwrap_or_else(|| Path::new("."));
+            if realpath_allow_missing(src_parent) == realpath_allow_missing(&root) {
+                let src_rel = src_name_key.trim_end_matches('/').to_string();
+                if !src_rel.is_empty() {
+                    source_rel_files.insert(src_rel);
+                }
             }
             let (_dest_total, uncollided_by_scan) =
                 destination_file_counts(&root, &source_rel_files);
@@ -3998,7 +4009,15 @@ fn run_rust_transfer(
     match src_obj_kind {
         SrcObjKind::File => {
             let src = Path::new(src_path);
-            let dst = Path::new(dst_path);
+            let mut dst_buf = PathBuf::from(dst_path);
+            if dst_buf.is_dir() {
+                let src_name = match src.file_name() {
+                    Some(v) => v,
+                    None => finish_transfer!(1),
+                };
+                dst_buf = dst_buf.join(src_name);
+            }
+            let dst = dst_buf.as_path();
             let src_lmd = match fs::symlink_metadata(src) {
                 Ok(v) => v,
                 Err(_) => finish_transfer!(1),
@@ -5893,13 +5912,12 @@ fn real_main() -> i32 {
         dst_preview_root.clone()
     };
 
-    if args.showall
-        && simple_rename_parent.is_some()
-        && src_obj_kind == SrcObjKind::Dir
-        && simple_rename_dst.is_some()
+    if simple_rename_parent.is_some() && src_obj_kind == SrcObjKind::Dir && simple_rename_dst.is_some()
     {
         let dst_name = simple_rename_dst.clone().unwrap_or_default();
-        source_display_paths = remap_path_set_under_prefix(&source_display_paths, &dst_name);
+        if args.showall {
+            source_display_paths = remap_path_set_under_prefix(&source_display_paths, &dst_name);
+        }
         if !display_change_preview.is_empty() {
             let mut remapped = Vec::new();
             for ch in display_change_preview {
@@ -6086,6 +6104,7 @@ fn real_main() -> i32 {
 
     let move_cleanup_only = is_move
         && !source_already_in_destination
+        && existing_same_name_target
         && planned_bytes == 0
         && !has_itemized_changes
         && !overwrite_requires_action;
@@ -6213,9 +6232,11 @@ fn real_main() -> i32 {
         return 0;
     }
 
+    let move_requires_material_action = is_move && !source_already_in_destination && !existing_same_name_target;
     let no_changes_planned = source_already_in_destination
         || ((planned_bytes == 0 && !has_itemized_changes && !overwrite_requires_action)
-            && !move_cleanup_only);
+            && !move_cleanup_only
+            && !move_requires_material_action);
 
     if overwrite_requires_action && planned_bytes == 0 && !has_itemized_changes {
         log(
@@ -6259,13 +6280,19 @@ fn real_main() -> i32 {
         return 0;
     }
 
+    // Allow fast rename for contents-only moves when destination is a brand-new
+    // directory path. In this case, moving source children into a new target dir
+    // is equivalent to a single rename(src_dir -> dst_dir).
+    let contents_only_dirnew_fastpath =
+        contents_mode_requested && src_obj_kind == SrcObjKind::Dir && dst_obj_kind == DstObjKind::DirNew;
+
     let maybe_fast_rename_target = if is_move
         && !use_sudo
         && !backup_requested
         && !overwrite_requires_action
         && !move_cleanup_only
         && !source_contents_mode
-        && !contents_mode_requested
+        && (!contents_mode_requested || contents_only_dirnew_fastpath)
         && !merge_child_into_parent
         && !overwrite_parent_from_child
         && !overwrite_rename_dir_target

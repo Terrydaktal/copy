@@ -146,6 +146,17 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertTrue((dst / "file.txt").exists())
             self.assertFalse((dst / "A").exists())
 
+    def test_copy_file_into_existing_directory_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "print_extension_groups.sh"
+            dst = Path(td) / "config" / "fish"
+            write_file(src, "echo hi\n")
+            dst.mkdir(parents=True, exist_ok=True)
+
+            rc, out, _ = run_copy([str(src), str(dst)], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue((dst / "print_extension_groups.sh").exists(), out)
+
     def test_contents_only_new_named_target_preview_roots_at_target_dir(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "Movies"
@@ -346,6 +357,23 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertIn("unearth/", out)
             self.assertIn("Deleted (src)", out)
 
+    def test_move_same_parent_rename_does_not_show_source_children_as_parent_siblings(self):
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / "home"
+            src = parent / "tasks"
+            dst = parent / "ops"
+            write_file(src / "laptop-alexandra" / "a.txt", "a\n")
+            write_file(src / "local" / "b.txt", "b\n")
+
+            rc, out, _ = run_copy(["--move", str(src), str(dst)])
+            self.assertEqual(rc, 0, out)
+            self.assertIn("ops", out)
+            self.assertIn("tasks/ (removed)", out)
+            self.assertNotIn("\n├── laptop-alexandra/", out)
+            self.assertNotIn("\n├── local/", out)
+            self.assertNotIn("\n└── laptop-alexandra/", out)
+            self.assertNotIn("\n└── local/", out)
+
     def test_move_same_filesystem_uses_fast_rename(self):
         with tempfile.TemporaryDirectory() as td:
             parent = Path(td) / "Dev"
@@ -358,6 +386,34 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertIn("Fast-path rename on same filesystem", out)
             self.assertFalse(src.exists(), out)
             self.assertTrue((dst / "a.txt").exists(), out)
+
+    def test_move_empty_directory_rename_uses_fastpath_not_cleanup_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "tasks"
+            src = root / "alexandra"
+            dst = root / "laptop-alexandra"
+            src.mkdir(parents=True, exist_ok=True)
+
+            rc, out, _ = run_copy(["--move", str(src), str(dst)], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Fast-path rename on same filesystem", out)
+            self.assertNotIn("Starting move cleanup:", out)
+            self.assertFalse(src.exists(), out)
+            self.assertTrue(dst.exists(), out)
+
+    def test_move_contents_only_to_new_named_target_uses_fast_rename(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Dev"
+            src = root / "sites" / "swiftsay"
+            dst = root / "swiftsay" / "swiftsay-server"
+            write_file(src / "backend" / "api.txt", "x\n")
+            (root / "swiftsay").mkdir(parents=True, exist_ok=True)
+
+            rc, out, _ = run_copy(["--move", str(src), str(dst), "-c"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Fast-path rename on same filesystem", out)
+            self.assertFalse(src.exists(), out)
+            self.assertTrue((dst / "backend" / "api.txt").exists(), out)
 
     def test_source_star_behaves_like_contents_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -620,6 +676,18 @@ class CopyCliIntegrationTests(unittest.TestCase):
             rc, out, _ = run_copy([str(src), str(dst)])
             self.assertEqual(rc, 0, out)
             self.assertRegex(out, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0")
+
+    def test_file_rename_in_same_directory_does_not_count_source_as_uncollided(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "content"
+            src = root / "Nano.pmd"
+            dst = root / "GNU_nano.pmd"
+            write_file(src, "nano\n")
+            write_file(root / "keep.pmd", "keep\n")
+
+            rc, out, _ = run_copy(["--move", str(src), str(dst)])
+            self.assertEqual(rc, 0, out)
+            self.assertRegex(out, r"Files\s+\|\s*1\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*1\s+\|\s*0")
 
     def test_backup_merge_copy_creates_backup_dir(self):
         with tempfile.TemporaryDirectory() as td:
