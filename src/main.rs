@@ -6,7 +6,7 @@ use nix::sys::statvfs::statvfs;
 use rayon::prelude::*;
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -43,6 +43,16 @@ enum LogLevel {
 enum TransferMode {
     Copy,
     Move,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum MergeCollisionPolicy {
+    #[default]
+    Default,
+    DestWins,
+    SourceWins,
+    SourceWinsIfLarger,
+    SourceWinsIfNewerOrLarger,
 }
 
 impl TransferMode {
@@ -122,9 +132,17 @@ struct ManifestFileEntry {
     size: u64,
 }
 
+#[derive(Clone)]
+struct ManifestDirTimeEntry {
+    rel: String,
+    atime: FileTime,
+    mtime: FileTime,
+}
+
 #[derive(Default, Clone)]
 struct TransferManifest {
     dirs: Vec<String>,
+    dir_times: Vec<ManifestDirTimeEntry>,
     copy_files: Vec<ManifestFileEntry>,
     identical_files: Vec<ManifestFileEntry>,
 }
@@ -179,11 +197,14 @@ struct CliArgs {
     overwrite: bool,
     contents_only: bool,
     backup: bool,
+    sync_mode: bool,
     showall: bool,
     tree_depth: Option<usize>,
     tree_trunc: usize,
     preview_only: bool,
     preview_lite: bool,
+    replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
 }
 
 struct CmdOutput {
@@ -318,6 +339,90 @@ fn log(mode: TransferMode, msg: &str, level: LogLevel) {
         LogLevel::Error => eprintln!("{FAIL}ERROR: {msg}{ENDC}"),
         LogLevel::Warn => eprintln!("{WARNING}WARNING: {msg}{ENDC}"),
         LogLevel::Info => println!("{OKBLUE}{}: {msg}{ENDC}", mode.word()),
+    }
+}
+
+fn set_merge_collision_policy(
+    args: &mut CliArgs,
+    policy: MergeCollisionPolicy,
+) -> Result<(), i32> {
+    if args.merge_collision_policy != MergeCollisionPolicy::Default
+        && args.merge_collision_policy != policy
+    {
+        usage();
+        eprintln!("copy: error: collision policy flags are mutually exclusive");
+        return Err(1);
+    }
+    args.merge_collision_policy = policy;
+    Ok(())
+}
+
+fn regular_file_collision_change(
+    policy: MergeCollisionPolicy,
+    src_size: u64,
+    src_mtime: Option<SystemTime>,
+    dst_exists: bool,
+    dst_size: Option<u64>,
+    dst_mtime: Option<SystemTime>,
+) -> Option<ChangeKind> {
+    match policy {
+        MergeCollisionPolicy::DestWins => {
+            if dst_exists {
+                None
+            } else {
+                Some(ChangeKind::NewFile)
+            }
+        }
+        MergeCollisionPolicy::SourceWins => {
+            if dst_exists {
+                Some(ChangeKind::ModFile)
+            } else {
+                Some(ChangeKind::NewFile)
+            }
+        }
+        MergeCollisionPolicy::SourceWinsIfLarger => {
+            if !dst_exists {
+                Some(ChangeKind::NewFile)
+            } else if let Some(dst_size) = dst_size {
+                if src_size > dst_size {
+                    Some(ChangeKind::ModFile)
+                } else {
+                    None
+                }
+            } else {
+                Some(ChangeKind::ModFile)
+            }
+        }
+        MergeCollisionPolicy::SourceWinsIfNewerOrLarger => {
+            if !dst_exists {
+                Some(ChangeKind::NewFile)
+            } else if dst_size.is_none() || dst_mtime.is_none() || src_mtime.is_none() {
+                Some(ChangeKind::ModFile)
+            } else if let Some(dst_size) = dst_size {
+                if src_size > dst_size {
+                    Some(ChangeKind::ModFile)
+                } else if src_mtime > dst_mtime {
+                    Some(ChangeKind::ModFile)
+                } else {
+                    None
+                }
+            } else {
+                Some(ChangeKind::ModFile)
+            }
+        }
+        MergeCollisionPolicy::Default => {
+            if !dst_exists {
+                Some(ChangeKind::NewFile)
+            } else if let Some(dst_size) = dst_size {
+                if dst_size == src_size {
+                    None
+                } else {
+                    Some(ChangeKind::ModFile)
+                }
+            } else {
+                Some(ChangeKind::ModFile)
+            }
+        }
     }
 }
 
@@ -467,13 +572,6 @@ fn option_u64_saturating_add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-fn option_f64_saturating_sub(a: Option<f64>, b: Option<f64>) -> Option<f64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some((x - y).max(0.0)),
-        _ => None,
-    }
-}
-
 fn transfer_eta_s(done: Option<u64>, total: u64, bps: Option<f64>) -> Option<f64> {
     if total == 0 {
         return None;
@@ -485,6 +583,202 @@ fn transfer_eta_s(done: Option<u64>, total: u64, bps: Option<f64>) -> Option<f64
     }
     let remain = total.saturating_sub(done.min(total));
     Some(remain as f64 / bps)
+}
+
+#[derive(Default)]
+struct EtaSmootherState {
+    key: String,
+    samples: VecDeque<(f64, u64)>,
+    display_eta_s: Option<f64>,
+    last_elapsed_s: Option<f64>,
+    slowdown_since_s: Option<f64>,
+}
+
+fn eta_smoother_state() -> &'static Mutex<EtaSmootherState> {
+    static STATE: OnceLock<Mutex<EtaSmootherState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(EtaSmootherState::default()))
+}
+
+fn quantize_eta_s(eta_s: f64) -> f64 {
+    eta_s.max(0.0).round()
+}
+
+fn ew_regression_speed_bps(samples: &VecDeque<(f64, u64)>, now_t: f64, tau_s: f64) -> Option<f64> {
+    if samples.len() < 2 || !tau_s.is_finite() || tau_s <= 0.0 {
+        return None;
+    }
+
+    let mut sw = 0.0;
+    let mut swt = 0.0;
+    let mut swx = 0.0;
+    for (t, bytes) in samples {
+        let age = (now_t - *t).max(0.0);
+        let w = (-age / tau_s).exp();
+        sw += w;
+        swt += w * *t;
+        swx += w * (*bytes as f64);
+    }
+    if sw <= 0.0 {
+        return None;
+    }
+    let t_bar = swt / sw;
+    let x_bar = swx / sw;
+
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (t, bytes) in samples {
+        let age = (now_t - *t).max(0.0);
+        let w = (-age / tau_s).exp();
+        let dt = *t - t_bar;
+        let dx = (*bytes as f64) - x_bar;
+        num += w * dt * dx;
+        den += w * dt * dt;
+    }
+    if den <= 1e-12 {
+        return None;
+    }
+    let v_hat = num / den;
+    if v_hat.is_finite() && v_hat > 0.0 {
+        Some(v_hat)
+    } else {
+        None
+    }
+}
+
+fn smoothed_transfer_eta_s(
+    phase_label: &str,
+    done: Option<u64>,
+    total: u64,
+    instant_bps: Option<f64>,
+    elapsed_s: f64,
+    finalize_line: bool,
+) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    let done = done?;
+    let done_clamped = done.min(total);
+    let remain = total.saturating_sub(done_clamped);
+    if remain == 0 {
+        return Some(0.0);
+    }
+
+    let key = format!("{phase_label}:{total}");
+    if let Ok(mut st) = eta_smoother_state().lock() {
+        if st.key != key || st.last_elapsed_s.map(|v| elapsed_s < v).unwrap_or(false) {
+            st.key = key.clone();
+            st.samples.clear();
+            st.display_eta_s = None;
+            st.last_elapsed_s = None;
+            st.slowdown_since_s = None;
+        }
+
+        if st
+            .samples
+            .back()
+            .map(|(t, b)| *t != elapsed_s || *b != done_clamped)
+            .unwrap_or(true)
+        {
+            st.samples.push_back((elapsed_s, done_clamped));
+        }
+        const REGRESSION_WINDOW_S: f64 = 120.0;
+        while st
+            .samples
+            .front()
+            .map(|(t, _)| elapsed_s - *t > REGRESSION_WINDOW_S)
+            .unwrap_or(false)
+        {
+            st.samples.pop_front();
+        }
+
+        const TAU_S: f64 = 45.0;
+        let sample_span_s = match (st.samples.front(), st.samples.back()) {
+            (Some((first_t, _)), Some((last_t, _))) => (last_t - first_t).max(0.0),
+            _ => 0.0,
+        };
+        const ETA_WARMUP_S: f64 = 5.0;
+        if st.display_eta_s.is_none() && sample_span_s < ETA_WARMUP_S {
+            st.last_elapsed_s = Some(elapsed_s);
+            return None;
+        }
+
+        let reg_bps = if sample_span_s >= 3.0 {
+            ew_regression_speed_bps(&st.samples, elapsed_s, TAU_S)
+        } else {
+            None
+        };
+        let avg_bps = if elapsed_s > 0.25 && done_clamped > 0 {
+            Some(done_clamped as f64 / elapsed_s.max(1e-6))
+        } else {
+            None
+        };
+        let speed_bps = match (reg_bps, avg_bps, instant_bps) {
+            (Some(r), Some(a), _) => Some((r * 0.80) + (a * 0.20)),
+            (Some(r), None, Some(i)) if i > 0.0 => Some((r * 0.85) + (i * 0.15)),
+            (Some(r), _, _) => Some(r),
+            (None, Some(a), Some(i)) if i > 0.0 => Some((a * 0.80) + (i * 0.20)),
+            (None, Some(a), _) => Some(a),
+            (None, None, Some(i)) if i > 0.0 => Some(i),
+            _ => None,
+        }?;
+        let raw_eta = transfer_eta_s(Some(done_clamped), total, Some(speed_bps))?;
+
+        let dt = st
+            .last_elapsed_s
+            .map(|prev| (elapsed_s - prev).max(0.0))
+            .unwrap_or(0.0);
+        st.last_elapsed_s = Some(elapsed_s);
+
+        let next_eta = if let Some(prev_display) = st.display_eta_s {
+            let countdown = (prev_display - dt).max(0.0);
+            let margin = (0.10 * countdown).max(15.0);
+            if raw_eta < countdown {
+                let down_alpha = if dt > 0.0 {
+                    1.0 - (-dt / 5.0).exp()
+                } else {
+                    0.0
+                };
+                st.slowdown_since_s = None;
+                countdown + down_alpha * (raw_eta - countdown)
+            } else if raw_eta <= countdown + margin {
+                st.slowdown_since_s = None;
+                countdown
+            } else {
+                if st.slowdown_since_s.is_none() {
+                    st.slowdown_since_s = Some(elapsed_s);
+                }
+                let sustained = st
+                    .slowdown_since_s
+                    .map(|start| (elapsed_s - start) >= 5.0)
+                    .unwrap_or(false);
+                if sustained {
+                    let up_alpha = if dt > 0.0 {
+                        1.0 - (-dt / 30.0).exp()
+                    } else {
+                        0.0
+                    };
+                    countdown + up_alpha * (raw_eta - countdown)
+                } else {
+                    countdown
+                }
+            }
+        } else {
+            raw_eta
+        };
+
+        st.display_eta_s = Some(next_eta.max(0.0));
+        let out = st.display_eta_s.map(quantize_eta_s);
+        if finalize_line {
+            st.key.clear();
+            st.samples.clear();
+            st.display_eta_s = None;
+            st.last_elapsed_s = None;
+            st.slowdown_since_s = None;
+        }
+        return out;
+    }
+
+    transfer_eta_s(Some(done_clamped), total, instant_bps).map(quantize_eta_s)
 }
 
 #[derive(Default)]
@@ -500,7 +794,7 @@ fn progress_render_state() -> &'static Mutex<ProgressRenderState> {
 }
 
 fn print_transfer_progress_bars(
-    _elapsed_s: f64,
+    elapsed_s: f64,
     planned_bytes: u64,
     write_all_total: Option<u64>,
     phase_label: &str,
@@ -522,7 +816,14 @@ fn print_transfer_progress_bars(
     } else {
         None
     };
-    let eta = transfer_eta_s(done, planned_bytes, rates.write_all_bps);
+    let eta = smoothed_transfer_eta_s(
+        phase_label,
+        done,
+        planned_bytes,
+        rates.write_all_bps,
+        elapsed_s,
+        finalize_line,
+    );
 
     let transfer_total = done;
     let transfer_rate = rates.write_all_bps;
@@ -536,7 +837,13 @@ fn print_transfer_progress_bars(
     let read_complete_rate = rates.read_complete_bps;
     let read_cache_total =
         option_u64_saturating_sub(proc_totals_delta.rchar, proc_totals_delta.read_bytes);
-    let read_cache_rate = option_f64_saturating_sub(rates.rchar_bps, rates.read_bytes_bps);
+    let read_cache_rate = read_cache_total.map(|total| {
+        if elapsed_s <= 0.0 {
+            0.0
+        } else {
+            total as f64 / elapsed_s.max(1e-6)
+        }
+    });
 
     let done_s = fmt_bytes_block_opt(transfer_total, 3);
     let planned_s = if planned_bytes > 0 {
@@ -817,6 +1124,115 @@ fn count_regular_files_any(path: &Path) -> u64 {
         .filter_map(Result::ok)
         .filter(|e| e.path().is_file())
         .count() as u64
+}
+
+fn count_regular_bytes_any(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    if path.is_file() {
+        return fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    }
+    if !path.is_dir() {
+        return 0;
+    }
+    WalkDir::new(path)
+        .sort(false)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+fn top_level_rel_component(rel: &str) -> Option<&str> {
+    let trimmed = rel.trim_start_matches("./").trim_start_matches('/');
+    let first = trimmed.split('/').next().unwrap_or("");
+    if first.is_empty() {
+        None
+    } else {
+        Some(first)
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct PreMergeFastRenameStats {
+    moved_entries: u64,
+    moved_files: u64,
+    moved_bytes: u64,
+    removed_copy_bytes: u64,
+}
+
+fn premerge_fast_rename_noncolliding_children(
+    src_root: &Path,
+    dst_root: &Path,
+    manifest: Option<&mut TransferManifest>,
+) -> PreMergeFastRenameStats {
+    if !src_root.is_dir() || !dst_root.is_dir() {
+        return PreMergeFastRenameStats::default();
+    }
+
+    let mut children: Vec<PathBuf> = match fs::read_dir(src_root) {
+        Ok(rd) => rd.filter_map(Result::ok).map(|e| e.path()).collect(),
+        Err(_) => return PreMergeFastRenameStats::default(),
+    };
+    children.sort();
+
+    let mut moved_names: HashSet<String> = HashSet::new();
+    let mut stats = PreMergeFastRenameStats::default();
+
+    for src_child in children {
+        let name = match src_child.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let dst_child = dst_root.join(&name);
+        if dst_child.exists() || src_child == dst_child {
+            continue;
+        }
+        if !can_fast_rename_same_fs(&src_child, &dst_child) {
+            continue;
+        }
+
+        let child_files = count_regular_files_any(&src_child);
+        let child_bytes = count_regular_bytes_any(&src_child);
+        if fs::rename(&src_child, &dst_child).is_ok() {
+            moved_names.insert(name);
+            stats.moved_entries = stats.moved_entries.saturating_add(1);
+            stats.moved_files = stats.moved_files.saturating_add(child_files);
+            stats.moved_bytes = stats.moved_bytes.saturating_add(child_bytes);
+        }
+    }
+
+    if moved_names.is_empty() {
+        return stats;
+    }
+
+    if let Some(m) = manifest {
+        m.dirs.retain(|rel| {
+            top_level_rel_component(rel)
+                .map(|top| !moved_names.contains(top))
+                .unwrap_or(true)
+        });
+        m.copy_files.retain(|entry| {
+            let keep = top_level_rel_component(&entry.rel)
+                .map(|top| !moved_names.contains(top))
+                .unwrap_or(true);
+            if !keep {
+                stats.removed_copy_bytes = stats.removed_copy_bytes.saturating_add(entry.size);
+            }
+            keep
+        });
+        m.identical_files.retain(|entry| {
+            top_level_rel_component(&entry.rel)
+                .map(|top| !moved_names.contains(top))
+                .unwrap_or(true)
+        });
+    }
+
+    stats
 }
 
 fn read_diskstats_bytes() -> io::Result<HashMap<(u64, u64), (u64, u64)>> {
@@ -1591,7 +2007,33 @@ fn resolve_source(value: &str, mode: TransferMode) -> Result<(PathBuf, SrcObjKin
 fn resolve_destination_for_file(
     value: &str,
     mode: TransferMode,
+    replace_dest_symlink: bool,
 ) -> Result<(PathBuf, DstObjKind), i32> {
+    if replace_dest_symlink {
+        let dst_real = PathBuf::from(expand_user(value));
+        if let Ok(md) = fs::symlink_metadata(&dst_real) {
+            if md.file_type().is_symlink() {
+                return Ok((dst_real, DstObjKind::File));
+            }
+            if md.is_dir() {
+                return Ok((dst_real, DstObjKind::Dir));
+            }
+            return Ok((dst_real, DstObjKind::File));
+        }
+        let parent = dst_real.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            log(
+                mode,
+                &format!(
+                    "Destination parent directory does not exist: {}",
+                    parent.display()
+                ),
+                LogLevel::Error,
+            );
+            return Err(1);
+        }
+        return Ok((dst_real, DstObjKind::File));
+    }
     let dst_real = to_real_path(value);
     if dst_real.exists() {
         if dst_real.is_dir() {
@@ -1789,13 +2231,13 @@ fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut FxHashSet<Strin
 
 fn usage() {
     eprintln!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v|-vv|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
 }
 
 fn print_help() {
     println!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [-v|-vv|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
     println!();
     println!("Standalone copy/move with preview/progress.");
@@ -1804,7 +2246,7 @@ fn print_help() {
     println!("Local mode preflight checks destination free space against planned transfer bytes (no sudo required).");
     println!();
     println!("positional arguments:");
-    println!("  source                Source path (file or directory)");
+    println!("  source                Source path (file or directory). Multiple files are supported when they all map to the same destination directory.");
     println!(
         "  destination           Destination path (directory, or file path when source is a file)"
     );
@@ -1813,16 +2255,550 @@ fn print_help() {
     println!("  -h, --help            show this help message and exit");
     println!("  -m, --move            Move mode: transfer then remove source data (equivalent to move behavior).");
     println!("  -s, --sudo            Run transfer commands with sudo");
-    println!("  -o, --overwrite       Force overwrite (replace) instead of merge when destination target already exists.");
+    println!("  -o, --overwrite       Replace the destination target itself instead of merging it.");
+    println!("                        This does not control file-vs-file collisions inside a merged folder.");
     println!("  -c, --contents-only   Transfer source directory children into destination (like source/*; do not nest source basename).");
     println!("                        In --move mode, source directories are removed if they become empty.");
     println!("  -b, --backup          Create a timestamped backup when destination data will be merged or overwritten.");
-    println!("  -v, -vv, --verbose, --showall");
+    println!("  --sync              Rsync-style in-place sync with destination deletions (like rsync -a --delete).");
+    println!("                        Merge/sync semantics; not target replacement semantics like --overwrite.");
+    println!("  -v, --verbose, --showall");
     println!("                        Show full preview tree (new, modified, identical, uncollided, deleted).");
+    println!("  --dest-wins");
+    println!("                        Keep destination files when a merged-folder path collides.");
+    println!("                        Merge the folder, but preserve the destination copy at that path.");
+    println!("  --source-wins");
+    println!("                        Replace destination files when a merged-folder path collides.");
+    println!("                        Merge the folder, but always copy the source file over the destination.");
+    println!("  --source-wins-if-larger");
+    println!("                        Replace destination files only when the source file is larger.");
+    println!("                        Merge the folder, and only treat larger source files as changes.");
+    println!("  --source-wins-if-newer-or-larger");
+    println!("                        Replace destination files when the source file is newer or larger.");
+    println!("                        Merge the folder, and treat newer or larger source files as changes.");
     println!("  -L depth              Max depth of preview tree (default: auto-fit deepest level within 27 lines, up to 20).");
     println!("  -T trunc              Max entries per folder before truncation (default: 25).");
+    println!("  --replace-dest-symlink");
+    println!("                        Replace a destination symlink itself instead of following it.");
     println!("  --preview             Run preview only (no prompt, no transfer).");
     println!("  --preview-lite        Faster preview-only mode; skips exact byte scan on brand-new destination trees.");
+    println!();
+    println!("decision tree:");
+    println!(
+        "{}",
+        r#"normal_copy(S, D, options)
+  |
+  |
+  v
+Resolve effective target T
+  |
+  +-- D exists as directory?
+  |       |
+  |       +-- yes (directory):
+  |       |       T = D/basename(S)
+  |       |       D is a container destination
+  |       |
+  |       +-- no (either missing or a file):
+  |               T = D
+  |               D is an exact-path destination
+  |
+  v
+What is S?
+  +-- does not exist
+  |   error
+  |
+  +-- existing file
+  |   |
+  |   v
+  |  What is T?
+  |    +-- missing
+  |    |   create file at T
+  |    +-- existing file
+  |    |   apply file collision policy:
+  |    |     --dest-wins
+  |    |       keep T
+  |    |       do not copy S
+  |    |       no backup
+  |    |     --source-wins
+  |    |       if -b: back up T
+  |    |       replace T with S
+  |    |     --source-wins-if-larger
+  |    |       if size(S) > size(T):
+  |    |         if -b: back up T
+  |    |         replace T with S
+  |    |       else:
+  |    |         keep T
+  |    |     --source-wins-if-newer-or-larger
+  |    |       if mtime(S) > mtime(T) OR size(S) > size(T):
+  |    |         if -b: back up T
+  |    |         replace T with S
+  |    |       else:
+  |    |         keep T
+  |    +-- existing directory 
+  |        error
+  |
+  +-- existing directory
+      |
+      v
+     What is T?
+       +-- missing
+       |   create directory T
+       |   copy contents of S into T
+       +-- file
+       |   error
+       +-- directory
+           |
+           v
+          Is -o enabled?
+            +-- no
+            |   merge S into T recursively
+            |   for every child: apply this same decision tree
+            |   if source child file maps to existing target child file:
+            |     apply file collision policy
+            |   if -b is set:
+            |     back up existing target directory T before merge starts
+            +-- yes
+                overwrite T with S
+                if -b: back up existing directory T first
+                replace T with a copy of S"#
+    );
+}
+
+fn run_multi_source_file_batch(
+    requested_mode: TransferMode,
+    source_paths: &[String],
+    destination: &str,
+    use_sudo: bool,
+    preview_only: bool,
+    is_move: bool,
+    tree_trunc: usize,
+    showall: bool,
+    replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
+) -> i32 {
+    let (dst_mnt, dst_obj_kind) = match resolve_destination_for_dir(destination, requested_mode, false)
+    {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    if dst_obj_kind != DstObjKind::DirExisting {
+        log(
+            requested_mode,
+            "Multiple source paths require an existing destination directory.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+
+    let dst_real = realpath_allow_missing(&dst_mnt);
+    let dst_display = format!("{}/", dst_mnt.display().to_string().trim_end_matches('/'));
+    let mut seen_names: FxHashSet<String> = FxHashSet::default();
+    let mut batch_items: Vec<(PathBuf, u64)> = Vec::new();
+    let mut planned_bytes: u64 = 0;
+    let mut total_regular_files: u64 = 0;
+    let mut add_files: u64 = 0;
+    let mut mod_files: u64 = 0;
+    let mut display_change_preview: Vec<ChangeItem> = Vec::new();
+    let mut source_top_entries: HashSet<String> = HashSet::new();
+    let mut has_itemized_changes = false;
+    let mut source_rel_files: HashSet<String> = HashSet::default();
+
+    for source in source_paths {
+        let (src_mnt, src_obj_kind) = match resolve_source(source, requested_mode) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+        if src_obj_kind != SrcObjKind::File {
+            log(
+                requested_mode,
+                "Multiple source path support currently only handles files.",
+                LogLevel::Error,
+            );
+            return 1;
+        }
+
+        let src_parent_real =
+            realpath_allow_missing(src_mnt.parent().unwrap_or_else(|| Path::new(".")));
+        if src_parent_real == dst_real {
+            log(
+                requested_mode,
+                "Multiple source file glob mode requires a different destination directory.",
+                LogLevel::Error,
+            );
+            return 1;
+        }
+
+        let src_name = src_mnt
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "source".to_string());
+        if !seen_names.insert(src_name.clone()) {
+            log(
+                requested_mode,
+                &format!(
+                    "Multiple source paths resolve to the same destination name: {}",
+                    src_name
+                ),
+                LogLevel::Error,
+            );
+            return 1;
+        }
+
+        let ps = pre_scan_file(
+            &src_mnt,
+            &dst_display,
+            DstObjKind::DirExisting,
+            true,
+            replace_dest_symlink,
+            merge_collision_policy,
+        );
+        planned_bytes = planned_bytes.saturating_add(ps.planned_bytes);
+        total_regular_files = total_regular_files
+            .saturating_add(ps.total_regular_files.unwrap_or(0));
+        add_files = add_files.saturating_add(ps.add_files);
+        mod_files = mod_files.saturating_add(ps.mod_files);
+        display_change_preview.extend(ps.change_preview);
+        source_top_entries.insert(src_name.clone());
+        if ps.has_itemized_changes {
+            has_itemized_changes = true;
+        }
+        source_rel_files.insert(src_name.clone());
+        batch_items.push((src_mnt, ps.planned_bytes));
+    }
+
+    let (_, uncollided_files) = destination_file_counts(&dst_mnt, &source_rel_files);
+
+    let preview_root_path = Path::new(&dst_display);
+    print_preview_root_line(preview_root_path, false, true);
+    let empty_extra: HashSet<String> = HashSet::new();
+    print_changed_top_preview(
+        preview_root_path,
+        &display_change_preview,
+        &source_top_entries,
+        showall,
+        &empty_extra,
+        &empty_extra,
+        &empty_extra,
+        &empty_extra,
+        tree_trunc,
+    );
+
+    println!();
+    print_counts_table(
+        Some((
+            add_files,
+            mod_files,
+            total_regular_files.saturating_sub(add_files.saturating_add(mod_files)),
+            uncollided_files,
+            if is_move { total_regular_files } else { 0 },
+            0,
+        )),
+        Some((0, 0, 0, 0, 0, 0)),
+    );
+
+    println!();
+    println!(
+        "Planned transfer bytes: {} ({})",
+        format_number(planned_bytes),
+        format_bytes_binary(planned_bytes, 2)
+    );
+    println!();
+
+    if preview_only {
+        return 0;
+    }
+
+    let no_changes_planned = planned_bytes == 0 && !has_itemized_changes;
+    if no_changes_planned && !is_move {
+        log(
+            requested_mode,
+            &format!("No changes detected; nothing to {}.", requested_mode.word()),
+            LogLevel::Info,
+        );
+        return 0;
+    }
+
+    print!("Proceed with {}? [Y/n]: ", requested_mode.word());
+    let _ = io::stdout().flush();
+    let mut ans = String::new();
+    if io::stdin().read_line(&mut ans).is_err() {
+        return 1;
+    }
+    let ans = ans.trim().to_lowercase();
+    if ans != "y" && ans != "yes" && !ans.is_empty() {
+        return 1;
+    }
+
+    if no_changes_planned && is_move {
+        log(
+            requested_mode,
+            "Destination already has matching files; source files will be removed to complete move.",
+            LogLevel::Info,
+        );
+        log(requested_mode, "Starting cleanup", LogLevel::Info);
+        let start_ts = Instant::now();
+        let cleanup_start = Instant::now();
+        let mut removed = DeleteCleanupOutcome::default();
+        let mut flush_targets: HashSet<PathBuf> = HashSet::new();
+
+        for (src_mnt, _) in &batch_items {
+            let src = src_mnt.as_path();
+            let src_lmd = match fs::symlink_metadata(src) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let src_name = match src.file_name() {
+                Some(v) => v,
+                None => continue,
+            };
+            let dst = dst_mnt.join(src_name);
+            let same = if src_lmd.file_type().is_symlink() {
+                symlink_targets_equal(src, &dst)
+            } else {
+                let src_md = match fs::metadata(src) {
+                    Ok(v) if v.is_file() => v,
+                    _ => continue,
+                };
+                match fs::metadata(&dst) {
+                    Ok(v) => v.is_file() && v.len() == src_md.len(),
+                    Err(_) => false,
+                }
+            };
+            if same && remove_single_file(src, use_sudo, requested_mode) {
+                removed.files = removed.files.saturating_add(1);
+                removed.bytes = removed.bytes.saturating_add(if src_lmd.file_type().is_symlink() {
+                    0
+                } else {
+                    src_lmd.len()
+                });
+                if let Some(parent) = src.parent() {
+                    flush_targets.insert(realpath_allow_missing(parent));
+                }
+            }
+        }
+        let cleanup_elapsed_s = cleanup_start.elapsed().as_secs_f64();
+        let mut cleanup_flush_elapsed_s = 0.0f64;
+        let mut cleanup_flush_bytes_total: u64 = 0;
+        for target in flush_targets {
+            let flush = flush_source_cleanup_writes(&target, use_sudo, requested_mode);
+            cleanup_flush_elapsed_s += flush.elapsed_s;
+            if let Some(b) = flush.flushed_bytes {
+                cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+            }
+        }
+        log(requested_mode, "Cleanup complete.", LogLevel::Info);
+        log_transfer_complete(requested_mode);
+        let cleanup_bps = if cleanup_elapsed_s > 0.0 {
+            removed.bytes as f64 / cleanup_elapsed_s.max(1e-6)
+        } else {
+            0.0
+        };
+        let cleanup_flush_bps = if cleanup_flush_elapsed_s > 0.0 {
+            cleanup_flush_bytes_total as f64 / cleanup_flush_elapsed_s.max(1e-6)
+        } else {
+            0.0
+        };
+        print_copy_duration_summary(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Some((
+                cleanup_elapsed_s,
+                cleanup_bps,
+                cleanup_flush_elapsed_s,
+                cleanup_flush_bps,
+            )),
+            start_ts.elapsed().as_secs_f64(),
+        );
+        return 0;
+    }
+
+    if is_move && !use_sudo {
+        let mut rename_plan: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(batch_items.len());
+        let mut can_batch_fast_rename = true;
+        for (src_mnt, _) in &batch_items {
+            let src_name = match src_mnt.file_name() {
+                Some(v) => v,
+                None => {
+                    can_batch_fast_rename = false;
+                    break;
+                }
+            };
+            let rename_target = dst_mnt.join(src_name);
+            if !can_fast_rename_same_fs(src_mnt, &rename_target)
+                || rename_target.exists()
+                || rename_target == *src_mnt
+            {
+                can_batch_fast_rename = false;
+                break;
+            }
+            rename_plan.push((src_mnt.clone(), rename_target));
+        }
+        if can_batch_fast_rename {
+            for (src_mnt, rename_target) in &rename_plan {
+                if fs::rename(src_mnt, rename_target).is_err() {
+                    can_batch_fast_rename = false;
+                    break;
+                }
+            }
+            if can_batch_fast_rename {
+                let _ = flush_destination_writes(&dst_mnt, use_sudo, requested_mode, None);
+                log(
+                    requested_mode,
+                    &format!(
+                        "Fast-path rename on same filesystem (batch): moved {} files into {}",
+                        rename_plan.len(),
+                        dst_mnt.display()
+                    ),
+                    LogLevel::Info,
+                );
+                println!();
+                log_transfer_complete(requested_mode);
+                return 0;
+            }
+        }
+    }
+
+    let backend = if use_sudo {
+        TransferBackend::Rsync
+    } else {
+        TransferBackend::Rust
+    };
+    let start_ts = Instant::now();
+    let mut transferred_bytes_total: u64 = 0;
+    let mut transferred_elapsed_total_s: f64 = 0.0;
+    let mut transfer_flush_elapsed_s: f64 = 0.0;
+    let mut transfer_flush_bytes_total: u64 = 0;
+    let mut cleanup_elapsed_total_s: f64 = 0.0;
+    let mut cleanup_flush_elapsed_s: f64 = 0.0;
+    let mut cleanup_flush_bytes_total: u64 = 0;
+    let mut deleted_cleanup_total = DeleteCleanupOutcome::default();
+
+    for (src_mnt, item_planned_bytes) in batch_items {
+        let src_path = src_mnt.display().to_string();
+        let media = dev_media_kind(&src_mnt);
+        let transfer = match backend {
+            TransferBackend::Rsync => {
+                run_rsync_transfer(
+                    &src_path,
+                    &dst_display,
+                    item_planned_bytes,
+                    use_sudo,
+                    false,
+                    false,
+                    true,
+                )
+            }
+            TransferBackend::Rust => run_rust_transfer(
+                &src_path,
+                &dst_display,
+                SrcObjKind::File,
+                is_move,
+                item_planned_bytes,
+                None,
+                media,
+                replace_dest_symlink,
+                merge_collision_policy,
+            ),
+        };
+        transferred_bytes_total = transferred_bytes_total.saturating_add(transfer.bytes_done);
+        transferred_elapsed_total_s += transfer.elapsed_s;
+        if transfer.rc != 0 {
+            log(
+                requested_mode,
+                &format!(
+                    "{} failed: transfer exited with status {}.",
+                    requested_mode.word_cap(),
+                    transfer.rc
+                ),
+                LogLevel::Error,
+            );
+            return 1;
+        }
+
+        let flush_stats = flush_destination_writes(
+            &dst_mnt,
+            use_sudo,
+            requested_mode,
+            transfer.progress_snapshot,
+        );
+        transfer_flush_elapsed_s += flush_stats.elapsed_s;
+        if let Some(b) = flush_stats.flushed_bytes {
+            transfer_flush_bytes_total = transfer_flush_bytes_total.saturating_add(b);
+        }
+
+        if is_move {
+            let cleanup = run_move_cleanup_phase(
+                &src_path,
+                &dst_display,
+                &src_mnt,
+                SrcObjKind::File,
+                false,
+                false,
+                false,
+                use_sudo,
+                requested_mode,
+                None,
+                1,
+                item_planned_bytes,
+            );
+            deleted_cleanup_total.files = deleted_cleanup_total
+                .files
+                .saturating_add(cleanup.deleted.files);
+            deleted_cleanup_total.bytes = deleted_cleanup_total
+                .bytes
+                .saturating_add(cleanup.deleted.bytes);
+            cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
+            cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
+            if let Some(b) = cleanup.flush.flushed_bytes {
+                cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+            }
+        }
+    }
+
+    log_transfer_complete(requested_mode);
+
+    let total_elapsed_s = start_ts.elapsed().as_secs_f64();
+    let avg_transfer_bps = if transferred_elapsed_total_s > 0.0 {
+        transferred_bytes_total as f64 / transferred_elapsed_total_s
+    } else {
+        0.0
+    };
+    let transfer_flush_bps = if transfer_flush_elapsed_s > 0.0 {
+        transfer_flush_bytes_total as f64 / transfer_flush_elapsed_s
+    } else {
+        0.0
+    };
+    let cleanup_summary = if is_move {
+        let cleanup_bps = if cleanup_elapsed_total_s > 0.0 {
+            deleted_cleanup_total.bytes as f64 / cleanup_elapsed_total_s.max(1e-6)
+        } else {
+            0.0
+        };
+        let cleanup_flush_bps = if cleanup_flush_elapsed_s > 0.0 {
+            cleanup_flush_bytes_total as f64 / cleanup_flush_elapsed_s.max(1e-6)
+        } else {
+            0.0
+        };
+        Some((
+            cleanup_elapsed_total_s,
+            cleanup_bps,
+            cleanup_flush_elapsed_s,
+            cleanup_flush_bps,
+        ))
+    } else {
+        None
+    };
+    print_copy_duration_summary(
+        transferred_elapsed_total_s,
+        avg_transfer_bps,
+        transfer_flush_elapsed_s,
+        transfer_flush_bps,
+        cleanup_summary,
+        total_elapsed_s,
+    );
+    0
 }
 
 fn parse_args() -> Result<CliArgs, i32> {
@@ -1846,7 +2822,24 @@ fn parse_args() -> Result<CliArgs, i32> {
             "-o" | "--overwrite" => args.overwrite = true,
             "-c" | "--contents-only" => args.contents_only = true,
             "-b" | "--backup" => args.backup = true,
-            "-v" | "-vv" | "--verbose" | "--showall" => args.showall = true,
+            "--sync" => args.sync_mode = true,
+            "-v" | "--verbose" | "--showall" => args.showall = true,
+            "--replace-dest-symlink" => args.replace_dest_symlink = true,
+            "--dest-wins" => {
+                set_merge_collision_policy(&mut args, MergeCollisionPolicy::DestWins)?
+            }
+            "--source-wins" => {
+                set_merge_collision_policy(&mut args, MergeCollisionPolicy::SourceWins)?
+            }
+            "--source-wins-if-larger" => {
+                set_merge_collision_policy(&mut args, MergeCollisionPolicy::SourceWinsIfLarger)?
+            }
+            "--source-wins-if-newer-or-larger" => {
+                set_merge_collision_policy(
+                    &mut args,
+                    MergeCollisionPolicy::SourceWinsIfNewerOrLarger,
+                )?
+            }
             "-L" => {
                 i += 1;
                 if i >= argv.len() {
@@ -1898,7 +2891,7 @@ fn parse_args() -> Result<CliArgs, i32> {
     }
 
     args.source = positional.remove(0);
-    args.destination = positional.remove(0);
+    args.destination = positional.pop().unwrap_or_default();
     args.extra = positional;
     Ok(args)
 }
@@ -2412,6 +3405,7 @@ fn copy_file_preserve_with_progress_buf<F>(
 where
     F: FnMut(u64),
 {
+    let meta = fs::symlink_metadata(src)?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2430,7 +3424,6 @@ where
         on_bytes(n64);
     }
     out_file.flush()?;
-    let meta = fs::symlink_metadata(src)?;
     fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
     let atime = FileTime::from_last_access_time(&meta);
     let mtime = FileTime::from_last_modification_time(&meta);
@@ -2511,6 +3504,48 @@ fn copy_path_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     let mtime = FileTime::from_last_modification_time(&meta);
     let _ = set_file_times(dst, atime, mtime);
     Ok(())
+}
+
+fn preserve_directory_times_tree(
+    src_root: &Path,
+    dst_base: &Path,
+    include_root: bool,
+    src_base: &str,
+    dir_times: Option<&[ManifestDirTimeEntry]>,
+) {
+    if let Some(entries) = dir_times {
+        let mut dirs = entries.to_vec();
+        // Apply deeper directories first, then parents.
+        dirs.sort_by_key(|e| std::cmp::Reverse(e.rel.bytes().filter(|c| *c == b'/').count()));
+
+        for entry in dirs {
+            let dst_dir = map_dir_dest_path(include_root, src_base, &entry.rel, dst_base);
+            let _ = set_file_times(&dst_dir, entry.atime, entry.mtime);
+        }
+        return;
+    }
+
+    let mut dirs: Vec<PathBuf> = WalkDir::new(src_root)
+        .sort(false)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+    for src_dir in dirs {
+        let rel = normalize_rel(src_dir.strip_prefix(src_root).unwrap_or(Path::new("")));
+        let dst_dir = map_dir_dest_path(include_root, src_base, &rel, dst_base);
+        let src_meta = match fs::metadata(&src_dir) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let atime = FileTime::from_last_access_time(&src_meta);
+        let mtime = FileTime::from_last_modification_time(&src_meta);
+        let _ = set_file_times(&dst_dir, atime, mtime);
+    }
 }
 
 fn remove_path_recursive(path: &Path, use_sudo: bool, mode: TransferMode) -> bool {
@@ -2751,7 +3786,15 @@ fn prune_move_source_duplicates(
     match src_obj_kind {
         SrcObjKind::File => {
             let src = Path::new(src_path);
-            let dst = Path::new(dst_path);
+            let mut dst_buf = PathBuf::from(dst_path);
+            if dst_buf.is_dir() {
+                let src_name = match src.file_name() {
+                    Some(v) => v,
+                    None => return removed,
+                };
+                dst_buf = dst_buf.join(src_name);
+            }
+            let dst = dst_buf.as_path();
             let src_lmd = match fs::symlink_metadata(src) {
                 Ok(v) => v,
                 Err(_) => return removed,
@@ -2993,51 +4036,71 @@ fn parent_rel_in_set(rel: &str, set: &FxHashSet<String>) -> bool {
     }
 }
 
-type SrcScanEntries = (Vec<String>, Vec<(String, Option<PathBuf>, u64, bool)>);
+type SrcScanEntries = (
+    Vec<String>,
+    Vec<(String, Option<PathBuf>, u64, bool)>,
+    Vec<ManifestDirTimeEntry>,
+);
 
 fn scan_source_entries(src_root: &Path) -> SrcScanEntries {
     // Pre-allocate based on rough estimates to avoid reallocation
     let mut dirs: Vec<String> = Vec::with_capacity(8192);
     let mut files: Vec<(String, Option<PathBuf>, u64, bool)> = Vec::with_capacity(65536);
+    let mut dir_times: Vec<ManifestDirTimeEntry> = Vec::with_capacity(8192);
 
-    for ent in WalkDir::new(src_root)
-        .sort(false)
-        .skip_hidden(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if ent.depth() == 0 {
-            continue;
-        }
-        let fty = ent.file_type();
-        if !fty.is_dir() && !fty.is_file() && !fty.is_symlink() {
-            continue;
-        }
-        let rel = ent
-            .path()
-            .strip_prefix(src_root)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if rel.is_empty() {
-            continue;
-        }
-
-        if fty.is_dir() {
-            dirs.push(rel);
-        } else if fty.is_file() {
-            let size = ent.metadata().map(|m| m.len()).unwrap_or_else(|_| {
-                fs::symlink_metadata(ent.path())
-                    .map(|m| m.len())
-                    .unwrap_or(0)
+    fn walk_source_entries(
+        current: &Path,
+        rel: &str,
+        dirs: &mut Vec<String>,
+        files: &mut Vec<(String, Option<PathBuf>, u64, bool)>,
+        dir_times: &mut Vec<ManifestDirTimeEntry>,
+    ) {
+        let meta = match fs::symlink_metadata(current) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if meta.is_dir() {
+            dir_times.push(ManifestDirTimeEntry {
+                rel: rel.to_string(),
+                atime: FileTime::from_last_access_time(&meta),
+                mtime: FileTime::from_last_modification_time(&meta),
             });
-            files.push((rel, None, size, false));
-        } else if fty.is_symlink() {
-            files.push((rel, Some(ent.path().to_path_buf()), 0, true));
+            if !rel.is_empty() {
+                dirs.push(rel.to_string());
+            }
+            let rd = match fs::read_dir(current) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            for entry in rd.filter_map(Result::ok) {
+                let child_path = entry.path();
+                let child_name = match child_path.file_name() {
+                    Some(n) => n.to_string_lossy().into_owned(),
+                    None => continue,
+                };
+                let child_rel = if rel.is_empty() {
+                    child_name.clone()
+                } else {
+                    format!("{rel}/{child_name}")
+                };
+                let child_meta = match fs::symlink_metadata(&child_path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if child_meta.is_dir() {
+                    walk_source_entries(&child_path, &child_rel, dirs, files, dir_times);
+                } else if child_meta.is_file() {
+                    files.push((child_rel, None, child_meta.len(), false));
+                } else if child_meta.file_type().is_symlink() {
+                    files.push((child_rel, Some(child_path), 0, true));
+                }
+            }
         }
     }
 
-    (dirs, files)
+    walk_source_entries(src_root, "", &mut dirs, &mut files, &mut dir_times);
+
+    (dirs, files, dir_times)
 }
 
 fn pre_scan_directory(
@@ -3046,6 +4109,8 @@ fn pre_scan_directory(
     src_mnt: &Path,
     build_manifest: bool,
     build_source_display_paths: bool,
+    replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
 ) -> PreScan {
     let src_no_trailing = src_path.trim_end_matches('/');
     let include_root = !src_path.ends_with('/');
@@ -3069,26 +4134,27 @@ fn pre_scan_directory(
     let dst_dev = fs::metadata(&destination_root).ok().map(|m| m.dev());
     let can_parallel_scans =
         !destination_missing && src_dev.is_some() && dst_dev.is_some() && src_dev != dst_dev;
-    let (mut dirs, files, destination_index): (
+    let (mut dirs, files, dir_times, destination_index): (
         Vec<String>,
         Vec<(String, Option<PathBuf>, u64, bool)>,
+        Vec<ManifestDirTimeEntry>,
         Option<DestinationIndex>,
     ) = if destination_missing {
-        let (d, f) = scan_source_entries(src_root);
-        (d, f, None)
+        let (d, f, t) = scan_source_entries(src_root);
+        (d, f, t, None)
     } else if can_parallel_scans {
         std::thread::scope(|scope| {
             let idx_handle = scope.spawn(|| build_destination_index(&destination_root));
-            let (d, f) = scan_source_entries(src_root);
+            let (d, f, t) = scan_source_entries(src_root);
             let idx = idx_handle
                 .join()
                 .unwrap_or_else(|_| build_destination_index(&destination_root));
-            (d, f, Some(idx))
+            (d, f, t, Some(idx))
         })
     } else {
-        let (d, f) = scan_source_entries(src_root);
+        let (d, f, t) = scan_source_entries(src_root);
         let idx = build_destination_index(&destination_root);
-        (d, f, Some(idx))
+        (d, f, t, Some(idx))
     };
 
     let mut out = PreScan::default();
@@ -3266,31 +4332,67 @@ fn pre_scan_directory(
                         }
                     }
                 } else {
-                    if let Some(idx) = dst_idx {
-                        if let Some(dst_size) = idx.file_sizes.get(rel.as_str()) {
-                            if *dst_size == *size {
-                                None
-                            } else {
-                                Some(ChangeKind::ModFile)
-                            }
-                        } else if idx.path_exists(rel.as_str()) {
-                            Some(ChangeKind::ModFile)
-                        } else {
-                            Some(ChangeKind::NewFile)
-                        }
+                    let needs_mtime =
+                        matches!(merge_collision_policy, MergeCollisionPolicy::SourceWinsIfNewerOrLarger);
+                    let src_mtime = if needs_mtime {
+                        fs::metadata(src_root.join(rel))
+                            .ok()
+                            .and_then(|m| m.modified().ok())
                     } else {
-                        match fs::metadata(ensure_dst_file_path(
+                        None
+                    };
+                    let dst_exists = if let Some(idx) = dst_idx {
+                        idx.path_exists(rel.as_str())
+                    } else {
+                        fs::symlink_metadata(ensure_dst_file_path(
                             &mut dst_file,
                             include_root,
                             &src_base,
                             rel,
                             dst_base,
-                        )) {
-                            Ok(dm) if dm.is_file() && dm.len() == *size => None,
-                            Ok(_) => Some(ChangeKind::ModFile),
-                            Err(_) => Some(ChangeKind::NewFile),
+                        ))
+                        .is_ok()
+                    };
+                    let dst_path = ensure_dst_file_path(
+                        &mut dst_file,
+                        include_root,
+                        &src_base,
+                        rel,
+                        dst_base,
+                    );
+                    let dst_is_symlink = fs::symlink_metadata(&dst_path)
+                        .map(|dm| dm.file_type().is_symlink())
+                        .unwrap_or(false);
+                    let dst_size = if replace_dest_symlink && dst_is_symlink {
+                        None
+                    } else if let Some(idx) = dst_idx {
+                        if needs_mtime {
+                            fs::metadata(&dst_path).ok().map(|m| m.len())
+                        } else {
+                            idx.file_sizes.get(rel.as_str()).copied()
                         }
-                    }
+                    } else {
+                        match fs::symlink_metadata(&dst_path) {
+                            Ok(dm) if dm.is_file() => fs::metadata(&dst_path).ok().map(|m| m.len()),
+                            Ok(_) => None,
+                            Err(_) => None,
+                        }
+                    };
+                    let dst_mtime = if replace_dest_symlink && dst_is_symlink {
+                        None
+                    } else if needs_mtime {
+                        fs::metadata(&dst_path).ok().and_then(|m| m.modified().ok())
+                    } else {
+                        None
+                    };
+                    regular_file_collision_change(
+                        merge_collision_policy,
+                        *size,
+                        src_mtime,
+                        dst_exists,
+                        dst_size,
+                        dst_mtime,
+                    )
                 };
                 let is_overlap = !matches!(change, Some(ChangeKind::NewFile));
                 if is_overlap {
@@ -3423,6 +4525,7 @@ fn pre_scan_directory(
             manifest_identical_files.sort_by(|a, b| a.rel.cmp(&b.rel));
             out.transfer_manifest = Some(TransferManifest {
                 dirs: d,
+                dir_times,
                 copy_files: manifest_copy_files,
                 identical_files: manifest_identical_files,
             });
@@ -3437,6 +4540,8 @@ fn pre_scan_file(
     dst_path: &str,
     dst_obj_kind: DstObjKind,
     build_source_display_paths: bool,
+    replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
 ) -> PreScan {
     let mut out = PreScan::default();
     out.planned_bytes_exact = true;
@@ -3445,14 +4550,16 @@ fn pre_scan_file(
         Err(_) => return out,
     };
     let src_is_symlink = src_lmd.file_type().is_symlink();
-    let size = if src_is_symlink {
-        0
+    let src_meta = if src_is_symlink {
+        None
     } else {
         match fs::metadata(src_mnt) {
-            Ok(m) => m.len(),
+            Ok(m) => Some(m),
             Err(_) => return out,
         }
     };
+    let size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let src_mtime = src_meta.as_ref().and_then(|m| m.modified().ok());
     out.total_regular_files = Some(if src_is_symlink { 0 } else { 1 });
     out.total_regular_bytes = Some(size);
     out.total_dirs = Some(0);
@@ -3527,11 +4634,27 @@ fn pre_scan_file(
             Err(_) => Some(ChangeKind::NewFile),
         }
     } else {
-        match fs::metadata(&dst_file) {
-            Ok(dm) if dm.is_file() && dm.len() == size => None,
-            Ok(_) => Some(ChangeKind::ModFile),
-            Err(_) => Some(ChangeKind::NewFile),
-        }
+        let dst_lmd = fs::symlink_metadata(&dst_file).ok();
+        let dst_is_symlink = dst_lmd
+            .as_ref()
+            .map(|md| md.file_type().is_symlink())
+            .unwrap_or(false);
+        let dst_exists = dst_lmd.is_some();
+        let dst_meta = if replace_dest_symlink && dst_is_symlink {
+            None
+        } else {
+            fs::metadata(&dst_file).ok()
+        };
+        let dst_size = dst_meta.as_ref().map(|m| m.len());
+        let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
+        regular_file_collision_change(
+            merge_collision_policy,
+            size,
+            src_mtime,
+            dst_exists,
+            dst_size,
+            dst_mtime,
+        )
     };
 
     if let Some(ch) = change {
@@ -3651,12 +4774,19 @@ fn run_rsync_transfer(
     planned_bytes: u64,
     use_sudo: bool,
     remove_source_during: bool,
+    delete_destination_extras: bool,
+    size_only: bool,
 ) -> TransferOutcome {
     let mut cmd: Vec<String> = vec![
         "rsync".to_string(),
         "-aH".to_string(),
-        "--size-only".to_string(),
     ];
+    if size_only {
+        cmd.push("--size-only".to_string());
+    }
+    if delete_destination_extras {
+        cmd.push("--delete".to_string());
+    }
     if remove_source_during {
         cmd.push("--remove-source-files".to_string());
     }
@@ -3868,6 +4998,8 @@ fn run_rust_transfer(
     planned_bytes: u64,
     manifest: Option<&TransferManifest>,
     media: MediaKind,
+    replace_dest_symlink: bool,
+    merge_collision_policy: MergeCollisionPolicy,
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
     let copy_buf_bytes = copy_chunk_bytes_for_media(media);
@@ -4010,7 +5142,10 @@ fn run_rust_transfer(
         SrcObjKind::File => {
             let src = Path::new(src_path);
             let mut dst_buf = PathBuf::from(dst_path);
-            if dst_buf.is_dir() {
+            let dst_is_symlink = fs::symlink_metadata(&dst_buf)
+                .map(|md| md.file_type().is_symlink())
+                .unwrap_or(false);
+            if dst_buf.is_dir() && !(replace_dest_symlink && dst_is_symlink) {
                 let src_name = match src.file_name() {
                     Some(v) => v,
                     None => finish_transfer!(1),
@@ -4033,13 +5168,41 @@ fn run_rust_transfer(
                 Ok(v) => v,
                 Err(_) => finish_transfer!(1),
             };
-            let needs_copy = match fs::metadata(dst) {
-                Ok(dm) => !(dm.is_file() && dm.len() == src_meta.len()),
-                Err(_) => true,
+            let src_mtime = src_meta.modified().ok();
+            let dst_lmd = fs::symlink_metadata(dst).ok();
+            let dst_is_symlink = dst_lmd
+                .as_ref()
+                .map(|md| md.file_type().is_symlink())
+                .unwrap_or(false);
+            let dst_exists = dst_lmd.is_some();
+            let dst_meta = if replace_dest_symlink && dst_is_symlink {
+                None
+            } else {
+                fs::metadata(dst).ok()
             };
+            let dst_size = dst_meta.as_ref().map(|m| m.len());
+            let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
+            let needs_copy =
+                regular_file_collision_change(
+                    merge_collision_policy,
+                    src_meta.len(),
+                    src_mtime,
+                    dst_exists,
+                    dst_size,
+                    dst_mtime,
+                )
+                    .is_some();
             if needs_copy {
                 let _permit =
                     acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
+                if replace_dest_symlink
+                    && fs::symlink_metadata(dst)
+                        .map(|md| md.file_type().is_symlink())
+                        .unwrap_or(false)
+                    && fs::remove_file(dst).is_err()
+                {
+                    finish_transfer!(1);
+                }
                 if copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
                     done.fetch_add(n, Ordering::Relaxed);
                 })
@@ -4090,11 +5253,45 @@ fn run_rust_transfer(
                         if src_md.file_type().is_symlink() {
                             copy_symlink(&src_file, &dst_item).is_ok()
                         } else if src_md.is_file() {
+                            let src_mtime = src_md.modified().ok();
+                            let dst_lmd = fs::symlink_metadata(&dst_item).ok();
+                            let dst_is_symlink = dst_lmd
+                                .as_ref()
+                                .map(|md| md.file_type().is_symlink())
+                                .unwrap_or(false);
+                            let dst_exists = dst_lmd.is_some();
+                            let dst_meta = if replace_dest_symlink && dst_is_symlink {
+                                None
+                            } else {
+                                fs::metadata(&dst_item).ok()
+                            };
+                            let dst_size = dst_meta.as_ref().map(|m| m.len());
+                            let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
+                            let needs_copy = regular_file_collision_change(
+                                merge_collision_policy,
+                                src_md.len(),
+                                src_mtime,
+                                dst_exists,
+                                dst_size,
+                                dst_mtime,
+                            )
+                            .is_some();
+                            if !needs_copy {
+                                return true;
+                            }
                             let _permit = acquire_file_write_permit(
                                 inflight_limiter.as_ref(),
                                 src_md.len(),
                                 media,
                             );
+                            if replace_dest_symlink
+                                && fs::symlink_metadata(&dst_item)
+                                    .map(|md| md.file_type().is_symlink())
+                                    .unwrap_or(false)
+                                && fs::remove_file(&dst_item).is_err()
+                            {
+                                return false;
+                            }
                             copy_file_preserve_with_progress_buf(
                                 &src_file,
                                 &dst_item,
@@ -4112,6 +5309,13 @@ fn run_rust_transfer(
                 if !copy_ok {
                     finish_transfer!(1);
                 }
+                preserve_directory_times_tree(
+                    src_root,
+                    dst_base,
+                    include_root,
+                    &src_base,
+                    manifest.map(|m| m.dir_times.as_slice()),
+                );
             } else {
                 let mut entries: Vec<PathBuf> = WalkDir::new(src_root)
                     .sort(false)
@@ -4151,13 +5355,41 @@ fn run_rust_transfer(
                     if !md.is_file() {
                         continue;
                     }
-                    let needs_copy = match fs::metadata(&dst_item) {
-                        Ok(dm) => !(dm.is_file() && dm.len() == md.len()),
-                        Err(_) => true,
+                    let src_mtime = md.modified().ok();
+                    let dst_lmd = fs::symlink_metadata(&dst_item).ok();
+                    let dst_is_symlink = dst_lmd
+                        .as_ref()
+                        .map(|meta| meta.file_type().is_symlink())
+                        .unwrap_or(false);
+                    let dst_exists = dst_lmd.is_some();
+                    let dst_meta = if replace_dest_symlink && dst_is_symlink {
+                        None
+                    } else {
+                        fs::metadata(&dst_item).ok()
                     };
+                    let dst_size = dst_meta.as_ref().map(|m| m.len());
+                    let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
+                    let needs_copy =
+                        regular_file_collision_change(
+                            merge_collision_policy,
+                            md.len(),
+                            src_mtime,
+                            dst_exists,
+                            dst_size,
+                            dst_mtime,
+                        )
+                            .is_some();
                     if needs_copy {
                         let _permit =
                             acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
+                        if replace_dest_symlink
+                            && fs::symlink_metadata(&dst_item)
+                                .map(|meta| meta.file_type().is_symlink())
+                                .unwrap_or(false)
+                            && fs::remove_file(&dst_item).is_err()
+                        {
+                            finish_transfer!(1);
+                        }
                         if copy_file_preserve_with_progress_buf(
                             &p,
                             &dst_item,
@@ -4172,6 +5404,13 @@ fn run_rust_transfer(
                         }
                     }
                 }
+                preserve_directory_times_tree(
+                    src_root,
+                    dst_base,
+                    include_root,
+                    &src_base,
+                    manifest.map(|m| m.dir_times.as_slice()),
+                );
             }
         }
     }
@@ -5125,6 +6364,7 @@ fn run_remote_transfer_mode(
     contents_mode_requested: bool,
     overwrite: bool,
     backup_requested: bool,
+    sync_mode: bool,
     preview_only: bool,
 ) -> i32 {
     if source_remote.is_some() && destination_remote.is_some() {
@@ -5154,7 +6394,11 @@ fn run_remote_transfer_mode(
         None => {
             if let Some(kind) = local_src_kind {
                 let resolved = match kind {
-                    SrcObjKind::File => resolve_destination_for_file(destination, requested_mode),
+                    SrcObjKind::File => resolve_destination_for_file(
+                        destination,
+                        requested_mode,
+                        false,
+                    ),
                     SrcObjKind::Dir => {
                         resolve_destination_for_dir(destination, requested_mode, false)
                     }
@@ -5191,6 +6435,13 @@ fn run_remote_transfer_mode(
             LogLevel::Warn,
         );
     }
+    if sync_mode {
+        log(
+            requested_mode,
+            "Sync mode enabled: destination extras will be deleted to match source.",
+            LogLevel::Info,
+        );
+    }
     if backup_requested {
         log(
             requested_mode,
@@ -5214,6 +6465,7 @@ fn run_remote_transfer_mode(
             fmt_mode_word("File", matches!(local_src_kind, Some(SrcObjKind::File))),
             fmt_mode_word("Dir", mode_dir_active),
             fmt_mode_word("Contents", contents_active),
+            fmt_mode_word("Sync", sync_mode),
         ]
         .join(" ")
     );
@@ -5257,7 +6509,7 @@ fn run_remote_transfer_mode(
         LogLevel::Info,
     );
     let start_ts = Instant::now();
-    let transfer = run_rsync_transfer(&src_path, &dst_path, 0, use_sudo, is_move);
+    let transfer = run_rsync_transfer(&src_path, &dst_path, 0, use_sudo, is_move, sync_mode, !sync_mode);
 
     if is_move && (transfer.rc == 0 || transfer.rc == 24) && matches!(source_ep, Endpoint::Local(_))
     {
@@ -5338,14 +6590,9 @@ fn real_main() -> i32 {
     };
     let is_move = requested_mode == TransferMode::Move;
 
-    if !args.extra.is_empty() {
-        log(
-            requested_mode,
-            "Unexpected extra path arguments. If using '*', quote it (e.g. 'src/*').",
-            LogLevel::Error,
-        );
-        return 1;
-    }
+    let batch_sources: Vec<String> = std::iter::once(args.source.clone())
+        .chain(args.extra.iter().cloned())
+        .collect();
 
     let source_input = args.source.clone();
     let mut source = source_input.clone();
@@ -5368,6 +6615,83 @@ fn real_main() -> i32 {
     let source_remote = parse_remote_spec(&source);
     let destination_remote = parse_remote_spec(&destination).map(enrich_remote_spec);
 
+    if (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::Default)
+        && (use_sudo || source_remote.is_some() || destination_remote.is_some())
+    {
+        log(
+            requested_mode,
+            "Collision and symlink replacement flags are only supported with the local Rust backend.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+
+    if args.sync_mode && args.overwrite {
+        log(
+            requested_mode,
+            "--sync cannot be combined with --overwrite. Use one mode.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+    if args.sync_mode && is_move {
+        log(
+            requested_mode,
+            "--sync currently supports copy mode only (no --move).",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+    if args.sync_mode
+        && (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::Default)
+    {
+        log(
+            requested_mode,
+            "--sync cannot be combined with collision/symlink replacement flags.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+
+    if !args.extra.is_empty() {
+        if source_remote.is_some() || destination_remote.is_some() {
+            log(
+                requested_mode,
+                "Multiple source paths are only supported for local filesystem transfers.",
+                LogLevel::Error,
+            );
+            return 1;
+        }
+        if args.contents_only {
+            log(
+                requested_mode,
+                "Multiple source paths do not support --contents-only.",
+                LogLevel::Error,
+            );
+            return 1;
+        }
+        if args.sync_mode {
+            log(
+                requested_mode,
+                "Multiple source paths do not support --sync.",
+                LogLevel::Error,
+            );
+            return 1;
+        }
+        return run_multi_source_file_batch(
+            requested_mode,
+            &batch_sources,
+            &args.destination,
+            args.sudo,
+            args.preview_only || args.preview_lite,
+            is_move,
+            args.tree_trunc,
+            args.showall,
+            args.replace_dest_symlink,
+            args.merge_collision_policy,
+        );
+    }
+
     if source_remote.is_some() || destination_remote.is_some() {
         return run_remote_transfer_mode(
             requested_mode,
@@ -5380,6 +6704,7 @@ fn real_main() -> i32 {
             contents_mode_requested,
             overwrite,
             backup_requested,
+            args.sync_mode,
             preview_only,
         );
     }
@@ -5388,9 +6713,21 @@ fn real_main() -> i32 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    if args.sync_mode && src_obj_kind != SrcObjKind::Dir {
+        log(
+            requested_mode,
+            "--sync currently supports directory sources only.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
 
     let (dst_mnt, dst_obj_kind) = match src_obj_kind {
-        SrcObjKind::File => match resolve_destination_for_file(&destination, requested_mode) {
+        SrcObjKind::File => match resolve_destination_for_file(
+            &destination,
+            requested_mode,
+            args.replace_dest_symlink,
+        ) {
             Ok(v) => v,
             Err(code) => return code,
         },
@@ -5666,7 +7003,22 @@ fn real_main() -> i32 {
     let mut backup_source_path: Option<PathBuf> = None;
     let mut backup_source_kind: Option<&str> = None;
     if backup_requested && !source_already_in_destination {
-        if let Some(otp) = &overwrite_target_path {
+        if args.sync_mode {
+            let sync_root = if source_contents_mode {
+                dst_mnt.clone()
+            } else if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
+                dst_mnt.join(src_mnt.file_name().unwrap_or_default())
+            } else {
+                dst_mnt.clone()
+            };
+            if sync_root.exists() {
+                let p = realpath_allow_missing(&sync_root);
+                if p != src_mnt {
+                    backup_source_kind = Some(if p.is_dir() { "dir" } else { "file" });
+                    backup_source_path = Some(p);
+                }
+            }
+        } else if let Some(otp) = &overwrite_target_path {
             backup_source_path = Some(otp.clone());
             backup_source_kind = overwrite_target_kind;
         } else if (mode_merge || mode_overwrite)
@@ -5714,6 +7066,7 @@ fn real_main() -> i32 {
             fmt_mode_word("File", src_obj_kind == SrcObjKind::File),
             fmt_mode_word("Dir", mode_dir_active),
             fmt_mode_word("Contents", contents_mode_active),
+            fmt_mode_word("Sync", args.sync_mode),
         ]
         .join(" ")
     );
@@ -5724,7 +7077,7 @@ fn real_main() -> i32 {
     }
 
     let media = dev_media_kind(&src_mnt);
-    let backend = if use_sudo {
+    let backend = if use_sudo || args.sync_mode {
         TransferBackend::Rsync
     } else {
         TransferBackend::Rust
@@ -5758,15 +7111,24 @@ fn real_main() -> i32 {
                 &src_mnt,
                 build_transfer_manifest,
                 args.showall,
+                args.replace_dest_symlink,
+                args.merge_collision_policy,
             ),
-            SrcObjKind::File => pre_scan_file(&src_mnt, &pre_dst_path, dst_obj_kind, args.showall),
+            SrcObjKind::File => pre_scan_file(
+                &src_mnt,
+                &pre_dst_path,
+                dst_obj_kind,
+                args.showall,
+                args.replace_dest_symlink,
+                args.merge_collision_policy,
+            ),
         };
 
         drop(preflight_tmpdir);
         ps
     };
 
-    let planned_bytes = prescan.planned_bytes;
+    let mut planned_bytes = prescan.planned_bytes;
     let planned_bytes_exact = prescan.planned_bytes_exact;
     let total_regular_files = prescan.total_regular_files;
     let total_regular_bytes = prescan.total_regular_bytes;
@@ -5777,7 +7139,7 @@ fn real_main() -> i32 {
     let add_dirs = prescan.add_dirs;
     let mod_dirs = prescan.mod_dirs;
     let uncollided_dirs = prescan.uncollided_dirs;
-    let transfer_manifest = prescan.transfer_manifest;
+    let mut transfer_manifest = prescan.transfer_manifest;
     let mut display_change_preview = prescan.change_preview.clone();
     let mut source_display_paths: HashSet<String> = if args.showall {
         prescan.source_display_paths.iter().cloned().collect()
@@ -5992,9 +7354,11 @@ fn real_main() -> i32 {
     let has_move_cleanup_work = is_move
         && !source_already_in_destination
         && (manifest_cleanup_files > 0 || manifest_cleanup_bytes > 0);
+    let sync_delete_requires_action = args.sync_mode && (uncollided_files > 0 || uncollided_dirs > 0);
     let emphasize_preview_root = has_itemized_changes
         || planned_bytes > 0
         || overwrite_requires_action
+        || sync_delete_requires_action
         || has_move_cleanup_work;
     print_preview_root_line(
         &preview_root,
@@ -6109,7 +7473,7 @@ fn real_main() -> i32 {
         && !has_itemized_changes
         && !overwrite_requires_action;
 
-    let likely_cleanup_files = if is_move && !source_already_in_destination {
+    let mut likely_cleanup_files = if is_move && !source_already_in_destination {
         if manifest_cleanup_files > 0 {
             manifest_cleanup_files
         } else {
@@ -6118,7 +7482,7 @@ fn real_main() -> i32 {
     } else {
         0
     };
-    let likely_cleanup_bytes = if is_move && !source_already_in_destination {
+    let mut likely_cleanup_bytes = if is_move && !source_already_in_destination {
         if manifest_cleanup_bytes > 0 {
             manifest_cleanup_bytes
         } else {
@@ -6178,38 +7542,7 @@ fn real_main() -> i32 {
         )
     });
     if file_row.is_some() || dir_row.is_some() {
-        println!(
-            "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
-            "Type", "New", "Modified", "Identical", "Uncollided", "Deleted (src)", "Deleted (dest)"
-        );
-        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) =
-            file_row
-        {
-            println!(
-                "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
-                "Files",
-                format_number(new_v),
-                format_number(mod_v),
-                format_number(identical_v),
-                format_number(uncollided_v),
-                format_number(deleted_src_v),
-                format_number(deleted_dest_v)
-            );
-        }
-        if let Some((new_v, mod_v, identical_v, uncollided_v, deleted_src_v, deleted_dest_v)) =
-            dir_row
-        {
-            println!(
-                "{:<5} | {:>10} | {:>10} | {:>10} | {:>10} | {:>13} | {:>14}",
-                "Dirs",
-                format_number(new_v),
-                format_number(mod_v),
-                format_number(identical_v),
-                format_number(uncollided_v),
-                format_number(deleted_src_v),
-                format_number(deleted_dest_v)
-            );
-        }
+        print_counts_table(file_row, dir_row);
     }
 
     println!();
@@ -6235,6 +7568,7 @@ fn real_main() -> i32 {
     let move_requires_material_action = is_move && !source_already_in_destination && !existing_same_name_target;
     let no_changes_planned = source_already_in_destination
         || ((planned_bytes == 0 && !has_itemized_changes && !overwrite_requires_action)
+            && !sync_delete_requires_action
             && !move_cleanup_only
             && !move_requires_material_action);
 
@@ -6242,6 +7576,13 @@ fn real_main() -> i32 {
         log(
             requested_mode,
             "Overwrite requested: destination conflict will be replaced.",
+            LogLevel::Info,
+        );
+    }
+    if sync_delete_requires_action && planned_bytes == 0 && !has_itemized_changes {
+        log(
+            requested_mode,
+            "Sync mode: destination-only entries will be deleted.",
             LogLevel::Info,
         );
     }
@@ -6380,6 +7721,7 @@ fn real_main() -> i32 {
                     ),
                     LogLevel::Info,
                 );
+                println!();
                 log_transfer_complete(requested_mode);
                 return 0;
             }
@@ -6436,6 +7778,7 @@ fn real_main() -> i32 {
         if backup_requested {
             if let Some(bsp) = &backup_source_path {
                 if overwrite_target_path.is_none() {
+                    println!();
                     if backup_source_kind == Some("file") {
                         log(
                             requested_mode,
@@ -6459,6 +7802,7 @@ fn real_main() -> i32 {
                             LogLevel::Info,
                         );
                     }
+                    println!();
                 }
             }
         }
@@ -6494,6 +7838,8 @@ fn real_main() -> i32 {
                         planned_bytes,
                         use_sudo,
                         false,
+                        args.sync_mode,
+                        !args.sync_mode,
                     ),
                     TransferBackend::Rust => run_rust_transfer(
                         &src_path,
@@ -6503,6 +7849,8 @@ fn real_main() -> i32 {
                         planned_bytes,
                         transfer_manifest.as_ref(),
                         media,
+                        args.replace_dest_symlink,
+                        args.merge_collision_policy,
                     ),
                 };
                 transferred_bytes_total += transfer.bytes_done;
@@ -6511,6 +7859,7 @@ fn real_main() -> i32 {
 
                 if rc_transfer == 0 || rc_transfer == 24 {
                     if backup_requested {
+                        println!();
                         log(
                             requested_mode,
                             &format!("Backing up existing directory: {}", otp.display()),
@@ -6528,6 +7877,7 @@ fn real_main() -> i32 {
                         } else {
                             return 1;
                         }
+                        println!();
                     } else {
                         log(
                             requested_mode,
@@ -6669,6 +8019,7 @@ fn real_main() -> i32 {
             }
 
             if backup_requested {
+                println!();
                 if overwrite_target_kind == Some("file") {
                     log(
                         requested_mode,
@@ -6698,6 +8049,7 @@ fn real_main() -> i32 {
                 } else {
                     return 1;
                 }
+                println!();
             } else {
                 if overwrite_target_kind == Some("file") {
                     log(
@@ -6715,6 +8067,39 @@ fn real_main() -> i32 {
                 if !remove_path_recursive(otp, use_sudo, requested_mode) {
                     return 1;
                 }
+            }
+        }
+
+        if is_move
+            && matches!(backend, TransferBackend::Rust)
+            && src_obj_kind == SrcObjKind::Dir
+            && contents_mode_requested
+            && matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting)
+            && !source_already_in_destination
+            && !use_sudo
+            && !backup_requested
+            && !overwrite_requires_action
+            && !overwrite_parent_from_child
+            && !overwrite_rename_dir_target
+            && !overwrite_replace_file_target
+        {
+            let rename_stats = premerge_fast_rename_noncolliding_children(
+                &src_mnt,
+                &dst_mnt,
+                transfer_manifest.as_mut(),
+            );
+            if rename_stats.moved_entries > 0 {
+                planned_bytes = planned_bytes.saturating_sub(rename_stats.removed_copy_bytes);
+                likely_cleanup_files = likely_cleanup_files.saturating_sub(rename_stats.moved_files);
+                likely_cleanup_bytes = likely_cleanup_bytes.saturating_sub(rename_stats.moved_bytes);
+                log(
+                    requested_mode,
+                    &format!(
+                        "Fast-path pre-merge rename: moved {} non-colliding entries directly into destination.",
+                        rename_stats.moved_entries
+                    ),
+                    LogLevel::Info,
+                );
             }
         }
 
@@ -6750,7 +8135,15 @@ fn real_main() -> i32 {
 
         let transfer = match backend {
             TransferBackend::Rsync => {
-                run_rsync_transfer(&src_path, &dst_path, planned_bytes, use_sudo, false)
+                run_rsync_transfer(
+                    &src_path,
+                    &dst_path,
+                    planned_bytes,
+                    use_sudo,
+                    false,
+                    args.sync_mode,
+                    !args.sync_mode,
+                )
             }
             TransferBackend::Rust => run_rust_transfer(
                 &src_path,
@@ -6760,6 +8153,8 @@ fn real_main() -> i32 {
                 planned_bytes,
                 transfer_manifest.as_ref(),
                 media,
+                args.replace_dest_symlink,
+                args.merge_collision_policy,
             ),
         };
         transferred_bytes_total += transfer.bytes_done;
@@ -6922,6 +8317,79 @@ fn format_number(n: u64) -> String {
     out
 }
 
+fn count_col_width(label: &str, values: &[u64]) -> usize {
+    let value_width = values
+        .iter()
+        .map(|v| format_number(*v).len())
+        .max()
+        .unwrap_or(1);
+    value_width.max(label.len())
+}
+
+fn print_counts_table(
+    file_row: Option<(u64, u64, u64, u64, u64, u64)>,
+    dir_row: Option<(u64, u64, u64, u64, u64, u64)>,
+) {
+    let mut new_vals = Vec::new();
+    let mut mod_vals = Vec::new();
+    let mut ident_vals = Vec::new();
+    let mut uncol_vals = Vec::new();
+    let mut del_src_vals = Vec::new();
+    let mut del_dst_vals = Vec::new();
+
+    for row in [file_row, dir_row].into_iter().flatten() {
+        new_vals.push(row.0);
+        mod_vals.push(row.1);
+        ident_vals.push(row.2);
+        uncol_vals.push(row.3);
+        del_src_vals.push(row.4);
+        del_dst_vals.push(row.5);
+    }
+
+    let type_w = 5usize;
+    let new_w = count_col_width("New", &new_vals);
+    let mod_w = count_col_width("Mod", &mod_vals);
+    let ident_w = count_col_width("Ident", &ident_vals);
+    let uncol_w = count_col_width("Uncol", &uncol_vals);
+    let del_src_w = count_col_width("Del(src)", &del_src_vals);
+    let del_dst_w = count_col_width("Del(dest)", &del_dst_vals);
+
+    println!(
+        "{:<type_w$} | {:>new_w$} | {:>mod_w$} | {:>ident_w$} | {:>uncol_w$} | {:>del_src_w$} | {:>del_dst_w$}",
+        "Type",
+        "New",
+        "Mod",
+        "Ident",
+        "Uncol",
+        "Del(src)",
+        "Del(dest)",
+    );
+    if let Some((new_v, mod_v, ident_v, uncol_v, del_src_v, del_dst_v)) = file_row {
+        println!(
+            "{:<type_w$} | {:>new_w$} | {:>mod_w$} | {:>ident_w$} | {:>uncol_w$} | {:>del_src_w$} | {:>del_dst_w$}",
+            "Files",
+            format_number(new_v),
+            format_number(mod_v),
+            format_number(ident_v),
+            format_number(uncol_v),
+            format_number(del_src_v),
+            format_number(del_dst_v),
+        );
+    }
+    if let Some((new_v, mod_v, ident_v, uncol_v, del_src_v, del_dst_v)) = dir_row {
+        println!(
+            "{:<type_w$} | {:>new_w$} | {:>mod_w$} | {:>ident_w$} | {:>uncol_w$} | {:>del_src_w$} | {:>del_dst_w$}",
+            "Dirs",
+            format_number(new_v),
+            format_number(mod_v),
+            format_number(ident_v),
+            format_number(uncol_v),
+            format_number(del_src_v),
+            format_number(del_dst_v),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7050,6 +8518,8 @@ Host dev-*
             &dst_file.display().to_string(),
             DstObjKind::File,
             false,
+            false,
+            MergeCollisionPolicy::Default,
         );
         assert_eq!(ps.uncollided_files, 1);
     }
