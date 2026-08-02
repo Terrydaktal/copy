@@ -62,11 +62,50 @@ class CopyCliIntegrationTests(unittest.TestCase):
         self.assertIn("-c, --contents-only", out)
         self.assertIn("--verbose", out)
         self.assertIn("--showall", out)
-        self.assertIn("--dest-wins", out)
-        self.assertIn("--source-wins", out)
-        self.assertIn("--source-wins-if-larger", out)
-        self.assertIn("--source-wins-if-newer-or-larger", out)
+        self.assertIn("--collision policy", out)
+        self.assertIn("Default: source:size-differs", out)
+        self.assertIn("--collision source:newer,larger", out)
+        self.assertIn("--collision dest:newer+larger", out)
         self.assertIn("--sync", out)
+
+    def test_preview_shows_policy_independent_file_relation_breakdown(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst" / "A"
+
+            write_file(src / "same.txt", "same\n")
+            write_file(dst / "same.txt", "same\n")
+            same_ts = 1_700_000_000
+            os.utime(src / "same.txt", (same_ts, same_ts))
+            os.utime(dst / "same.txt", (same_ts, same_ts))
+
+            write_file(src / "newer_same_size.txt", "same-size\n")
+            write_file(dst / "newer_same_size.txt", "same-size\n")
+            older = 1_700_000_010
+            newer = older + 100
+            os.utime(src / "newer_same_size.txt", (newer, newer))
+            os.utime(dst / "newer_same_size.txt", (older, older))
+
+            write_file(src / "newer_larger.txt", "source-is-larger\n")
+            write_file(dst / "newer_larger.txt", "dst\n")
+            os.utime(src / "newer_larger.txt", (newer + 100, newer + 100))
+            os.utime(dst / "newer_larger.txt", (older + 50, older + 50))
+
+            rc, out, _ = run_copy(
+                [str(src), str(dst), "-c", "--preview", "--collision", "dest:always"],
+            )
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Time=Size=", out)
+            self.assertIn("Time+Size=", out)
+            self.assertIn("Time+Size+", out)
+            self.assertRegex(
+                out,
+                r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0",
+            )
+            self.assertRegex(
+                out,
+                r"Files\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*0\s+\|\s*1\s+\|\s*0\s+\|\s*0",
+                )
 
     def test_copy_fails_preflight_when_destination_space_is_insufficient(self):
         with tempfile.TemporaryDirectory() as td:
@@ -355,6 +394,23 @@ class CopyCliIntegrationTests(unittest.TestCase):
             )
             self.assertEqual((dst / "scripts" / "a.sh").read_text(encoding="utf-8"), "echo hi\n")
             self.assertEqual((dst / "keep.txt").read_text(encoding="utf-8"), "keep\n")
+
+    def test_move_current_directory_into_existing_child_uses_contents_semantics(self):
+        with tempfile.TemporaryDirectory() as td:
+            videos = Path(td) / "Videos"
+            videos.mkdir(parents=True, exist_ok=True)
+            write_file(videos / "clip1.mkv", "one\n")
+            write_file(videos / "clip2.mkv", "two\n")
+            write_file(videos / "obs" / "keep.txt", "keep\n")
+
+            rc, out, _ = run_copy(["--move", ".", "obs"], cwd=videos, confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertFalse((videos / "clip1.mkv").exists(), out)
+            self.assertFalse((videos / "clip2.mkv").exists(), out)
+            self.assertTrue((videos / "obs" / "clip1.mkv").exists(), out)
+            self.assertTrue((videos / "obs" / "clip2.mkv").exists(), out)
+            self.assertTrue((videos / "obs" / "keep.txt").exists(), out)
+            self.assertFalse((videos / "obs" / "obs").exists(), out)
 
     def test_move_merge_identical_destination_still_removes_source(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1000,7 +1056,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(dst / "same.txt", "destination-version\n")
 
             rc, out, _ = run_copy(
-                [str(src), str(dst), "-c", "--dest-wins"],
+                [str(src), str(dst), "-c", "--collision", "dest:always"],
                 confirm=True,
             )
             self.assertEqual(rc, 0, out)
@@ -1016,7 +1072,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(dst / "same.txt", "destination-version\n")
 
             rc, out, _ = run_copy(
-                [str(src), str(dst), "-c", "--source-wins"],
+                [str(src), str(dst), "-c", "--collision", "source:always"],
                 confirm=True,
             )
             self.assertEqual(rc, 0, out)
@@ -1031,7 +1087,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(dst_larger / "same.txt", "dst\n")
 
             rc, out, _ = run_copy(
-                [str(src_larger), str(dst_larger), "-c", "--source-wins-if-larger"],
+                [str(src_larger), str(dst_larger), "-c", "--collision", "source:larger"],
                 confirm=True,
             )
             self.assertEqual(rc, 0, out)
@@ -1044,7 +1100,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(dst_smaller / "same.txt", "destination-is-larger\n")
 
             rc, out, _ = run_copy(
-                [str(src_smaller), str(dst_smaller), "-c", "--source-wins-if-larger"],
+                [str(src_smaller), str(dst_smaller), "-c", "--collision", "source:larger"],
                 confirm=True,
             )
             self.assertEqual(rc, 0, out)
@@ -1064,7 +1120,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
             os.utime(src_file, (newer, newer))
 
             rc, out, _ = run_copy(
-                [str(src), str(dst), "-c", "--source-wins-if-newer-or-larger"],
+                [str(src), str(dst), "-c", "--collision", "source:newer,larger"],
                 confirm=True,
             )
             self.assertEqual(rc, 0, out)

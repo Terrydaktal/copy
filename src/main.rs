@@ -45,14 +45,50 @@ enum TransferMode {
     Move,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollisionWinner {
+    Source,
+    Dest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollisionCombineMode {
+    Any,
+    All,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum MergeCollisionPolicy {
-    #[default]
-    Default,
-    DestWins,
-    SourceWins,
-    SourceWinsIfLarger,
-    SourceWinsIfNewerOrLarger,
+struct CollisionPredicates {
+    always: bool,
+    newer: bool,
+    larger: bool,
+    size_differs: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MergeCollisionPolicy {
+    winner: CollisionWinner,
+    combine: CollisionCombineMode,
+    predicates: CollisionPredicates,
+}
+
+impl Default for MergeCollisionPolicy {
+    fn default() -> Self {
+        Self {
+            winner: CollisionWinner::Source,
+            combine: CollisionCombineMode::Any,
+            predicates: CollisionPredicates {
+                size_differs: true,
+                ..CollisionPredicates::default()
+            },
+        }
+    }
+}
+
+impl MergeCollisionPolicy {
+    fn requires_mtime(self) -> bool {
+        self.predicates.newer
+    }
 }
 
 impl TransferMode {
@@ -163,6 +199,52 @@ struct PreScan {
     source_display_paths: FxHashSet<String>,
     has_itemized_changes: bool,
     transfer_manifest: Option<TransferManifest>,
+    file_relation_breakdown: FileRelationBreakdown,
+}
+
+#[derive(Default, Clone, Copy)]
+struct FileRelationBreakdown {
+    same_time_same_size: u64,
+    same_time_source_larger: u64,
+    same_time_source_smaller: u64,
+    same_size_source_newer: u64,
+    same_size_source_older: u64,
+    source_older_smaller: u64,
+    source_older_larger: u64,
+    source_newer_smaller: u64,
+    source_newer_larger: u64,
+}
+
+impl FileRelationBreakdown {
+    fn add_assign(&mut self, other: Self) {
+        self.same_time_same_size = self
+            .same_time_same_size
+            .saturating_add(other.same_time_same_size);
+        self.same_time_source_larger = self
+            .same_time_source_larger
+            .saturating_add(other.same_time_source_larger);
+        self.same_time_source_smaller = self
+            .same_time_source_smaller
+            .saturating_add(other.same_time_source_smaller);
+        self.same_size_source_newer = self
+            .same_size_source_newer
+            .saturating_add(other.same_size_source_newer);
+        self.same_size_source_older = self
+            .same_size_source_older
+            .saturating_add(other.same_size_source_older);
+        self.source_older_smaller = self
+            .source_older_smaller
+            .saturating_add(other.source_older_smaller);
+        self.source_older_larger = self
+            .source_older_larger
+            .saturating_add(other.source_older_larger);
+        self.source_newer_smaller = self
+            .source_newer_smaller
+            .saturating_add(other.source_newer_smaller);
+        self.source_newer_larger = self
+            .source_newer_larger
+            .saturating_add(other.source_newer_larger);
+    }
 }
 
 impl Default for PreScan {
@@ -183,6 +265,7 @@ impl Default for PreScan {
             source_display_paths: FxHashSet::default(),
             has_itemized_changes: false,
             transfer_manifest: None,
+            file_relation_breakdown: FileRelationBreakdown::default(),
         }
     }
 }
@@ -342,19 +425,68 @@ fn log(mode: TransferMode, msg: &str, level: LogLevel) {
     }
 }
 
-fn set_merge_collision_policy(
-    args: &mut CliArgs,
-    policy: MergeCollisionPolicy,
-) -> Result<(), i32> {
-    if args.merge_collision_policy != MergeCollisionPolicy::Default
+fn set_merge_collision_policy(args: &mut CliArgs, policy: MergeCollisionPolicy) -> Result<(), i32> {
+    if args.merge_collision_policy != MergeCollisionPolicy::default()
         && args.merge_collision_policy != policy
     {
         usage();
-        eprintln!("copy: error: collision policy flags are mutually exclusive");
+        eprintln!("copy: error: collision policy options are mutually exclusive");
         return Err(1);
     }
     args.merge_collision_policy = policy;
     Ok(())
+}
+
+fn parse_merge_collision_policy(raw: &str) -> Result<MergeCollisionPolicy, String> {
+    let (winner_raw, expr_raw) = raw
+        .split_once(':')
+        .ok_or_else(|| "expected winner:rule".to_string())?;
+    let winner = match winner_raw {
+        "source" => CollisionWinner::Source,
+        "dest" => CollisionWinner::Dest,
+        _ => return Err("winner must be 'source' or 'dest'".to_string()),
+    };
+    if expr_raw.is_empty() {
+        return Err("collision rule cannot be empty".to_string());
+    }
+    if expr_raw.contains(',') && expr_raw.contains('+') {
+        return Err(
+            "use either ',' (or) or '+' (and), not both, in one --collision rule".to_string(),
+        );
+    }
+    let combine = if expr_raw.contains('+') {
+        CollisionCombineMode::All
+    } else {
+        CollisionCombineMode::Any
+    };
+    let splitter = if matches!(combine, CollisionCombineMode::All) {
+        '+'
+    } else {
+        ','
+    };
+    let mut predicates = CollisionPredicates::default();
+    for token in expr_raw.split(splitter) {
+        match token.trim() {
+            "always" => predicates.always = true,
+            "newer" => predicates.newer = true,
+            "larger" => predicates.larger = true,
+            "size-differs" => predicates.size_differs = true,
+            "" => return Err("collision rule contains an empty condition".to_string()),
+            other => {
+                return Err(format!(
+                    "unknown collision condition '{other}'; expected always, newer, larger, or size-differs"
+                ))
+            }
+        }
+    }
+    if !predicates.always && !predicates.newer && !predicates.larger && !predicates.size_differs {
+        return Err("collision rule must contain at least one condition".to_string());
+    }
+    Ok(MergeCollisionPolicy {
+        winner,
+        combine,
+        predicates,
+    })
 }
 
 fn regular_file_collision_change(
@@ -365,72 +497,150 @@ fn regular_file_collision_change(
     dst_size: Option<u64>,
     dst_mtime: Option<SystemTime>,
 ) -> Option<ChangeKind> {
-    match policy {
-        MergeCollisionPolicy::DestWins => {
-            if dst_exists {
-                None
-            } else {
-                Some(ChangeKind::NewFile)
-            }
-        }
-        MergeCollisionPolicy::SourceWins => {
-            if dst_exists {
-                Some(ChangeKind::ModFile)
-            } else {
-                Some(ChangeKind::NewFile)
-            }
-        }
-        MergeCollisionPolicy::SourceWinsIfLarger => {
-            if !dst_exists {
-                Some(ChangeKind::NewFile)
-            } else if let Some(dst_size) = dst_size {
-                if src_size > dst_size {
-                    Some(ChangeKind::ModFile)
-                } else {
-                    None
-                }
-            } else {
-                Some(ChangeKind::ModFile)
-            }
-        }
-        MergeCollisionPolicy::SourceWinsIfNewerOrLarger => {
-            if !dst_exists {
-                Some(ChangeKind::NewFile)
-            } else if dst_size.is_none() || dst_mtime.is_none() || src_mtime.is_none() {
-                Some(ChangeKind::ModFile)
-            } else if let Some(dst_size) = dst_size {
-                if src_size > dst_size {
-                    Some(ChangeKind::ModFile)
-                } else if src_mtime > dst_mtime {
-                    Some(ChangeKind::ModFile)
-                } else {
-                    None
-                }
-            } else {
-                Some(ChangeKind::ModFile)
-            }
-        }
-        MergeCollisionPolicy::Default => {
-            if !dst_exists {
-                Some(ChangeKind::NewFile)
-            } else if let Some(dst_size) = dst_size {
-                if dst_size == src_size {
-                    None
-                } else {
-                    Some(ChangeKind::ModFile)
-                }
-            } else {
-                Some(ChangeKind::ModFile)
-            }
-        }
+    if !dst_exists {
+        return Some(ChangeKind::NewFile);
     }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PredicateResult {
+        True,
+        False,
+        Unknown,
+    }
+
+    let eval_always = if policy.predicates.always {
+        Some(PredicateResult::True)
+    } else {
+        None
+    };
+    let eval_newer = if policy.predicates.newer {
+        Some(match (src_mtime, dst_mtime) {
+            (Some(src), Some(dst)) => {
+                if src > dst {
+                    PredicateResult::True
+                } else {
+                    PredicateResult::False
+                }
+            }
+            _ => PredicateResult::Unknown,
+        })
+    } else {
+        None
+    };
+    let eval_larger = if policy.predicates.larger {
+        Some(match dst_size {
+            Some(dst) => match policy.winner {
+                CollisionWinner::Source => {
+                    if src_size > dst {
+                        PredicateResult::True
+                    } else {
+                        PredicateResult::False
+                    }
+                }
+                CollisionWinner::Dest => {
+                    if dst > src_size {
+                        PredicateResult::True
+                    } else {
+                        PredicateResult::False
+                    }
+                }
+            },
+            None => PredicateResult::Unknown,
+        })
+    } else {
+        None
+    };
+    let eval_size_differs = if policy.predicates.size_differs {
+        Some(match dst_size {
+            Some(dst) => {
+                if src_size != dst {
+                    PredicateResult::True
+                } else {
+                    PredicateResult::False
+                }
+            }
+            None => PredicateResult::Unknown,
+        })
+    } else {
+        None
+    };
+
+    let predicate_results = [eval_always, eval_newer, eval_larger, eval_size_differs];
+    let match_selected_winner = match policy.combine {
+        CollisionCombineMode::Any => {
+            if predicate_results
+                .iter()
+                .flatten()
+                .any(|r| matches!(r, PredicateResult::True))
+            {
+                true
+            } else {
+                predicate_results
+                    .iter()
+                    .flatten()
+                    .any(|r| matches!(r, PredicateResult::Unknown))
+            }
+        }
+        CollisionCombineMode::All => {
+            if predicate_results
+                .iter()
+                .flatten()
+                .any(|r| matches!(r, PredicateResult::False))
+            {
+                false
+            } else {
+                true
+            }
+        }
+    };
+
+    let source_wins = match_selected_winner == matches!(policy.winner, CollisionWinner::Source);
+    if source_wins {
+        Some(ChangeKind::ModFile)
+    } else {
+        None
+    }
+}
+
+fn classify_file_relation(
+    src_size: u64,
+    src_mtime: Option<SystemTime>,
+    dst_size: Option<u64>,
+    dst_mtime: Option<SystemTime>,
+) -> Option<FileRelationBreakdown> {
+    let dst_size = dst_size?;
+    let src_mtime = src_mtime?;
+    let dst_mtime = dst_mtime?;
+    let mut out = FileRelationBreakdown::default();
+    match src_mtime.cmp(&dst_mtime) {
+        std::cmp::Ordering::Equal => match src_size.cmp(&dst_size) {
+            std::cmp::Ordering::Equal => out.same_time_same_size = 1,
+            std::cmp::Ordering::Greater => out.same_time_source_larger = 1,
+            std::cmp::Ordering::Less => out.same_time_source_smaller = 1,
+        },
+        std::cmp::Ordering::Greater => match src_size.cmp(&dst_size) {
+            std::cmp::Ordering::Equal => out.same_size_source_newer = 1,
+            std::cmp::Ordering::Greater => out.source_newer_larger = 1,
+            std::cmp::Ordering::Less => out.source_newer_smaller = 1,
+        },
+        std::cmp::Ordering::Less => match src_size.cmp(&dst_size) {
+            std::cmp::Ordering::Equal => out.same_size_source_older = 1,
+            std::cmp::Ordering::Greater => out.source_older_larger = 1,
+            std::cmp::Ordering::Less => out.source_older_smaller = 1,
+        },
+    }
+    Some(out)
 }
 
 fn log_transfer_complete(mode: TransferMode) {
     if matches!(mode, TransferMode::Copy) {
         println!();
     }
-    log(mode, &format!("{} complete.", mode.word_cap()), LogLevel::Info);
+    log(
+        mode,
+        &format!("{} complete.", mode.word_cap()),
+        LogLevel::Info,
+    );
     if matches!(mode, TransferMode::Copy) {
         println!();
     }
@@ -490,10 +700,29 @@ fn print_transfer_columns_header() {
 }
 
 fn terminal_columns() -> usize {
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v >= 40)
+    fn tty_columns_from_fd(fd: i32) -> Option<usize> {
+        let mut ws = nix::libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let rc = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col >= 40 {
+            Some(ws.ws_col as usize)
+        } else {
+            None
+        }
+    }
+
+    tty_columns_from_fd(io::stdout().as_raw_fd())
+        .or_else(|| tty_columns_from_fd(io::stderr().as_raw_fd()))
+        .or_else(|| {
+            env::var("COLUMNS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|v| *v >= 40)
+        })
         .unwrap_or(120)
 }
 
@@ -572,213 +801,213 @@ fn option_u64_saturating_add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-fn transfer_eta_s(done: Option<u64>, total: u64, bps: Option<f64>) -> Option<f64> {
-    if total == 0 {
-        return None;
-    }
-    let done = done?;
-    let bps = bps?;
-    if bps <= 0.0 {
-        return None;
-    }
-    let remain = total.saturating_sub(done.min(total));
-    Some(remain as f64 / bps)
-}
-
 #[derive(Default)]
-struct EtaSmootherState {
-    key: String,
+struct TransferEtaEstimator {
     samples: VecDeque<(f64, u64)>,
-    display_eta_s: Option<f64>,
+    display_finish_s: Option<f64>,
     last_elapsed_s: Option<f64>,
-    slowdown_since_s: Option<f64>,
+    last_done: Option<u64>,
+    regime_start_s: f64,
+    reference_bps: Option<f64>,
+    slowdown_since_s: Option<(f64, f64)>,
+    zero_progress_s: f64,
 }
 
-fn eta_smoother_state() -> &'static Mutex<EtaSmootherState> {
-    static STATE: OnceLock<Mutex<EtaSmootherState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(EtaSmootherState::default()))
-}
-
-fn quantize_eta_s(eta_s: f64) -> f64 {
-    eta_s.max(0.0).round()
-}
-
-fn ew_regression_speed_bps(samples: &VecDeque<(f64, u64)>, now_t: f64, tau_s: f64) -> Option<f64> {
-    if samples.len() < 2 || !tau_s.is_finite() || tau_s <= 0.0 {
-        return None;
-    }
-
-    let mut sw = 0.0;
-    let mut swt = 0.0;
-    let mut swx = 0.0;
-    for (t, bytes) in samples {
-        let age = (now_t - *t).max(0.0);
-        let w = (-age / tau_s).exp();
-        sw += w;
-        swt += w * *t;
-        swx += w * (*bytes as f64);
-    }
-    if sw <= 0.0 {
-        return None;
-    }
-    let t_bar = swt / sw;
-    let x_bar = swx / sw;
-
-    let mut num = 0.0;
-    let mut den = 0.0;
-    for (t, bytes) in samples {
-        let age = (now_t - *t).max(0.0);
-        let w = (-age / tau_s).exp();
-        let dt = *t - t_bar;
-        let dx = (*bytes as f64) - x_bar;
-        num += w * dt * dx;
-        den += w * dt * dt;
-    }
-    if den <= 1e-12 {
-        return None;
-    }
-    let v_hat = num / den;
-    if v_hat.is_finite() && v_hat > 0.0 {
-        Some(v_hat)
-    } else {
-        None
-    }
-}
-
-fn smoothed_transfer_eta_s(
-    phase_label: &str,
-    done: Option<u64>,
-    total: u64,
-    instant_bps: Option<f64>,
-    elapsed_s: f64,
-    finalize_line: bool,
+fn rate_over_window(
+    samples: &VecDeque<(f64, u64)>,
+    start_s: f64,
+    now_s: f64,
+    window_s: f64,
 ) -> Option<f64> {
-    if total == 0 {
+    let cutoff_s = (now_s - window_s).max(start_s);
+    let mut first: Option<(f64, u64)> = None;
+    for &(t, bytes) in samples.iter().filter(|(t, _)| *t >= start_s) {
+        if t <= cutoff_s {
+            first = Some((t, bytes));
+        } else if first.is_none() {
+            first = Some((t, bytes));
+            break;
+        } else {
+            break;
+        }
+    }
+    let last = samples.iter().rev().find(|(t, _)| *t >= start_s).copied()?;
+    let first = first?;
+    let dt = last.0 - first.0;
+    if dt <= 1e-6 {
         return None;
     }
-    let done = done?;
-    let done_clamped = done.min(total);
-    let remain = total.saturating_sub(done_clamped);
-    if remain == 0 {
-        return Some(0.0);
+    Some(last.1.saturating_sub(first.1) as f64 / dt)
+}
+
+fn median_rate(rates: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
+    let mut values: Vec<f64> = rates
+        .into_iter()
+        .flatten()
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .collect();
+    if values.is_empty() {
+        return None;
     }
+    values.sort_by(f64::total_cmp);
+    Some(values[values.len() / 2])
+}
 
-    let key = format!("{phase_label}:{total}");
-    if let Ok(mut st) = eta_smoother_state().lock() {
-        if st.key != key || st.last_elapsed_s.map(|v| elapsed_s < v).unwrap_or(false) {
-            st.key = key.clone();
-            st.samples.clear();
-            st.display_eta_s = None;
-            st.last_elapsed_s = None;
-            st.slowdown_since_s = None;
+impl TransferEtaEstimator {
+    fn update(
+        &mut self,
+        done: Option<u64>,
+        total: u64,
+        instant_bps: Option<f64>,
+        elapsed_s: f64,
+        finalize_line: bool,
+    ) -> Option<f64> {
+        let done = done?;
+        if total == 0 {
+            return None;
+        }
+        let done_clamped = done.min(total);
+        let remain = total.saturating_sub(done_clamped);
+        if remain == 0 {
+            return Some(0.0);
         }
 
-        if st
-            .samples
-            .back()
-            .map(|(t, b)| *t != elapsed_s || *b != done_clamped)
-            .unwrap_or(true)
-        {
-            st.samples.push_back((elapsed_s, done_clamped));
-        }
-        const REGRESSION_WINDOW_S: f64 = 120.0;
-        while st
-            .samples
-            .front()
-            .map(|(t, _)| elapsed_s - *t > REGRESSION_WINDOW_S)
+        if self
+            .last_elapsed_s
+            .map(|previous| elapsed_s < previous)
             .unwrap_or(false)
         {
-            st.samples.pop_front();
+            *self = Self::default();
+        }
+        let dt = self
+            .last_elapsed_s
+            .map(|previous| (elapsed_s - previous).max(0.0))
+            .unwrap_or(0.0);
+        if self.last_done == Some(done_clamped) {
+            self.zero_progress_s += dt;
+        } else {
+            self.zero_progress_s = 0.0;
+        }
+        self.last_elapsed_s = Some(elapsed_s);
+        self.last_done = Some(done_clamped);
+
+        if self
+            .samples
+            .back()
+            .map(|(t, bytes)| *t != elapsed_s || *bytes != done_clamped)
+            .unwrap_or(true)
+        {
+            self.samples.push_back((elapsed_s, done_clamped));
+        }
+        const SAMPLE_RETENTION_S: f64 = 45.0;
+        while self
+            .samples
+            .front()
+            .map(|(t, _)| elapsed_s - *t > SAMPLE_RETENTION_S)
+            .unwrap_or(false)
+        {
+            self.samples.pop_front();
         }
 
-        const TAU_S: f64 = 45.0;
-        let sample_span_s = match (st.samples.front(), st.samples.back()) {
+        if self.zero_progress_s > 0.0 {
+            if let Some(finish) = &mut self.display_finish_s {
+                *finish += dt;
+                if self.zero_progress_s >= 5.0 {
+                    return None;
+                }
+                return Some((*finish - elapsed_s).max(0.0).round());
+            }
+        }
+
+        const WARMUP_S: f64 = 5.0;
+        let sample_span_s = match (self.samples.front(), self.samples.back()) {
             (Some((first_t, _)), Some((last_t, _))) => (last_t - first_t).max(0.0),
             _ => 0.0,
         };
-        const ETA_WARMUP_S: f64 = 5.0;
-        if st.display_eta_s.is_none() && sample_span_s < ETA_WARMUP_S {
-            st.last_elapsed_s = Some(elapsed_s);
+        let recent_rate = rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 1.2)
+            .or_else(|| instant_bps.filter(|rate| rate.is_finite() && *rate > 0.0));
+
+        if self.reference_bps.is_none() && sample_span_s >= WARMUP_S {
+            self.reference_bps = median_rate([
+                rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 2.5),
+                rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 5.0),
+            ]);
+        }
+
+        let mut regime_changed = false;
+        if let (Some(reference), Some(recent)) = (self.reference_bps, recent_rate) {
+            let ratio = recent / reference.max(1e-6);
+            let candidate = if ratio < 0.125 {
+                Some(1.2)
+            } else if ratio < 0.60 {
+                Some(2.5)
+            } else {
+                None
+            };
+            if let Some(confirm_after_s) = candidate {
+                if self.slowdown_since_s.is_none() {
+                    self.slowdown_since_s = Some((elapsed_s, confirm_after_s));
+                }
+                if self
+                    .slowdown_since_s
+                    .map(|(started, required)| elapsed_s - started >= required)
+                    .unwrap_or(false)
+                {
+                    self.regime_start_s = (elapsed_s - confirm_after_s).max(0.0);
+                    self.reference_bps = Some(recent.max(1.0));
+                    self.slowdown_since_s = None;
+                    regime_changed = true;
+                }
+            } else {
+                self.slowdown_since_s = None;
+                if recent.is_finite() && recent > 0.0 {
+                    self.reference_bps = Some(reference * 0.98 + recent * 0.02);
+                }
+            }
+        }
+
+        if self.zero_progress_s >= 5.0 {
+            return None;
+        }
+        if self.zero_progress_s >= 1.5 {
+            if let Some(finish) = &mut self.display_finish_s {
+                *finish += dt;
+                return Some((*finish - elapsed_s).max(0.0).round());
+            }
             return None;
         }
 
-        let reg_bps = if sample_span_s >= 3.0 {
-            ew_regression_speed_bps(&st.samples, elapsed_s, TAU_S)
-        } else {
-            None
+        let current_rate = median_rate([
+            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 1.2),
+            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 2.5),
+            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 5.0),
+        ])
+        .or_else(|| recent_rate.filter(|rate| *rate > 0.0));
+        let rate = match current_rate {
+            Some(rate) if rate.is_finite() && rate > 0.0 => rate,
+            _ if sample_span_s < WARMUP_S => return None,
+            _ => return None,
         };
-        let avg_bps = if elapsed_s > 0.25 && done_clamped > 0 {
-            Some(done_clamped as f64 / elapsed_s.max(1e-6))
-        } else {
-            None
-        };
-        let speed_bps = match (reg_bps, avg_bps, instant_bps) {
-            (Some(r), Some(a), _) => Some((r * 0.80) + (a * 0.20)),
-            (Some(r), None, Some(i)) if i > 0.0 => Some((r * 0.85) + (i * 0.15)),
-            (Some(r), _, _) => Some(r),
-            (None, Some(a), Some(i)) if i > 0.0 => Some((a * 0.80) + (i * 0.20)),
-            (None, Some(a), _) => Some(a),
-            (None, None, Some(i)) if i > 0.0 => Some(i),
-            _ => None,
-        }?;
-        let raw_eta = transfer_eta_s(Some(done_clamped), total, Some(speed_bps))?;
-
-        let dt = st
-            .last_elapsed_s
-            .map(|prev| (elapsed_s - prev).max(0.0))
-            .unwrap_or(0.0);
-        st.last_elapsed_s = Some(elapsed_s);
-
-        let next_eta = if let Some(prev_display) = st.display_eta_s {
-            let countdown = (prev_display - dt).max(0.0);
-            let margin = (0.10 * countdown).max(15.0);
-            if raw_eta < countdown {
-                let down_alpha = if dt > 0.0 {
-                    1.0 - (-dt / 5.0).exp()
-                } else {
-                    0.0
-                };
-                st.slowdown_since_s = None;
-                countdown + down_alpha * (raw_eta - countdown)
-            } else if raw_eta <= countdown + margin {
-                st.slowdown_since_s = None;
-                countdown
+        let model_finish_s = elapsed_s + remain as f64 / rate;
+        if self.display_finish_s.is_none() || regime_changed {
+            self.display_finish_s = Some(model_finish_s);
+        } else if let Some(finish) = &mut self.display_finish_s {
+            let alpha = if dt > 0.0 {
+                1.0 - (-dt / 2.0).exp()
             } else {
-                if st.slowdown_since_s.is_none() {
-                    st.slowdown_since_s = Some(elapsed_s);
-                }
-                let sustained = st
-                    .slowdown_since_s
-                    .map(|start| (elapsed_s - start) >= 5.0)
-                    .unwrap_or(false);
-                if sustained {
-                    let up_alpha = if dt > 0.0 {
-                        1.0 - (-dt / 30.0).exp()
-                    } else {
-                        0.0
-                    };
-                    countdown + up_alpha * (raw_eta - countdown)
-                } else {
-                    countdown
-                }
-            }
-        } else {
-            raw_eta
-        };
-
-        st.display_eta_s = Some(next_eta.max(0.0));
-        let out = st.display_eta_s.map(quantize_eta_s);
-        if finalize_line {
-            st.key.clear();
-            st.samples.clear();
-            st.display_eta_s = None;
-            st.last_elapsed_s = None;
-            st.slowdown_since_s = None;
+                0.0
+            };
+            *finish += alpha * (model_finish_s - *finish);
         }
-        return out;
-    }
 
-    transfer_eta_s(Some(done_clamped), total, instant_bps).map(quantize_eta_s)
+        let result = self
+            .display_finish_s
+            .map(|finish| (finish - elapsed_s).max(0.0).round());
+        if finalize_line {
+            *self = Self::default();
+        }
+        result
+    }
 }
 
 #[derive(Default)]
@@ -801,6 +1030,7 @@ fn print_transfer_progress_bars(
     rates: TransferProgressRates,
     proc_totals_delta: ProcIoDeltas,
     device_totals_delta: DeviceIoDeltas,
+    eta_estimator: Option<&mut TransferEtaEstimator>,
     finalize_line: bool,
     flushing: bool,
 ) {
@@ -816,14 +1046,17 @@ fn print_transfer_progress_bars(
     } else {
         None
     };
-    let eta = smoothed_transfer_eta_s(
-        phase_label,
-        done,
-        planned_bytes,
-        rates.write_all_bps,
-        elapsed_s,
-        finalize_line,
-    );
+    let eta = match eta_estimator {
+        Some(estimator) => estimator.update(
+            done,
+            planned_bytes,
+            rates.write_all_bps,
+            elapsed_s,
+            finalize_line,
+        ),
+        None if done.map(|value| value >= planned_bytes).unwrap_or(false) => Some(0.0),
+        None => None,
+    };
 
     let transfer_total = done;
     let transfer_rate = rates.write_all_bps;
@@ -1157,6 +1390,14 @@ fn top_level_rel_component(rel: &str) -> Option<&str> {
     }
 }
 
+fn rel_matches_prefix(rel: &str, prefix: &str) -> bool {
+    rel == prefix
+        || rel
+            .strip_prefix(prefix)
+            .map(|suffix| suffix.starts_with('/'))
+            .unwrap_or(false)
+}
+
 #[derive(Default, Clone, Copy)]
 struct PreMergeFastRenameStats {
     moved_entries: u64,
@@ -1169,6 +1410,7 @@ fn premerge_fast_rename_noncolliding_children(
     src_root: &Path,
     dst_root: &Path,
     manifest: Option<&mut TransferManifest>,
+    exclude_top_level_name: Option<&str>,
 ) -> PreMergeFastRenameStats {
     if !src_root.is_dir() || !dst_root.is_dir() {
         return PreMergeFastRenameStats::default();
@@ -1188,6 +1430,9 @@ fn premerge_fast_rename_noncolliding_children(
             Some(n) => n.to_string_lossy().to_string(),
             None => continue,
         };
+        if exclude_top_level_name == Some(name.as_str()) {
+            continue;
+        }
         let dst_child = dst_root.join(&name);
         if dst_child.exists() || src_child == dst_child {
             continue;
@@ -2255,7 +2500,9 @@ fn print_help() {
     println!("  -h, --help            show this help message and exit");
     println!("  -m, --move            Move mode: transfer then remove source data (equivalent to move behavior).");
     println!("  -s, --sudo            Run transfer commands with sudo");
-    println!("  -o, --overwrite       Replace the destination target itself instead of merging it.");
+    println!(
+        "  -o, --overwrite       Replace the destination target itself instead of merging it."
+    );
     println!("                        This does not control file-vs-file collisions inside a merged folder.");
     println!("  -c, --contents-only   Transfer source directory children into destination (like source/*; do not nest source basename).");
     println!("                        In --move mode, source directories are removed if they become empty.");
@@ -2264,22 +2511,21 @@ fn print_help() {
     println!("                        Merge/sync semantics; not target replacement semantics like --overwrite.");
     println!("  -v, --verbose, --showall");
     println!("                        Show full preview tree (new, modified, identical, uncollided, deleted).");
-    println!("  --dest-wins");
-    println!("                        Keep destination files when a merged-folder path collides.");
-    println!("                        Merge the folder, but preserve the destination copy at that path.");
-    println!("  --source-wins");
-    println!("                        Replace destination files when a merged-folder path collides.");
-    println!("                        Merge the folder, but always copy the source file over the destination.");
-    println!("  --source-wins-if-larger");
-    println!("                        Replace destination files only when the source file is larger.");
-    println!("                        Merge the folder, and only treat larger source files as changes.");
-    println!("  --source-wins-if-newer-or-larger");
-    println!("                        Replace destination files when the source file is newer or larger.");
-    println!("                        Merge the folder, and treat newer or larger source files as changes.");
+    println!("  --collision policy   Collision policy for file-vs-file conflicts inside local Rust merges.");
+    println!("                        Syntax: winner:conditions");
+    println!("                        winner: source | dest");
+    println!("                        conditions: always | newer | larger | size-differs");
+    println!("                        Use ',' for OR and '+' for AND.");
+    println!("                        Default: source:size-differs");
+    println!("                        Examples: --collision source:always");
+    println!("                                  --collision source:newer,larger");
+    println!("                                  --collision dest:newer+larger");
     println!("  -L depth              Max depth of preview tree (default: auto-fit deepest level within 27 lines, up to 20).");
     println!("  -T trunc              Max entries per folder before truncation (default: 25).");
     println!("  --replace-dest-symlink");
-    println!("                        Replace a destination symlink itself instead of following it.");
+    println!(
+        "                        Replace a destination symlink itself instead of following it."
+    );
     println!("  --preview             Run preview only (no prompt, no transfer).");
     println!("  --preview-lite        Faster preview-only mode; skips exact byte scan on brand-new destination trees.");
     println!();
@@ -2315,25 +2561,15 @@ What is S?
   |    |   create file at T
   |    +-- existing file
   |    |   apply file collision policy:
-  |    |     --dest-wins
-  |    |       keep T
-  |    |       do not copy S
-  |    |       no backup
-  |    |     --source-wins
-  |    |       if -b: back up T
-  |    |       replace T with S
-  |    |     --source-wins-if-larger
-  |    |       if size(S) > size(T):
-  |    |         if -b: back up T
+  |    |     default: --collision source:size-differs
+  |    |       if size(S) != size(T):
   |    |         replace T with S
   |    |       else:
   |    |         keep T
-  |    |     --source-wins-if-newer-or-larger
-  |    |       if mtime(S) > mtime(T) OR size(S) > size(T):
-  |    |         if -b: back up T
-  |    |         replace T with S
-  |    |       else:
-  |    |         keep T
+  |    |     other examples:
+  |    |       --collision source:always
+  |    |       --collision source:newer,larger
+  |    |       --collision dest:newer+larger
   |    +-- existing directory 
   |        error
   |
@@ -2376,11 +2612,11 @@ fn run_multi_source_file_batch(
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
 ) -> i32 {
-    let (dst_mnt, dst_obj_kind) = match resolve_destination_for_dir(destination, requested_mode, false)
-    {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    let (dst_mnt, dst_obj_kind) =
+        match resolve_destination_for_dir(destination, requested_mode, false) {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
     if dst_obj_kind != DstObjKind::DirExisting {
         log(
             requested_mode,
@@ -2402,6 +2638,7 @@ fn run_multi_source_file_batch(
     let mut source_top_entries: HashSet<String> = HashSet::new();
     let mut has_itemized_changes = false;
     let mut source_rel_files: HashSet<String> = HashSet::default();
+    let mut file_relation_breakdown = FileRelationBreakdown::default();
 
     for source in source_paths {
         let (src_mnt, src_obj_kind) = match resolve_source(source, requested_mode) {
@@ -2449,16 +2686,18 @@ fn run_multi_source_file_batch(
             &dst_display,
             DstObjKind::DirExisting,
             true,
+            preview_only,
             replace_dest_symlink,
             merge_collision_policy,
         );
         planned_bytes = planned_bytes.saturating_add(ps.planned_bytes);
-        total_regular_files = total_regular_files
-            .saturating_add(ps.total_regular_files.unwrap_or(0));
+        total_regular_files =
+            total_regular_files.saturating_add(ps.total_regular_files.unwrap_or(0));
         add_files = add_files.saturating_add(ps.add_files);
         mod_files = mod_files.saturating_add(ps.mod_files);
         display_change_preview.extend(ps.change_preview);
         source_top_entries.insert(src_name.clone());
+        file_relation_breakdown.add_assign(ps.file_relation_breakdown);
         if ps.has_itemized_changes {
             has_itemized_changes = true;
         }
@@ -2484,17 +2723,20 @@ fn run_multi_source_file_batch(
     );
 
     println!();
-    print_counts_table(
-        Some((
-            add_files,
-            mod_files,
-            total_regular_files.saturating_sub(add_files.saturating_add(mod_files)),
-            uncollided_files,
-            if is_move { total_regular_files } else { 0 },
-            0,
-        )),
-        Some((0, 0, 0, 0, 0, 0)),
-    );
+    let file_row = Some((
+        add_files,
+        mod_files,
+        total_regular_files.saturating_sub(add_files.saturating_add(mod_files)),
+        uncollided_files,
+        if is_move { total_regular_files } else { 0 },
+        0,
+    ));
+    let dir_row = Some((0, 0, 0, 0, 0, 0));
+    if preview_only {
+        print_preview_counts_table(file_row, dir_row, file_relation_breakdown);
+    } else {
+        print_counts_table(file_row, dir_row);
+    }
 
     println!();
     println!(
@@ -2566,11 +2808,13 @@ fn run_multi_source_file_batch(
             };
             if same && remove_single_file(src, use_sudo, requested_mode) {
                 removed.files = removed.files.saturating_add(1);
-                removed.bytes = removed.bytes.saturating_add(if src_lmd.file_type().is_symlink() {
-                    0
-                } else {
-                    src_lmd.len()
-                });
+                removed.bytes = removed
+                    .bytes
+                    .saturating_add(if src_lmd.file_type().is_symlink() {
+                        0
+                    } else {
+                        src_lmd.len()
+                    });
                 if let Some(parent) = src.parent() {
                     flush_targets.insert(realpath_allow_missing(parent));
                 }
@@ -2679,17 +2923,15 @@ fn run_multi_source_file_batch(
         let src_path = src_mnt.display().to_string();
         let media = dev_media_kind(&src_mnt);
         let transfer = match backend {
-            TransferBackend::Rsync => {
-                run_rsync_transfer(
-                    &src_path,
-                    &dst_display,
-                    item_planned_bytes,
-                    use_sudo,
-                    false,
-                    false,
-                    true,
-                )
-            }
+            TransferBackend::Rsync => run_rsync_transfer(
+                &src_path,
+                &dst_display,
+                item_planned_bytes,
+                use_sudo,
+                false,
+                false,
+                true,
+            ),
             TransferBackend::Rust => run_rust_transfer(
                 &src_path,
                 &dst_display,
@@ -2700,6 +2942,7 @@ fn run_multi_source_file_batch(
                 media,
                 replace_dest_symlink,
                 merge_collision_policy,
+                None,
             ),
         };
         transferred_bytes_total = transferred_bytes_total.saturating_add(transfer.bytes_done);
@@ -2736,6 +2979,7 @@ fn run_multi_source_file_batch(
                 SrcObjKind::File,
                 false,
                 false,
+                None,
                 false,
                 use_sudo,
                 requested_mode,
@@ -2825,20 +3069,25 @@ fn parse_args() -> Result<CliArgs, i32> {
             "--sync" => args.sync_mode = true,
             "-v" | "--verbose" | "--showall" => args.showall = true,
             "--replace-dest-symlink" => args.replace_dest_symlink = true,
-            "--dest-wins" => {
-                set_merge_collision_policy(&mut args, MergeCollisionPolicy::DestWins)?
-            }
-            "--source-wins" => {
-                set_merge_collision_policy(&mut args, MergeCollisionPolicy::SourceWins)?
-            }
-            "--source-wins-if-larger" => {
-                set_merge_collision_policy(&mut args, MergeCollisionPolicy::SourceWinsIfLarger)?
-            }
-            "--source-wins-if-newer-or-larger" => {
-                set_merge_collision_policy(
-                    &mut args,
-                    MergeCollisionPolicy::SourceWinsIfNewerOrLarger,
-                )?
+            "--collision" => {
+                i += 1;
+                if i >= argv.len() {
+                    usage();
+                    eprintln!("copy: error: --collision requires an argument");
+                    return Err(1);
+                }
+                let policy = match parse_merge_collision_policy(&argv[i]) {
+                    Ok(v) => v,
+                    Err(msg) => {
+                        usage();
+                        eprintln!(
+                            "copy: error: invalid --collision value '{}': {msg}",
+                            argv[i]
+                        );
+                        return Err(1);
+                    }
+                };
+                set_merge_collision_policy(&mut args, policy)?
             }
             "-L" => {
                 i += 1;
@@ -3074,6 +3323,7 @@ fn flush_destination_writes(
                         display_rates,
                         merged_proc_deltas,
                         merged_device_deltas,
+                        None,
                         false,
                         true,
                     );
@@ -3139,6 +3389,7 @@ fn flush_destination_writes(
             display_rates,
             merged_proc_deltas,
             merged_device_deltas,
+            None,
             true,
             true,
         );
@@ -3208,6 +3459,7 @@ fn run_move_cleanup_phase(
     src_obj_kind: SrcObjKind,
     contents_mode_requested: bool,
     source_contents_mode: bool,
+    exclude_rel: Option<&str>,
     rename_dir_to_new_path: bool,
     use_sudo: bool,
     mode: TransferMode,
@@ -3230,6 +3482,7 @@ fn run_move_cleanup_phase(
         dst_path,
         src_obj_kind,
         contents_mode_requested && src_obj_kind == SrcObjKind::Dir,
+        exclude_rel,
         use_sudo,
         mode,
         transfer_manifest,
@@ -3280,6 +3533,7 @@ fn run_move_cleanup_phase(
     } else {
         expected_bytes
     };
+    let mut eta_estimator = TransferEtaEstimator::default();
     print_transfer_progress_bars(
         total_elapsed_s,
         delete_total,
@@ -3288,6 +3542,7 @@ fn run_move_cleanup_phase(
         rates,
         proc_delta,
         device_delta,
+        Some(&mut eta_estimator),
         true,
         true,
     );
@@ -3774,6 +4029,7 @@ fn prune_move_source_duplicates(
     dst_path: &str,
     src_obj_kind: SrcObjKind,
     contents_mode: bool,
+    exclude_rel: Option<&str>,
     use_sudo: bool,
     mode: TransferMode,
     manifest: Option<&TransferManifest>,
@@ -3841,6 +4097,12 @@ fn prune_move_source_duplicates(
 
                 for entry in m.identical_files.iter().chain(m.copy_files.iter()) {
                     if entry.rel.is_empty() || !seen_rel.insert(entry.rel.clone()) {
+                        continue;
+                    }
+                    if exclude_rel
+                        .map(|prefix| rel_matches_prefix(&entry.rel, prefix))
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     let src_file = src_root.join(&entry.rel);
@@ -3933,6 +4195,13 @@ fn prune_move_source_duplicates(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                let rel_str = normalize_rel(rel);
+                if exclude_rel
+                    .map(|prefix| rel_matches_prefix(&rel_str, prefix))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let dst_item = if include_root {
                     dst_base.join(&src_base).join(rel)
                 } else {
@@ -4042,7 +4311,7 @@ type SrcScanEntries = (
     Vec<ManifestDirTimeEntry>,
 );
 
-fn scan_source_entries(src_root: &Path) -> SrcScanEntries {
+fn scan_source_entries(src_root: &Path, exclude_rel: Option<&str>) -> SrcScanEntries {
     // Pre-allocate based on rough estimates to avoid reallocation
     let mut dirs: Vec<String> = Vec::with_capacity(8192);
     let mut files: Vec<(String, Option<PathBuf>, u64, bool)> = Vec::with_capacity(65536);
@@ -4051,6 +4320,7 @@ fn scan_source_entries(src_root: &Path) -> SrcScanEntries {
     fn walk_source_entries(
         current: &Path,
         rel: &str,
+        exclude_rel: Option<&str>,
         dirs: &mut Vec<String>,
         files: &mut Vec<(String, Option<PathBuf>, u64, bool)>,
         dir_times: &mut Vec<ManifestDirTimeEntry>,
@@ -4083,12 +4353,25 @@ fn scan_source_entries(src_root: &Path) -> SrcScanEntries {
                 } else {
                     format!("{rel}/{child_name}")
                 };
+                if exclude_rel
+                    .map(|prefix| rel_matches_prefix(&child_rel, prefix))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let child_meta = match fs::symlink_metadata(&child_path) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
                 if child_meta.is_dir() {
-                    walk_source_entries(&child_path, &child_rel, dirs, files, dir_times);
+                    walk_source_entries(
+                        &child_path,
+                        &child_rel,
+                        exclude_rel,
+                        dirs,
+                        files,
+                        dir_times,
+                    );
                 } else if child_meta.is_file() {
                     files.push((child_rel, None, child_meta.len(), false));
                 } else if child_meta.file_type().is_symlink() {
@@ -4098,7 +4381,14 @@ fn scan_source_entries(src_root: &Path) -> SrcScanEntries {
         }
     }
 
-    walk_source_entries(src_root, "", &mut dirs, &mut files, &mut dir_times);
+    walk_source_entries(
+        src_root,
+        "",
+        exclude_rel,
+        &mut dirs,
+        &mut files,
+        &mut dir_times,
+    );
 
     (dirs, files, dir_times)
 }
@@ -4109,8 +4399,10 @@ fn pre_scan_directory(
     src_mnt: &Path,
     build_manifest: bool,
     build_source_display_paths: bool,
+    collect_file_relation_breakdown: bool,
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
+    exclude_rel: Option<&str>,
 ) -> PreScan {
     let src_no_trailing = src_path.trim_end_matches('/');
     let include_root = !src_path.ends_with('/');
@@ -4140,19 +4432,19 @@ fn pre_scan_directory(
         Vec<ManifestDirTimeEntry>,
         Option<DestinationIndex>,
     ) = if destination_missing {
-        let (d, f, t) = scan_source_entries(src_root);
+        let (d, f, t) = scan_source_entries(src_root, exclude_rel);
         (d, f, t, None)
     } else if can_parallel_scans {
         std::thread::scope(|scope| {
             let idx_handle = scope.spawn(|| build_destination_index(&destination_root));
-            let (d, f, t) = scan_source_entries(src_root);
+            let (d, f, t) = scan_source_entries(src_root, exclude_rel);
             let idx = idx_handle
                 .join()
                 .unwrap_or_else(|_| build_destination_index(&destination_root));
             (d, f, t, Some(idx))
         })
     } else {
-        let (d, f, t) = scan_source_entries(src_root);
+        let (d, f, t) = scan_source_entries(src_root, exclude_rel);
         let idx = build_destination_index(&destination_root);
         (d, f, t, Some(idx))
     };
@@ -4249,6 +4541,7 @@ fn pre_scan_directory(
         Vec<ManifestFileEntry>,
         FxHashSet<String>,
         u64,
+        FileRelationBreakdown,
     );
     let has_missing_subtrees = !missing_dir_prefixes.is_empty();
     let (
@@ -4260,6 +4553,7 @@ fn pre_scan_directory(
         mut manifest_identical_files,
         mut changed_parent_dirs,
         overlap_count,
+        file_relation_breakdown,
     ): FileReduce = files
         .par_iter()
         .fold(
@@ -4273,6 +4567,7 @@ fn pre_scan_directory(
                     Vec::new(),
                     FxHashSet::default(),
                     0,
+                    FileRelationBreakdown::default(),
                 )
             },
             |mut acc, (rel, src_file, size, is_symlink)| {
@@ -4333,7 +4628,7 @@ fn pre_scan_directory(
                     }
                 } else {
                     let needs_mtime =
-                        matches!(merge_collision_policy, MergeCollisionPolicy::SourceWinsIfNewerOrLarger);
+                        merge_collision_policy.requires_mtime() || collect_file_relation_breakdown;
                     let src_mtime = if needs_mtime {
                         fs::metadata(src_root.join(rel))
                             .ok()
@@ -4353,13 +4648,8 @@ fn pre_scan_directory(
                         ))
                         .is_ok()
                     };
-                    let dst_path = ensure_dst_file_path(
-                        &mut dst_file,
-                        include_root,
-                        &src_base,
-                        rel,
-                        dst_base,
-                    );
+                    let dst_path =
+                        ensure_dst_file_path(&mut dst_file, include_root, &src_base, rel, dst_base);
                     let dst_is_symlink = fs::symlink_metadata(&dst_path)
                         .map(|dm| dm.file_type().is_symlink())
                         .unwrap_or(false);
@@ -4385,6 +4675,13 @@ fn pre_scan_directory(
                     } else {
                         None
                     };
+                    if collect_file_relation_breakdown && dst_exists && !dst_is_symlink {
+                        if let Some(breakdown) =
+                            classify_file_relation(*size, src_mtime, dst_size, dst_mtime)
+                        {
+                            acc.8.add_assign(breakdown);
+                        }
+                    }
                     regular_file_collision_change(
                         merge_collision_policy,
                         *size,
@@ -4440,6 +4737,7 @@ fn pre_scan_directory(
                     Vec::new(),
                     FxHashSet::default(),
                     0,
+                    FileRelationBreakdown::default(),
                 )
             },
             |mut a, b| {
@@ -4451,6 +4749,7 @@ fn pre_scan_directory(
                 a.5.extend(b.5);
                 a.6.extend(b.6);
                 a.7 += b.7;
+                a.8.add_assign(b.8);
                 a
             },
         );
@@ -4513,6 +4812,7 @@ fn pre_scan_directory(
     }
 
     out.change_preview.extend(detailed_changes);
+    out.file_relation_breakdown = file_relation_breakdown;
 
     if build_manifest {
         if let Some(mut d) = manifest_dirs.take() {
@@ -4540,6 +4840,7 @@ fn pre_scan_file(
     dst_path: &str,
     dst_obj_kind: DstObjKind,
     build_source_display_paths: bool,
+    collect_file_relation_breakdown: bool,
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
 ) -> PreScan {
@@ -4647,6 +4948,11 @@ fn pre_scan_file(
         };
         let dst_size = dst_meta.as_ref().map(|m| m.len());
         let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
+        if collect_file_relation_breakdown && dst_meta.is_some() && !dst_is_symlink {
+            if let Some(breakdown) = classify_file_relation(size, src_mtime, dst_size, dst_mtime) {
+                out.file_relation_breakdown = breakdown;
+            }
+        }
         regular_file_collision_change(
             merge_collision_policy,
             size,
@@ -4780,6 +5086,7 @@ fn run_rsync_transfer(
     let mut cmd: Vec<String> = vec![
         "rsync".to_string(),
         "-aH".to_string(),
+        "--partial".to_string(),
     ];
     if size_only {
         cmd.push("--size-only".to_string());
@@ -4833,6 +5140,7 @@ fn run_rsync_transfer(
     let mut last_device_totals = device_start_totals;
     let mut last_device_at = transfer_start;
     let mut last_io_rates = TransferProgressRates::default();
+    let mut eta_estimator = TransferEtaEstimator::default();
 
     let (event_tx, event_rx) = mpsc::channel::<RsyncStreamEvent>();
     let stdout_handle = child
@@ -4891,6 +5199,7 @@ fn run_rsync_transfer(
                 last_io_rates,
                 io_delta,
                 device_delta,
+                Some(&mut eta_estimator),
                 false,
                 false,
             );
@@ -4970,6 +5279,7 @@ fn run_rsync_transfer(
         last_io_rates,
         io_delta,
         device_delta,
+        Some(&mut eta_estimator),
         true,
         false,
     );
@@ -5000,6 +5310,7 @@ fn run_rust_transfer(
     media: MediaKind,
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
+    exclude_rel: Option<&str>,
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
     let copy_buf_bytes = copy_chunk_bytes_for_media(media);
@@ -5031,6 +5342,7 @@ fn run_rust_transfer(
         let mut last_device_at = transfer_start_for_ticker;
         let mut last_done_bytes: u64 = 0;
         let mut last_done_at = transfer_start_for_ticker;
+        let mut eta_estimator = TransferEtaEstimator::default();
         loop {
             match ticker_stop_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -5068,6 +5380,7 @@ fn run_rust_transfer(
                         io_rates,
                         io_delta,
                         device_delta,
+                        Some(&mut eta_estimator),
                         false,
                         false,
                     );
@@ -5118,6 +5431,7 @@ fn run_rust_transfer(
                 final_io_rates,
                 io_delta,
                 device_delta,
+                None,
                 true,
                 false,
             );
@@ -5182,16 +5496,15 @@ fn run_rust_transfer(
             };
             let dst_size = dst_meta.as_ref().map(|m| m.len());
             let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
-            let needs_copy =
-                regular_file_collision_change(
-                    merge_collision_policy,
-                    src_meta.len(),
-                    src_mtime,
-                    dst_exists,
-                    dst_size,
-                    dst_mtime,
-                )
-                    .is_some();
+            let needs_copy = regular_file_collision_change(
+                merge_collision_policy,
+                src_meta.len(),
+                src_mtime,
+                dst_exists,
+                dst_size,
+                dst_mtime,
+            )
+            .is_some();
             if needs_copy {
                 let _permit =
                     acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
@@ -5334,6 +5647,12 @@ fn run_rust_transfer(
                         continue;
                     }
                     let rel = normalize_rel(p.strip_prefix(src_root).unwrap_or(Path::new("")));
+                    if exclude_rel
+                        .map(|prefix| rel_matches_prefix(&rel, prefix))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     let (dst_item, _) = map_dir_dest(include_root, &src_base, &rel, dst_base);
                     let md = match fs::symlink_metadata(&p) {
                         Ok(v) => v,
@@ -5369,16 +5688,15 @@ fn run_rust_transfer(
                     };
                     let dst_size = dst_meta.as_ref().map(|m| m.len());
                     let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
-                    let needs_copy =
-                        regular_file_collision_change(
-                            merge_collision_policy,
-                            md.len(),
-                            src_mtime,
-                            dst_exists,
-                            dst_size,
-                            dst_mtime,
-                        )
-                            .is_some();
+                    let needs_copy = regular_file_collision_change(
+                        merge_collision_policy,
+                        md.len(),
+                        src_mtime,
+                        dst_exists,
+                        dst_size,
+                        dst_mtime,
+                    )
+                    .is_some();
                     if needs_copy {
                         let _permit =
                             acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
@@ -6394,11 +6712,9 @@ fn run_remote_transfer_mode(
         None => {
             if let Some(kind) = local_src_kind {
                 let resolved = match kind {
-                    SrcObjKind::File => resolve_destination_for_file(
-                        destination,
-                        requested_mode,
-                        false,
-                    ),
+                    SrcObjKind::File => {
+                        resolve_destination_for_file(destination, requested_mode, false)
+                    }
                     SrcObjKind::Dir => {
                         resolve_destination_for_dir(destination, requested_mode, false)
                     }
@@ -6452,20 +6768,18 @@ fn run_remote_transfer_mode(
 
     let contents_active =
         contents_mode_requested && !matches!(local_src_kind, Some(SrcObjKind::File));
-    let mode_dir_active = matches!(local_src_kind, Some(SrcObjKind::Dir)) && !contents_active;
     println!(
         "{}",
         [
-            fmt_mode_word("Overwrite", false),
-            fmt_mode_word("Move", is_move),
             fmt_mode_word("Copy", !is_move),
-            fmt_mode_word("Merge", true),
-            fmt_mode_word("Rename", false),
-            fmt_mode_word("Backup", false),
-            fmt_mode_word("File", matches!(local_src_kind, Some(SrcObjKind::File))),
-            fmt_mode_word("Dir", mode_dir_active),
-            fmt_mode_word("Contents", contents_active),
+            fmt_mode_word("Move", is_move),
             fmt_mode_word("Sync", sync_mode),
+            fmt_mode_word("Backup", false),
+            "|".to_string(),
+            fmt_mode_word("Merge", true),
+            fmt_mode_word("Overwrite", false),
+            fmt_mode_word("Contents", contents_active),
+            fmt_mode_word("File", matches!(local_src_kind, Some(SrcObjKind::File))),
         ]
         .join(" ")
     );
@@ -6509,7 +6823,9 @@ fn run_remote_transfer_mode(
         LogLevel::Info,
     );
     let start_ts = Instant::now();
-    let transfer = run_rsync_transfer(&src_path, &dst_path, 0, use_sudo, is_move, sync_mode, !sync_mode);
+    let transfer = run_rsync_transfer(
+        &src_path, &dst_path, 0, use_sudo, is_move, sync_mode, !sync_mode,
+    );
 
     if is_move && (transfer.rc == 0 || transfer.rc == 24) && matches!(source_ep, Endpoint::Local(_))
     {
@@ -6615,7 +6931,7 @@ fn real_main() -> i32 {
     let source_remote = parse_remote_spec(&source);
     let destination_remote = parse_remote_spec(&destination).map(enrich_remote_spec);
 
-    if (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::Default)
+    if (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::default())
         && (use_sudo || source_remote.is_some() || destination_remote.is_some())
     {
         log(
@@ -6643,7 +6959,8 @@ fn real_main() -> i32 {
         return 1;
     }
     if args.sync_mode
-        && (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::Default)
+        && (args.replace_dest_symlink
+            || args.merge_collision_policy != MergeCollisionPolicy::default())
     {
         log(
             requested_mode,
@@ -6740,6 +7057,31 @@ fn real_main() -> i32 {
     };
 
     let source_contents_mode = source_glob_contents && !force;
+    let mut descendant_target_contents_mode = false;
+    let mut descendant_target_exclude_rel: Option<String> = None;
+    if src_obj_kind == SrcObjKind::Dir
+        && matches!(
+            dst_obj_kind,
+            DstObjKind::Dir | DstObjKind::DirExisting | DstObjKind::DirNew
+        )
+        && !overwrite
+    {
+        let dst_real = realpath_allow_missing(&dst_mnt);
+        if dst_real != src_mnt {
+            if let Ok(rel) = dst_real.strip_prefix(&src_mnt) {
+                let rel_norm = normalize_rel(rel);
+                if !rel_norm.is_empty() {
+                    descendant_target_contents_mode = true;
+                    descendant_target_exclude_rel = Some(rel_norm);
+                }
+            }
+        }
+    }
+    let effective_contents_mode_requested = (contents_mode_requested
+        || descendant_target_contents_mode)
+        && src_obj_kind == SrcObjKind::Dir;
+    let effective_source_contents_mode = (source_contents_mode || descendant_target_contents_mode)
+        && src_obj_kind == SrcObjKind::Dir;
     let dest_tail_raw = destination
         .trim_end_matches('/')
         .split('/')
@@ -6771,16 +7113,16 @@ fn real_main() -> i32 {
                 .unwrap_or_default();
             if src_base == dst_base {
                 source_already_in_destination = true;
-                if force && !source_contents_mode {
+                if force && !effective_source_contents_mode {
                     merge_child_into_parent = true;
                     source_already_in_destination = false;
                 }
             } else {
                 source_already_in_destination = true;
-                if overwrite && !source_contents_mode && !destination_is_dir_ref {
+                if overwrite && !effective_source_contents_mode && !destination_is_dir_ref {
                     overwrite_parent_from_child = true;
                     source_already_in_destination = false;
-                } else if force && !source_contents_mode {
+                } else if force && !effective_source_contents_mode {
                     source_already_in_destination = false;
                 }
             }
@@ -6789,7 +7131,7 @@ fn real_main() -> i32 {
                 realpath_allow_missing(src_mnt.parent().unwrap_or_else(|| Path::new(".")));
             if dst_slot_for_src == src_parent_real {
                 source_already_in_destination = true;
-                if force && !source_contents_mode {
+                if force && !effective_source_contents_mode {
                     merge_child_into_parent = true;
                     source_already_in_destination = false;
                 }
@@ -6799,7 +7141,7 @@ fn real_main() -> i32 {
 
     let rename_style_existing_dir_target = src_obj_kind == SrcObjKind::Dir
         && dst_obj_kind == DstObjKind::DirExisting
-        && !source_contents_mode
+        && !effective_source_contents_mode
         && !destination_is_dir_ref
         && src_mnt.file_name() != dst_mnt.file_name();
 
@@ -6817,7 +7159,7 @@ fn real_main() -> i32 {
     if overwrite
         && src_obj_kind == SrcObjKind::Dir
         && dst_obj_kind == DstObjKind::FileExistingForDir
-        && !source_contents_mode
+        && !effective_source_contents_mode
     {
         overwrite_replace_file_target = true;
     }
@@ -6825,7 +7167,7 @@ fn real_main() -> i32 {
     let force_merge_dir_target = force
         && src_obj_kind == SrcObjKind::Dir
         && matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting)
-        && !source_contents_mode
+        && !effective_source_contents_mode
         && !source_already_in_destination
         && !overwrite_parent_from_child
         && !overwrite_rename_dir_target;
@@ -6893,7 +7235,7 @@ fn real_main() -> i32 {
     } else if overwrite
         && src_obj_kind == SrcObjKind::Dir
         && matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting)
-        && !source_contents_mode
+        && !effective_source_contents_mode
         && !merge_child_into_parent
         && !source_already_in_destination
     {
@@ -6920,20 +7262,20 @@ fn real_main() -> i32 {
         SrcObjKind::Dir => {
             let src_s = src_mnt.display().to_string();
             if (overwrite_rename_dir_target || overwrite_replace_file_target)
-                && !source_contents_mode
+                && !effective_source_contents_mode
             {
                 rename_dir_to_new_path = true;
                 format!("{}/", src_s.trim_end_matches('/'))
-            } else if force_merge_dir_target && !source_contents_mode {
+            } else if effective_source_contents_mode {
                 format!("{}/", src_s.trim_end_matches('/'))
-            } else if dst_obj_kind == DstObjKind::DirNew && !source_contents_mode {
+            } else if force_merge_dir_target && !effective_source_contents_mode {
+                format!("{}/", src_s.trim_end_matches('/'))
+            } else if dst_obj_kind == DstObjKind::DirNew && !effective_source_contents_mode {
                 if !force {
                     rename_dir_to_new_path = true;
                 }
                 format!("{}/", src_s.trim_end_matches('/'))
-            } else if merge_child_into_parent && !source_contents_mode {
-                format!("{}/", src_s.trim_end_matches('/'))
-            } else if source_contents_mode {
+            } else if merge_child_into_parent && !effective_source_contents_mode {
                 format!("{}/", src_s.trim_end_matches('/'))
             } else {
                 src_s.trim_end_matches('/').to_string()
@@ -6957,28 +7299,17 @@ fn real_main() -> i32 {
             .to_string()
     };
 
-    let src_base = src_mnt
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
     let src_parent = src_mnt
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let target_base = target_name_for_conflict.clone().unwrap_or_default();
     let target_parent = target_dir_for_name.clone().unwrap_or_default();
 
     let mut _mode_move =
         realpath_allow_missing(&src_parent) != realpath_allow_missing(&target_parent);
     if merge_child_into_parent || overwrite_parent_from_child {
         _mode_move = false;
-    }
-
-    let mut mode_rename =
-        !src_base.is_empty() && !target_base.is_empty() && src_base != target_base;
-    if force_merge_dir_target || merge_child_into_parent {
-        mode_rename = false;
     }
 
     let mut mode_overwrite = false;
@@ -6997,14 +7328,13 @@ fn real_main() -> i32 {
         mode_overwrite = false;
         _mode_move = false;
         mode_merge = false;
-        mode_rename = false;
     }
 
     let mut backup_source_path: Option<PathBuf> = None;
     let mut backup_source_kind: Option<&str> = None;
     if backup_requested && !source_already_in_destination {
         if args.sync_mode {
-            let sync_root = if source_contents_mode {
+            let sync_root = if effective_source_contents_mode {
                 dst_mnt.clone()
             } else if matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting) {
                 dst_mnt.join(src_mnt.file_name().unwrap_or_default())
@@ -7051,22 +7381,20 @@ fn real_main() -> i32 {
     }
 
     let mode_backup = planned_backup_path.is_some();
-    let contents_mode_active = contents_mode_requested && src_obj_kind == SrcObjKind::Dir;
-    let mode_dir_active = src_obj_kind == SrcObjKind::Dir && !contents_mode_active;
+    let contents_mode_active = effective_contents_mode_requested;
 
     println!(
         "{}",
         [
-            fmt_mode_word("Overwrite", mode_overwrite),
-            fmt_mode_word("Move", is_move),
             fmt_mode_word("Copy", !is_move),
-            fmt_mode_word("Merge", mode_merge),
-            fmt_mode_word("Rename", mode_rename),
-            fmt_mode_word("Backup", mode_backup),
-            fmt_mode_word("File", src_obj_kind == SrcObjKind::File),
-            fmt_mode_word("Dir", mode_dir_active),
-            fmt_mode_word("Contents", contents_mode_active),
+            fmt_mode_word("Move", is_move),
             fmt_mode_word("Sync", args.sync_mode),
+            fmt_mode_word("Backup", mode_backup),
+            "|".to_string(),
+            fmt_mode_word("Merge", mode_merge),
+            fmt_mode_word("Overwrite", mode_overwrite),
+            fmt_mode_word("Contents", contents_mode_active),
+            fmt_mode_word("File", src_obj_kind == SrcObjKind::File),
         ]
         .join(" ")
     );
@@ -7111,14 +7439,17 @@ fn real_main() -> i32 {
                 &src_mnt,
                 build_transfer_manifest,
                 args.showall,
+                preview_only,
                 args.replace_dest_symlink,
                 args.merge_collision_policy,
+                descendant_target_exclude_rel.as_deref(),
             ),
             SrcObjKind::File => pre_scan_file(
                 &src_mnt,
                 &pre_dst_path,
                 dst_obj_kind,
                 args.showall,
+                preview_only,
                 args.replace_dest_symlink,
                 args.merge_collision_policy,
             ),
@@ -7274,7 +7605,9 @@ fn real_main() -> i32 {
         dst_preview_root.clone()
     };
 
-    if simple_rename_parent.is_some() && src_obj_kind == SrcObjKind::Dir && simple_rename_dst.is_some()
+    if simple_rename_parent.is_some()
+        && src_obj_kind == SrcObjKind::Dir
+        && simple_rename_dst.is_some()
     {
         let dst_name = simple_rename_dst.clone().unwrap_or_default();
         if args.showall {
@@ -7354,7 +7687,8 @@ fn real_main() -> i32 {
     let has_move_cleanup_work = is_move
         && !source_already_in_destination
         && (manifest_cleanup_files > 0 || manifest_cleanup_bytes > 0);
-    let sync_delete_requires_action = args.sync_mode && (uncollided_files > 0 || uncollided_dirs > 0);
+    let sync_delete_requires_action =
+        args.sync_mode && (uncollided_files > 0 || uncollided_dirs > 0);
     let emphasize_preview_root = has_itemized_changes
         || planned_bytes > 0
         || overwrite_requires_action
@@ -7541,7 +7875,11 @@ fn real_main() -> i32 {
             deleted_dest_dirs,
         )
     });
-    if file_row.is_some() || dir_row.is_some() {
+    if preview_only {
+        if file_row.is_some() || dir_row.is_some() {
+            print_preview_counts_table(file_row, dir_row, prescan.file_relation_breakdown);
+        }
+    } else if file_row.is_some() || dir_row.is_some() {
         print_counts_table(file_row, dir_row);
     }
 
@@ -7565,7 +7903,8 @@ fn real_main() -> i32 {
         return 0;
     }
 
-    let move_requires_material_action = is_move && !source_already_in_destination && !existing_same_name_target;
+    let move_requires_material_action =
+        is_move && !source_already_in_destination && !existing_same_name_target;
     let no_changes_planned = source_already_in_destination
         || ((planned_bytes == 0 && !has_itemized_changes && !overwrite_requires_action)
             && !sync_delete_requires_action
@@ -7624,16 +7963,17 @@ fn real_main() -> i32 {
     // Allow fast rename for contents-only moves when destination is a brand-new
     // directory path. In this case, moving source children into a new target dir
     // is equivalent to a single rename(src_dir -> dst_dir).
-    let contents_only_dirnew_fastpath =
-        contents_mode_requested && src_obj_kind == SrcObjKind::Dir && dst_obj_kind == DstObjKind::DirNew;
+    let contents_only_dirnew_fastpath = effective_contents_mode_requested
+        && src_obj_kind == SrcObjKind::Dir
+        && dst_obj_kind == DstObjKind::DirNew;
 
     let maybe_fast_rename_target = if is_move
         && !use_sudo
         && !backup_requested
         && !overwrite_requires_action
         && !move_cleanup_only
-        && !source_contents_mode
-        && (!contents_mode_requested || contents_only_dirnew_fastpath)
+        && !effective_source_contents_mode
+        && (!effective_contents_mode_requested || contents_only_dirnew_fastpath)
         && !merge_child_into_parent
         && !overwrite_parent_from_child
         && !overwrite_rename_dir_target
@@ -7851,6 +8191,7 @@ fn real_main() -> i32 {
                         media,
                         args.replace_dest_symlink,
                         args.merge_collision_policy,
+                        descendant_target_exclude_rel.as_deref(),
                     ),
                 };
                 transferred_bytes_total += transfer.bytes_done;
@@ -7938,8 +8279,9 @@ fn real_main() -> i32 {
                                 &stage_path.display().to_string(),
                                 &src_mnt,
                                 src_obj_kind,
-                                contents_mode_requested,
-                                source_contents_mode,
+                                effective_contents_mode_requested,
+                                effective_source_contents_mode,
+                                descendant_target_exclude_rel.as_deref(),
                                 true,
                                 use_sudo,
                                 requested_mode,
@@ -7968,8 +8310,9 @@ fn real_main() -> i32 {
                             &stage_path.display().to_string(),
                             &src_mnt,
                             src_obj_kind,
-                            contents_mode_requested,
-                            source_contents_mode,
+                            effective_contents_mode_requested,
+                            effective_source_contents_mode,
+                            descendant_target_exclude_rel.as_deref(),
                             true,
                             use_sudo,
                             requested_mode,
@@ -8073,7 +8416,7 @@ fn real_main() -> i32 {
         if is_move
             && matches!(backend, TransferBackend::Rust)
             && src_obj_kind == SrcObjKind::Dir
-            && contents_mode_requested
+            && effective_contents_mode_requested
             && matches!(dst_obj_kind, DstObjKind::Dir | DstObjKind::DirExisting)
             && !source_already_in_destination
             && !use_sudo
@@ -8087,11 +8430,16 @@ fn real_main() -> i32 {
                 &src_mnt,
                 &dst_mnt,
                 transfer_manifest.as_mut(),
+                descendant_target_exclude_rel
+                    .as_deref()
+                    .and_then(top_level_rel_component),
             );
             if rename_stats.moved_entries > 0 {
                 planned_bytes = planned_bytes.saturating_sub(rename_stats.removed_copy_bytes);
-                likely_cleanup_files = likely_cleanup_files.saturating_sub(rename_stats.moved_files);
-                likely_cleanup_bytes = likely_cleanup_bytes.saturating_sub(rename_stats.moved_bytes);
+                likely_cleanup_files =
+                    likely_cleanup_files.saturating_sub(rename_stats.moved_files);
+                likely_cleanup_bytes =
+                    likely_cleanup_bytes.saturating_sub(rename_stats.moved_bytes);
                 log(
                     requested_mode,
                     &format!(
@@ -8109,8 +8457,9 @@ fn real_main() -> i32 {
                 &dst_path,
                 &src_mnt,
                 src_obj_kind,
-                contents_mode_requested,
-                source_contents_mode,
+                effective_contents_mode_requested,
+                effective_source_contents_mode,
+                descendant_target_exclude_rel.as_deref(),
                 rename_dir_to_new_path,
                 use_sudo,
                 requested_mode,
@@ -8134,17 +8483,15 @@ fn real_main() -> i32 {
         }
 
         let transfer = match backend {
-            TransferBackend::Rsync => {
-                run_rsync_transfer(
-                    &src_path,
-                    &dst_path,
-                    planned_bytes,
-                    use_sudo,
-                    false,
-                    args.sync_mode,
-                    !args.sync_mode,
-                )
-            }
+            TransferBackend::Rsync => run_rsync_transfer(
+                &src_path,
+                &dst_path,
+                planned_bytes,
+                use_sudo,
+                false,
+                args.sync_mode,
+                !args.sync_mode,
+            ),
             TransferBackend::Rust => run_rust_transfer(
                 &src_path,
                 &dst_path,
@@ -8155,6 +8502,7 @@ fn real_main() -> i32 {
                 media,
                 args.replace_dest_symlink,
                 args.merge_collision_policy,
+                descendant_target_exclude_rel.as_deref(),
             ),
         };
         transferred_bytes_total += transfer.bytes_done;
@@ -8179,8 +8527,9 @@ fn real_main() -> i32 {
                     &dst_path,
                     &src_mnt,
                     src_obj_kind,
-                    contents_mode_requested,
-                    source_contents_mode,
+                    effective_contents_mode_requested,
+                    effective_source_contents_mode,
+                    descendant_target_exclude_rel.as_deref(),
                     rename_dir_to_new_path,
                     use_sudo,
                     requested_mode,
@@ -8209,8 +8558,9 @@ fn real_main() -> i32 {
                     &dst_path,
                     &src_mnt,
                     src_obj_kind,
-                    contents_mode_requested,
-                    source_contents_mode,
+                    effective_contents_mode_requested,
+                    effective_source_contents_mode,
+                    descendant_target_exclude_rel.as_deref(),
                     rename_dir_to_new_path,
                     use_sudo,
                     requested_mode,
@@ -8390,6 +8740,143 @@ fn print_counts_table(
     }
 }
 
+fn print_preview_counts_table(
+    file_row: Option<(u64, u64, u64, u64, u64, u64)>,
+    dir_row: Option<(u64, u64, u64, u64, u64, u64)>,
+    breakdown: FileRelationBreakdown,
+) {
+    let mut new_vals = Vec::new();
+    let mut uncol_vals = Vec::new();
+    let mut del_src_vals = Vec::new();
+    let mut del_dst_vals = Vec::new();
+    let mut time_eq_size_eq_vals = Vec::new();
+    let mut time_eq_src_gt_vals = Vec::new();
+    let mut time_eq_src_lt_vals = Vec::new();
+    let mut size_eq_new_vals = Vec::new();
+    let mut size_eq_old_vals = Vec::new();
+    let mut old_src_lt_vals = Vec::new();
+    let mut old_src_gt_vals = Vec::new();
+    let mut new_src_lt_vals = Vec::new();
+    let mut new_src_gt_vals = Vec::new();
+
+    for row in [file_row, dir_row].into_iter().flatten() {
+        new_vals.push(row.0);
+        uncol_vals.push(row.3);
+        del_src_vals.push(row.4);
+        del_dst_vals.push(row.5);
+    }
+    time_eq_size_eq_vals.push(breakdown.same_time_same_size);
+    time_eq_src_gt_vals.push(breakdown.same_time_source_larger);
+    time_eq_src_lt_vals.push(breakdown.same_time_source_smaller);
+    size_eq_new_vals.push(breakdown.same_size_source_newer);
+    size_eq_old_vals.push(breakdown.same_size_source_older);
+    old_src_lt_vals.push(breakdown.source_older_smaller);
+    old_src_gt_vals.push(breakdown.source_older_larger);
+    new_src_lt_vals.push(breakdown.source_newer_smaller);
+    new_src_gt_vals.push(breakdown.source_newer_larger);
+    time_eq_size_eq_vals.push(0);
+    time_eq_src_gt_vals.push(0);
+    time_eq_src_lt_vals.push(0);
+    size_eq_new_vals.push(0);
+    size_eq_old_vals.push(0);
+    old_src_lt_vals.push(0);
+    old_src_gt_vals.push(0);
+    new_src_lt_vals.push(0);
+    new_src_gt_vals.push(0);
+
+    let type_w = 5usize;
+    let new_w = count_col_width("New", &new_vals);
+    let uncol_w = count_col_width("Uncol", &uncol_vals);
+    let del_src_w = count_col_width("Del(src)", &del_src_vals);
+    let del_dst_w = count_col_width("Del(dest)", &del_dst_vals);
+    let time_eq_size_eq_w = count_col_width("Time=Size=", &time_eq_size_eq_vals);
+    let time_eq_src_gt_w = count_col_width("Time=Size+", &time_eq_src_gt_vals);
+    let time_eq_src_lt_w = count_col_width("Time=Size-", &time_eq_src_lt_vals);
+    let size_eq_new_w = count_col_width("Time+Size=", &size_eq_new_vals);
+    let size_eq_old_w = count_col_width("Time-Size=", &size_eq_old_vals);
+    let old_src_lt_w = count_col_width("Time-Size-", &old_src_lt_vals);
+    let old_src_gt_w = count_col_width("Time-Size+", &old_src_gt_vals);
+    let new_src_lt_w = count_col_width("Time+Size-", &new_src_lt_vals);
+    let new_src_gt_w = count_col_width("Time+Size+", &new_src_gt_vals);
+
+    println!(
+        "{:<type_w$} | {:>new_w$} | {:>uncol_w$} | {:>time_eq_size_eq_w$} | {:>time_eq_src_gt_w$} | {:>time_eq_src_lt_w$} | {:>size_eq_new_w$}",
+        "Type",
+        "New",
+        "Uncol",
+        "Time=Size=",
+        "Time=Size+",
+        "Time=Size-",
+        "Time+Size=",
+    );
+    if let Some((new_v, _mod_v, _ident_v, uncol_v, del_src_v, del_dst_v)) = file_row {
+        println!(
+            "{:<type_w$} | {:>new_w$} | {:>uncol_w$} | {:>time_eq_size_eq_w$} | {:>time_eq_src_gt_w$} | {:>time_eq_src_lt_w$} | {:>size_eq_new_w$}",
+            "Files",
+            format_number(new_v),
+            format_number(uncol_v),
+            format_number(breakdown.same_time_same_size),
+            format_number(breakdown.same_time_source_larger),
+            format_number(breakdown.same_time_source_smaller),
+            format_number(breakdown.same_size_source_newer),
+        );
+        let _ = (del_src_v, del_dst_v);
+    }
+    if let Some((new_v, _mod_v, _ident_v, uncol_v, del_src_v, del_dst_v)) = dir_row {
+        println!(
+            "{:<type_w$} | {:>new_w$} | {:>uncol_w$} | {:>time_eq_size_eq_w$} | {:>time_eq_src_gt_w$} | {:>time_eq_src_lt_w$} | {:>size_eq_new_w$}",
+            "Dirs",
+            format_number(new_v),
+            format_number(uncol_v),
+            "0",
+            "0",
+            "0",
+            "0",
+        );
+        let _ = (del_src_v, del_dst_v);
+    }
+
+    println!();
+    println!(
+        "{:<type_w$} | {:>size_eq_old_w$} | {:>old_src_lt_w$} | {:>old_src_gt_w$} | {:>new_src_lt_w$} | {:>new_src_gt_w$} | {:>del_src_w$} | {:>del_dst_w$}",
+        "Type",
+        "Time-Size=",
+        "Time-Size-",
+        "Time-Size+",
+        "Time+Size-",
+        "Time+Size+",
+        "Del(src)",
+        "Del(dest)",
+    );
+    if let Some((_new_v, _mod_v, _ident_v, _uncol_v, del_src_v, del_dst_v)) = file_row {
+        println!(
+            "{:<type_w$} | {:>size_eq_old_w$} | {:>old_src_lt_w$} | {:>old_src_gt_w$} | {:>new_src_lt_w$} | {:>new_src_gt_w$} | {:>del_src_w$} | {:>del_dst_w$}",
+            "Files",
+            format_number(breakdown.same_size_source_older),
+            format_number(breakdown.source_older_smaller),
+            format_number(breakdown.source_older_larger),
+            format_number(breakdown.source_newer_smaller),
+            format_number(breakdown.source_newer_larger),
+            format_number(del_src_v),
+            format_number(del_dst_v),
+        );
+    }
+    if let Some((_new_v, _mod_v, _ident_v, _uncol_v, del_src_v, del_dst_v)) = dir_row {
+        println!(
+            "{:<type_w$} | {:>size_eq_old_w$} | {:>old_src_lt_w$} | {:>old_src_gt_w$} | {:>new_src_lt_w$} | {:>new_src_gt_w$} | {:>del_src_w$} | {:>del_dst_w$}",
+            "Dirs",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            format_number(del_src_v),
+            format_number(del_dst_v),
+        );
+    }
+    println!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8519,8 +9006,91 @@ Host dev-*
             DstObjKind::File,
             false,
             false,
-            MergeCollisionPolicy::Default,
+            false,
+            MergeCollisionPolicy::default(),
         );
         assert_eq!(ps.uncollided_files, 1);
+    }
+
+    #[test]
+    fn eta_estimator_tracks_stable_throughput() {
+        let mut estimator = TransferEtaEstimator::default();
+        let mib = 1024.0 * 1024.0;
+        let rate = 100.0 * mib;
+        let total = 20 * 1024 * 1024 * 1024u64;
+        let mut eta = None;
+
+        for tick in 1..=60 {
+            let elapsed = tick as f64 * 0.2;
+            let done = (elapsed * rate) as u64;
+            eta = estimator.update(Some(done), total, Some(rate), elapsed, false);
+        }
+
+        let eta = eta.expect("ETA should be available after warmup");
+        assert!(eta > 150.0 && eta < 250.0, "unexpected stable ETA: {eta}");
+    }
+
+    #[test]
+    fn eta_estimator_reacts_to_cache_to_disk_slowdown() {
+        let mut estimator = TransferEtaEstimator::default();
+        let mib = 1024.0 * 1024.0;
+        let fast_rate = 800.0 * mib;
+        let slow_rate = 9.726 * mib;
+        let total = 100 * 1024 * 1024 * 1024u64;
+
+        for tick in 1..=50 {
+            let elapsed = tick as f64 * 0.2;
+            let done = (elapsed * fast_rate) as u64;
+            let _ = estimator.update(Some(done), total, Some(fast_rate), elapsed, false);
+        }
+
+        let mut eta_after_slowdown = None;
+        for tick in 51..=80 {
+            let elapsed = tick as f64 * 0.2;
+            let done = (10.0 * fast_rate + (elapsed - 10.0) * slow_rate) as u64;
+            eta_after_slowdown =
+                estimator.update(Some(done), total, Some(slow_rate), elapsed, false);
+        }
+
+        let eta = eta_after_slowdown.expect("ETA should remain available after slowdown");
+        assert!(eta > 5_000.0, "slowdown was not detected quickly: {eta}s");
+    }
+
+    #[test]
+    fn eta_estimator_freezes_short_stalls_and_reports_long_stalls() {
+        let mut estimator = TransferEtaEstimator::default();
+        let rate = 100.0 * 1024.0 * 1024.0;
+        let total = 20 * 1024 * 1024 * 1024u64;
+        let mut eta_before_stall = None;
+
+        for tick in 1..=60 {
+            let elapsed = tick as f64 * 0.2;
+            let done = (elapsed * rate) as u64;
+            eta_before_stall = estimator.update(Some(done), total, Some(rate), elapsed, false);
+        }
+
+        let eta_before_stall = eta_before_stall.expect("ETA should be available before stall");
+        let done = (60.0 * 0.2 * rate) as u64;
+        let mut eta_after_short_stall = None;
+        for tick in 61..=68 {
+            let elapsed = tick as f64 * 0.2;
+            eta_after_short_stall = estimator.update(Some(done), total, Some(0.0), elapsed, false);
+        }
+        let eta_after_short_stall =
+            eta_after_short_stall.expect("short stall should retain the current ETA");
+        assert!(
+            (eta_after_short_stall - eta_before_stall).abs() <= 1.0,
+            "short stall changed ETA: before={eta_before_stall}, after={eta_after_short_stall}"
+        );
+
+        let mut long_stall_eta = Some(0.0);
+        for tick in 69..=90 {
+            let elapsed = tick as f64 * 0.2;
+            long_stall_eta = estimator.update(Some(done), total, Some(0.0), elapsed, false);
+        }
+        assert!(
+            long_stall_eta.is_none(),
+            "long stall should report an unavailable ETA"
+        );
     }
 }
