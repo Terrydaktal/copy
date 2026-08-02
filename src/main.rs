@@ -801,14 +801,127 @@ fn option_u64_saturating_add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+const ETA_FILE_BIN_COUNT: usize = 8;
+const ETA_SMALL_FILE_BIN_LAST: usize = 2;
+
+type EtaFileCounts = [u64; ETA_FILE_BIN_COUNT];
+type EtaFileBytes = [u64; ETA_FILE_BIN_COUNT];
+
+fn eta_file_bin(size: u64) -> usize {
+    if size <= 4 * 1024 {
+        0
+    } else if size <= 16 * 1024 {
+        1
+    } else if size <= 64 * 1024 {
+        2
+    } else if size <= 256 * 1024 {
+        3
+    } else if size <= 1024 * 1024 {
+        4
+    } else if size <= 4 * 1024 * 1024 {
+        5
+    } else if size <= 64 * 1024 * 1024 {
+        6
+    } else {
+        7
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EtaWorkload {
+    file_bins: EtaFileCounts,
+    file_bytes: EtaFileBytes,
+    dirs: u64,
+}
+
+impl EtaWorkload {
+    fn from_manifest(manifest: &TransferManifest, include_root: bool) -> Self {
+        let mut workload = Self {
+            file_bins: [0; ETA_FILE_BIN_COUNT],
+            file_bytes: [0; ETA_FILE_BIN_COUNT],
+            dirs: manifest.dirs.len() as u64 + u64::from(include_root),
+        };
+        for entry in &manifest.copy_files {
+            let bin = eta_file_bin(entry.size);
+            workload.file_bins[bin] = workload.file_bins[bin].saturating_add(1);
+            workload.file_bytes[bin] = workload.file_bytes[bin].saturating_add(entry.size);
+        }
+        workload
+    }
+
+    fn from_file(size: u64) -> Self {
+        let mut workload = Self {
+            file_bins: [0; ETA_FILE_BIN_COUNT],
+            file_bytes: [0; ETA_FILE_BIN_COUNT],
+            dirs: 0,
+        };
+        let bin = eta_file_bin(size);
+        workload.file_bins[bin] = 1;
+        workload.file_bytes[bin] = size;
+        workload
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EtaProgressTotals {
+    file_bins: EtaFileCounts,
+    file_bytes: EtaFileBytes,
+    dirs: u64,
+}
+
+struct AtomicEtaProgress {
+    file_bins: [AtomicU64; ETA_FILE_BIN_COUNT],
+    file_bytes: [AtomicU64; ETA_FILE_BIN_COUNT],
+    dirs: AtomicU64,
+}
+
+impl Default for AtomicEtaProgress {
+    fn default() -> Self {
+        Self {
+            file_bins: std::array::from_fn(|_| AtomicU64::new(0)),
+            file_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            dirs: AtomicU64::new(0),
+        }
+    }
+}
+
+impl AtomicEtaProgress {
+    fn mark_file(&self, size: u64) {
+        let bin = eta_file_bin(size);
+        self.file_bins[bin].fetch_add(1, Ordering::Relaxed);
+        self.file_bytes[bin].fetch_add(size, Ordering::Relaxed);
+    }
+
+    fn mark_dir(&self) {
+        self.dirs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> EtaProgressTotals {
+        EtaProgressTotals {
+            file_bins: std::array::from_fn(|idx| self.file_bins[idx].load(Ordering::Relaxed)),
+            file_bytes: std::array::from_fn(|idx| self.file_bytes[idx].load(Ordering::Relaxed)),
+            dirs: self.dirs.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EtaWorkSample {
+    elapsed_s: f64,
+    bytes: u64,
+    progress: EtaProgressTotals,
+}
+
 #[derive(Default)]
 struct TransferEtaEstimator {
     samples: VecDeque<(f64, u64)>,
+    work_samples: VecDeque<EtaWorkSample>,
     display_finish_s: Option<f64>,
     last_elapsed_s: Option<f64>,
     last_done: Option<u64>,
     regime_start_s: f64,
     reference_bps: Option<f64>,
+    peak_bps: Option<f64>,
     slowdown_since_s: Option<(f64, f64)>,
     zero_progress_s: f64,
 }
@@ -853,6 +966,42 @@ fn median_rate(rates: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
     Some(values[values.len() / 2])
 }
 
+fn eta_work_window(
+    samples: &VecDeque<EtaWorkSample>,
+    start_s: f64,
+    now_s: f64,
+    window_s: f64,
+) -> Option<(f64, u64, EtaProgressTotals)> {
+    let cutoff_s = (now_s - window_s).max(start_s);
+    let first = samples
+        .iter()
+        .filter(|sample| sample.elapsed_s >= start_s)
+        .find(|sample| sample.elapsed_s >= cutoff_s)
+        .copied()?;
+    let last = samples
+        .iter()
+        .rev()
+        .find(|sample| sample.elapsed_s >= start_s)
+        .copied()?;
+    let dt = last.elapsed_s - first.elapsed_s;
+    if dt <= 1e-6 {
+        return None;
+    }
+    Some((
+        dt,
+        last.bytes.saturating_sub(first.bytes),
+        EtaProgressTotals {
+            file_bins: std::array::from_fn(|idx| {
+                last.progress.file_bins[idx].saturating_sub(first.progress.file_bins[idx])
+            }),
+            file_bytes: std::array::from_fn(|idx| {
+                last.progress.file_bytes[idx].saturating_sub(first.progress.file_bytes[idx])
+            }),
+            dirs: last.progress.dirs.saturating_sub(first.progress.dirs),
+        },
+    ))
+}
+
 impl TransferEtaEstimator {
     fn update(
         &mut self,
@@ -861,6 +1010,8 @@ impl TransferEtaEstimator {
         instant_bps: Option<f64>,
         elapsed_s: f64,
         finalize_line: bool,
+        workload: Option<EtaWorkload>,
+        progress: Option<EtaProgressTotals>,
     ) -> Option<f64> {
         let done = done?;
         if total == 0 {
@@ -899,6 +1050,26 @@ impl TransferEtaEstimator {
         {
             self.samples.push_back((elapsed_s, done_clamped));
         }
+        if let (Some(_), Some(progress)) = (workload, progress) {
+            if self
+                .work_samples
+                .back()
+                .map(|sample| {
+                    sample.elapsed_s != elapsed_s
+                        || sample.bytes != done_clamped
+                        || sample.progress.file_bins != progress.file_bins
+                        || sample.progress.file_bytes != progress.file_bytes
+                        || sample.progress.dirs != progress.dirs
+                })
+                .unwrap_or(true)
+            {
+                self.work_samples.push_back(EtaWorkSample {
+                    elapsed_s,
+                    bytes: done_clamped,
+                    progress,
+                });
+            }
+        }
         const SAMPLE_RETENTION_S: f64 = 45.0;
         while self
             .samples
@@ -907,6 +1078,14 @@ impl TransferEtaEstimator {
             .unwrap_or(false)
         {
             self.samples.pop_front();
+        }
+        while self
+            .work_samples
+            .front()
+            .map(|sample| elapsed_s - sample.elapsed_s > SAMPLE_RETENTION_S)
+            .unwrap_or(false)
+        {
+            self.work_samples.pop_front();
         }
 
         if self.zero_progress_s > 0.0 {
@@ -988,7 +1167,12 @@ impl TransferEtaEstimator {
             _ if sample_span_s < WARMUP_S => return None,
             _ => return None,
         };
-        let model_finish_s = elapsed_s + remain as f64 / rate;
+        self.peak_bps = Some(self.peak_bps.unwrap_or(rate).max(rate));
+        let scalar_eta_s = remain as f64 / rate;
+        let modeled_eta_s = workload.zip(progress).and_then(|(workload, progress)| {
+            self.workload_eta_s(workload, progress, remain, elapsed_s, rate)
+        });
+        let model_finish_s = elapsed_s + modeled_eta_s.unwrap_or(scalar_eta_s);
         if self.display_finish_s.is_none() || regime_changed {
             self.display_finish_s = Some(model_finish_s);
         } else if let Some(finish) = &mut self.display_finish_s {
@@ -1007,6 +1191,75 @@ impl TransferEtaEstimator {
             *self = Self::default();
         }
         result
+    }
+
+    // Use object rates only after a measured small-file phase; otherwise a
+    // physical capacity slowdown must continue to control the byte ETA.
+    fn workload_eta_s(
+        &self,
+        workload: EtaWorkload,
+        progress: EtaProgressTotals,
+        remaining_bytes: u64,
+        elapsed_s: f64,
+        current_rate: f64,
+    ) -> Option<f64> {
+        let (window_s, _, completed) =
+            eta_work_window(&self.work_samples, self.regime_start_s, elapsed_s, 5.0)?;
+        let small_files_completed: u64 = completed.file_bins[..=ETA_SMALL_FILE_BIN_LAST]
+            .iter()
+            .copied()
+            .sum();
+        if small_files_completed == 0 {
+            return None;
+        }
+        let small_file_rate = small_files_completed as f64 / window_s;
+        if !small_file_rate.is_finite() || small_file_rate <= 0.0 {
+            return None;
+        }
+
+        let mut remaining_files = [0u64; ETA_FILE_BIN_COUNT];
+        for (idx, remaining) in remaining_files.iter_mut().enumerate() {
+            *remaining = workload.file_bins[idx].saturating_sub(progress.file_bins[idx]);
+        }
+        let remaining_small_files: u64 = remaining_files[..=ETA_SMALL_FILE_BIN_LAST]
+            .iter()
+            .copied()
+            .sum();
+        if remaining_small_files == 0 {
+            return None;
+        }
+        let remaining_small_bytes = workload
+            .file_bytes
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx <= ETA_SMALL_FILE_BIN_LAST)
+            .map(|(idx, bytes)| bytes.saturating_sub(progress.file_bytes[idx]))
+            .sum::<u64>();
+        let remaining_large_bytes = remaining_bytes.saturating_sub(remaining_small_bytes);
+
+        let completed_files: u64 = completed.file_bins.iter().copied().sum();
+        if completed_files == 0 || small_files_completed.saturating_mul(2) < completed_files {
+            return None;
+        }
+
+        let capacity_bps = self.peak_bps.unwrap_or(current_rate).max(current_rate);
+        let large_eta_s = if remaining_large_bytes > 0 {
+            remaining_large_bytes as f64 / capacity_bps
+        } else {
+            0.0
+        };
+        let small_eta_s = remaining_small_files as f64 / small_file_rate;
+        let directory_eta_s = if completed.dirs > 0 && workload.dirs > progress.dirs {
+            (workload.dirs.saturating_sub(progress.dirs)) as f64 * window_s / completed.dirs as f64
+        } else {
+            0.0
+        };
+        let eta = small_eta_s + large_eta_s + directory_eta_s;
+        if eta.is_finite() && eta > 0.0 {
+            Some(eta)
+        } else {
+            None
+        }
     }
 }
 
@@ -1030,6 +1283,8 @@ fn print_transfer_progress_bars(
     rates: TransferProgressRates,
     proc_totals_delta: ProcIoDeltas,
     device_totals_delta: DeviceIoDeltas,
+    eta_workload: Option<EtaWorkload>,
+    eta_progress: Option<EtaProgressTotals>,
     eta_estimator: Option<&mut TransferEtaEstimator>,
     finalize_line: bool,
     flushing: bool,
@@ -1053,6 +1308,8 @@ fn print_transfer_progress_bars(
             rates.write_all_bps,
             elapsed_s,
             finalize_line,
+            eta_workload,
+            eta_progress,
         ),
         None if done.map(|value| value >= planned_bytes).unwrap_or(false) => Some(0.0),
         None => None,
@@ -3324,6 +3581,8 @@ fn flush_destination_writes(
                         merged_proc_deltas,
                         merged_device_deltas,
                         None,
+                        None,
+                        None,
                         false,
                         true,
                     );
@@ -3389,6 +3648,8 @@ fn flush_destination_writes(
             display_rates,
             merged_proc_deltas,
             merged_device_deltas,
+            None,
+            None,
             None,
             true,
             true,
@@ -3542,6 +3803,8 @@ fn run_move_cleanup_phase(
         rates,
         proc_delta,
         device_delta,
+        None,
+        None,
         Some(&mut eta_estimator),
         true,
         true,
@@ -5199,6 +5462,8 @@ fn run_rsync_transfer(
                 last_io_rates,
                 io_delta,
                 device_delta,
+                None,
+                None,
                 Some(&mut eta_estimator),
                 false,
                 false,
@@ -5279,6 +5544,8 @@ fn run_rsync_transfer(
         last_io_rates,
         io_delta,
         device_delta,
+        None,
+        None,
         Some(&mut eta_estimator),
         true,
         false,
@@ -5317,6 +5584,23 @@ fn run_rust_transfer(
     let inflight_limiter = inflight_max_bytes_for_media(media)
         .map(InflightWriteLimiter::new)
         .map(Arc::new);
+    let eta_workload = manifest
+        .map(|m| {
+            EtaWorkload::from_manifest(
+                m,
+                src_obj_kind == SrcObjKind::Dir && !src_path.ends_with('/'),
+            )
+        })
+        .or_else(|| {
+            (src_obj_kind == SrcObjKind::File)
+                .then(|| {
+                    fs::symlink_metadata(src_path)
+                        .ok()
+                        .map(|meta| EtaWorkload::from_file(meta.len()))
+                })
+                .flatten()
+        });
+    let eta_progress = Arc::new(AtomicEtaProgress::default());
     let transfer_start = Instant::now();
     print_transfer_columns_header();
     let io_window_for_avg = ProcessIoWindow::from_pid(std::process::id());
@@ -5328,6 +5612,8 @@ fn run_rust_transfer(
     let device_start_totals_for_ticker = device_start_totals;
     let src_path_for_ticker = src_path.to_string();
     let dst_path_for_ticker = dst_path.to_string();
+    let eta_workload_for_ticker = eta_workload;
+    let eta_progress_for_ticker = Arc::clone(&eta_progress);
 
     let done_for_ticker = Arc::clone(&done);
     let io_rates_shared = Arc::new(Mutex::new(TransferProgressRates::default()));
@@ -5380,6 +5666,8 @@ fn run_rust_transfer(
                         io_rates,
                         io_delta,
                         device_delta,
+                        eta_workload_for_ticker,
+                        Some(eta_progress_for_ticker.snapshot()),
                         Some(&mut eta_estimator),
                         false,
                         false,
@@ -5431,6 +5719,8 @@ fn run_rust_transfer(
                 final_io_rates,
                 io_delta,
                 device_delta,
+                eta_workload,
+                Some(eta_progress.snapshot()),
                 None,
                 true,
                 false,
@@ -5476,6 +5766,7 @@ fn run_rust_transfer(
                 if needs_copy && copy_symlink(src, dst).is_err() {
                     finish_transfer!(1);
                 }
+                eta_progress.mark_file(0);
                 finish_transfer!(0);
             }
             let src_meta = match fs::metadata(src) {
@@ -5524,6 +5815,7 @@ fn run_rust_transfer(
                     finish_transfer!(1);
                 }
             }
+            eta_progress.mark_file(src_meta.len());
         }
         SrcObjKind::Dir => {
             let src_no_trailing = src_path.trim_end_matches('/');
@@ -5539,6 +5831,7 @@ fn run_rust_transfer(
                 if fs::create_dir_all(dst_base.join(&src_base)).is_err() {
                     finish_transfer!(1);
                 }
+                eta_progress.mark_dir();
             } else {
                 if fs::create_dir_all(dst_base).is_err() {
                     finish_transfer!(1);
@@ -5551,6 +5844,7 @@ fn run_rust_transfer(
                     if fs::create_dir_all(&dst_dir).is_err() {
                         finish_transfer!(1);
                     }
+                    eta_progress.mark_dir();
                 }
                 let copy_ok = m
                     .copy_files
@@ -5564,7 +5858,11 @@ fn run_rust_transfer(
                             Err(_) => return false,
                         };
                         if src_md.file_type().is_symlink() {
-                            copy_symlink(&src_file, &dst_item).is_ok()
+                            let ok = copy_symlink(&src_file, &dst_item).is_ok();
+                            if ok {
+                                eta_progress.mark_file(0);
+                            }
+                            ok
                         } else if src_md.is_file() {
                             let src_mtime = src_md.modified().ok();
                             let dst_lmd = fs::symlink_metadata(&dst_item).ok();
@@ -5590,6 +5888,7 @@ fn run_rust_transfer(
                             )
                             .is_some();
                             if !needs_copy {
+                                eta_progress.mark_file(src_md.len());
                                 return true;
                             }
                             let _permit = acquire_file_write_permit(
@@ -5605,7 +5904,7 @@ fn run_rust_transfer(
                             {
                                 return false;
                             }
-                            copy_file_preserve_with_progress_buf(
+                            let ok = copy_file_preserve_with_progress_buf(
                                 &src_file,
                                 &dst_item,
                                 copy_buf_bytes,
@@ -5613,7 +5912,11 @@ fn run_rust_transfer(
                                     done.fetch_add(n, Ordering::Relaxed);
                                 },
                             )
-                            .is_ok()
+                            .is_ok();
+                            if ok {
+                                eta_progress.mark_file(src_md.len());
+                            }
+                            ok
                         } else {
                             true
                         }
@@ -5662,6 +5965,7 @@ fn run_rust_transfer(
                         if fs::create_dir_all(&dst_item).is_err() {
                             finish_transfer!(1);
                         }
+                        eta_progress.mark_dir();
                         continue;
                     }
                     if md.file_type().is_symlink() {
@@ -5669,6 +5973,7 @@ fn run_rust_transfer(
                         if needs_copy && copy_symlink(&p, &dst_item).is_err() {
                             finish_transfer!(1);
                         }
+                        eta_progress.mark_file(0);
                         continue;
                     }
                     if !md.is_file() {
@@ -5721,6 +6026,7 @@ fn run_rust_transfer(
                             finish_transfer!(1);
                         }
                     }
+                    eta_progress.mark_file(md.len());
                 }
                 preserve_directory_times_tree(
                     src_root,
@@ -9023,11 +9329,64 @@ Host dev-*
         for tick in 1..=60 {
             let elapsed = tick as f64 * 0.2;
             let done = (elapsed * rate) as u64;
-            eta = estimator.update(Some(done), total, Some(rate), elapsed, false);
+            eta = estimator.update(Some(done), total, Some(rate), elapsed, false, None, None);
         }
 
         let eta = eta.expect("ETA should be available after warmup");
         assert!(eta > 150.0 && eta < 250.0, "unexpected stable ETA: {eta}");
+    }
+
+    #[test]
+    fn eta_estimator_uses_remaining_file_composition_after_small_file_phase() {
+        let mut estimator = TransferEtaEstimator::default();
+        let mib = 1024.0 * 1024.0;
+        let kib = 1024u64;
+        let fast_rate = 100.0 * mib;
+        let mut workload = EtaWorkload::default();
+        workload.file_bins[0] = 1_000;
+        workload.file_bytes[0] = workload.file_bins[0] * 4 * kib;
+        workload.file_bins[7] = 10;
+        workload.file_bytes[7] = workload.file_bins[7] * 1024 * 1024 * 1024;
+        let total = workload.file_bytes.iter().sum::<u64>();
+        let mut progress = EtaProgressTotals::default();
+        let mut done = 0u64;
+
+        for tick in 1..=50 {
+            let elapsed = tick as f64 * 0.2;
+            done = (elapsed * fast_rate) as u64;
+            let _ = estimator.update(
+                Some(done),
+                total,
+                Some(fast_rate),
+                elapsed,
+                false,
+                Some(workload),
+                Some(progress),
+            );
+        }
+
+        let mut eta = None;
+        for tick in 51..=100 {
+            let elapsed = tick as f64 * 0.2;
+            done = done.saturating_add(4 * kib * 2);
+            progress.file_bins[0] += 2;
+            progress.file_bytes[0] += 4 * kib * 2;
+            eta = estimator.update(
+                Some(done),
+                total,
+                Some((4 * kib * 2) as f64 / 0.2),
+                elapsed,
+                false,
+                Some(workload),
+                Some(progress),
+            );
+        }
+
+        let eta = eta.expect("ETA should remain available during small-file phase");
+        assert!(
+            eta > 100.0 && eta < 1_000.0,
+            "unexpected composition ETA: {eta}"
+        );
     }
 
     #[test]
@@ -9041,15 +9400,30 @@ Host dev-*
         for tick in 1..=50 {
             let elapsed = tick as f64 * 0.2;
             let done = (elapsed * fast_rate) as u64;
-            let _ = estimator.update(Some(done), total, Some(fast_rate), elapsed, false);
+            let _ = estimator.update(
+                Some(done),
+                total,
+                Some(fast_rate),
+                elapsed,
+                false,
+                None,
+                None,
+            );
         }
 
         let mut eta_after_slowdown = None;
         for tick in 51..=80 {
             let elapsed = tick as f64 * 0.2;
             let done = (10.0 * fast_rate + (elapsed - 10.0) * slow_rate) as u64;
-            eta_after_slowdown =
-                estimator.update(Some(done), total, Some(slow_rate), elapsed, false);
+            eta_after_slowdown = estimator.update(
+                Some(done),
+                total,
+                Some(slow_rate),
+                elapsed,
+                false,
+                None,
+                None,
+            );
         }
 
         let eta = eta_after_slowdown.expect("ETA should remain available after slowdown");
@@ -9066,7 +9440,8 @@ Host dev-*
         for tick in 1..=60 {
             let elapsed = tick as f64 * 0.2;
             let done = (elapsed * rate) as u64;
-            eta_before_stall = estimator.update(Some(done), total, Some(rate), elapsed, false);
+            eta_before_stall =
+                estimator.update(Some(done), total, Some(rate), elapsed, false, None, None);
         }
 
         let eta_before_stall = eta_before_stall.expect("ETA should be available before stall");
@@ -9074,7 +9449,8 @@ Host dev-*
         let mut eta_after_short_stall = None;
         for tick in 61..=68 {
             let elapsed = tick as f64 * 0.2;
-            eta_after_short_stall = estimator.update(Some(done), total, Some(0.0), elapsed, false);
+            eta_after_short_stall =
+                estimator.update(Some(done), total, Some(0.0), elapsed, false, None, None);
         }
         let eta_after_short_stall =
             eta_after_short_stall.expect("short stall should retain the current ETA");
@@ -9086,7 +9462,8 @@ Host dev-*
         let mut long_stall_eta = Some(0.0);
         for tick in 69..=90 {
             let elapsed = tick as f64 * 0.2;
-            long_stall_eta = estimator.update(Some(done), total, Some(0.0), elapsed, false);
+            long_stall_eta =
+                estimator.update(Some(done), total, Some(0.0), elapsed, false, None, None);
         }
         assert!(
             long_stall_eta.is_none(),
