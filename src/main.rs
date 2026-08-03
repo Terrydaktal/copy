@@ -803,7 +803,9 @@ fn option_u64_saturating_add(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 }
 
 const ETA_FILE_BIN_COUNT: usize = 8;
-const ETA_SMALL_FILE_BIN_LAST: usize = 2;
+const ETA_MAX_REGIME_HYPOTHESES: usize = 64;
+const ETA_BUCKET_S: f64 = 1.0;
+const ETA_SAMPLE_RETENTION_S: f64 = 90.0;
 
 type EtaFileCounts = [u64; ETA_FILE_BIN_COUNT];
 type EtaFileBytes = [u64; ETA_FILE_BIN_COUNT];
@@ -870,6 +872,24 @@ struct EtaProgressTotals {
     dirs: u64,
 }
 
+impl EtaProgressTotals {
+    fn file_count(self) -> u64 {
+        self.file_bins.iter().copied().sum()
+    }
+
+    fn delta(self, previous: Self) -> Self {
+        Self {
+            file_bins: std::array::from_fn(|idx| {
+                self.file_bins[idx].saturating_sub(previous.file_bins[idx])
+            }),
+            file_bytes: std::array::from_fn(|idx| {
+                self.file_bytes[idx].saturating_sub(previous.file_bytes[idx])
+            }),
+            dirs: self.dirs.saturating_sub(previous.dirs),
+        }
+    }
+}
+
 struct AtomicEtaProgress {
     file_bins: [AtomicU64; ETA_FILE_BIN_COUNT],
     file_bytes: [AtomicU64; ETA_FILE_BIN_COUNT],
@@ -906,11 +926,289 @@ impl AtomicEtaProgress {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct EtaTelemetry {
+    write_bytes: Option<u64>,
+    write_complete: Option<u64>,
+    read_bytes: Option<u64>,
+    read_complete: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EtaActivity {
+    WarmingUp,
+    Active,
+    WorkloadBound,
+    PipelineBound,
+    TransientStall,
+    Stalled,
+    Complete,
+}
+
+impl EtaActivity {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WarmingUp => "warming-up",
+            Self::Active => "active",
+            Self::WorkloadBound => "workload-bound",
+            Self::PipelineBound => "pipeline-bound",
+            Self::TransientStall => "stalled briefly",
+            Self::Stalled => "stalled",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EtaEstimate {
+    p10_s: Option<f64>,
+    p50_s: Option<f64>,
+    p90_s: Option<f64>,
+    confidence: f64,
+    activity: EtaActivity,
+}
+
 #[derive(Clone, Copy)]
 struct EtaWorkSample {
     elapsed_s: f64,
     bytes: u64,
     progress: EtaProgressTotals,
+}
+
+#[derive(Clone, Copy)]
+struct EtaRegimeHypothesis {
+    run_length_s: f64,
+    mean_log_bps: f64,
+    m2_log_bps: f64,
+    observations: f64,
+    log_probability: f64,
+}
+
+impl EtaRegimeHypothesis {
+    fn variance(self) -> f64 {
+        if self.observations > 1.0 {
+            (self.m2_log_bps / (self.observations - 1.0)).max(0.04 * 0.04)
+        } else {
+            0.40 * 0.40
+        }
+    }
+
+    fn observe(self, observation: f64, dt_s: f64, log_probability: f64) -> Self {
+        let observations = self.observations + 1.0;
+        let delta = observation - self.mean_log_bps;
+        let mean_log_bps = self.mean_log_bps + delta / observations;
+        let m2_log_bps = self.m2_log_bps + delta * (observation - mean_log_bps);
+        Self {
+            run_length_s: self.run_length_s + dt_s,
+            mean_log_bps,
+            m2_log_bps,
+            observations,
+            log_probability,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EtaRegimeModel {
+    hypotheses: Vec<EtaRegimeHypothesis>,
+    observations: u64,
+    observed_s: f64,
+    zero_progress_s: f64,
+}
+
+fn log_sum_exp(values: impl IntoIterator<Item = f64>) -> f64 {
+    let values: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
+    let max = values.iter().copied().max_by(f64::total_cmp);
+    let Some(max) = max else {
+        return f64::NEG_INFINITY;
+    };
+    max + values
+        .iter()
+        .map(|value| (*value - max).exp())
+        .sum::<f64>()
+        .ln()
+}
+
+fn student_t_log_likelihood(observation: f64, mean: f64, variance: f64) -> f64 {
+    const NU: f64 = 4.0;
+    let variance = variance.max(0.04 * 0.04);
+    let residual = observation - mean;
+    -0.5 * variance.ln() - 0.5 * (NU + 1.0) * (1.0 + residual * residual / (NU * variance)).ln()
+}
+
+impl EtaRegimeModel {
+    fn observe(&mut self, rate_bps: f64, dt_s: f64) {
+        if !rate_bps.is_finite() || rate_bps <= 0.0 || dt_s <= 0.0 {
+            return;
+        }
+        self.observed_s += dt_s;
+        let observation = rate_bps.max(1.0).ln();
+        self.observations = self.observations.saturating_add(1);
+        if self.hypotheses.is_empty() {
+            self.hypotheses.push(EtaRegimeHypothesis {
+                run_length_s: dt_s,
+                mean_log_bps: observation,
+                m2_log_bps: 0.0,
+                observations: 1.0,
+                log_probability: 0.0,
+            });
+            return;
+        }
+
+        let hazard = (1.0 - (-dt_s / 240.0).exp()).clamp(0.0001, 0.5);
+        let mut growth = Vec::with_capacity(self.hypotheses.len());
+        let mut change_terms = Vec::with_capacity(self.hypotheses.len());
+        for hypothesis in self.hypotheses.iter().copied() {
+            let likelihood = student_t_log_likelihood(
+                observation,
+                hypothesis.mean_log_bps,
+                hypothesis.variance(),
+            );
+            growth.push(hypothesis.observe(
+                observation,
+                dt_s,
+                hypothesis.log_probability + (1.0 - hazard).ln() + likelihood,
+            ));
+            change_terms.push(hypothesis.log_probability + hazard.ln() + likelihood);
+        }
+
+        let change_log_probability = log_sum_exp(change_terms);
+        let mut next = Vec::with_capacity(growth.len() + 1);
+        next.push(EtaRegimeHypothesis {
+            run_length_s: dt_s,
+            mean_log_bps: observation,
+            m2_log_bps: 0.0,
+            observations: 1.0,
+            log_probability: change_log_probability,
+        });
+        next.extend(growth);
+        let normalizer = log_sum_exp(next.iter().map(|hypothesis| hypothesis.log_probability));
+        for hypothesis in &mut next {
+            hypothesis.log_probability -= normalizer;
+        }
+        next.sort_by(|a, b| b.log_probability.total_cmp(&a.log_probability));
+        next.truncate(ETA_MAX_REGIME_HYPOTHESES);
+        self.hypotheses = next;
+    }
+
+    fn observe_zero(&mut self, dt_s: f64) {
+        if dt_s > 0.0 {
+            self.observed_s += dt_s;
+            self.zero_progress_s += dt_s;
+        }
+    }
+
+    fn current_rate_bps(&self) -> Option<f64> {
+        self.hypotheses
+            .first()
+            .map(|hypothesis| hypothesis.mean_log_bps.exp())
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+    }
+
+    fn recent_change_probability(&self) -> f64 {
+        self.hypotheses
+            .iter()
+            .filter(|hypothesis| hypothesis.run_length_s <= 2.5)
+            .map(|hypothesis| hypothesis.log_probability.exp())
+            .sum::<f64>()
+            .clamp(0.0, 1.0)
+    }
+
+    fn log_rate_sigma(&self) -> f64 {
+        self.hypotheses
+            .first()
+            .map(|hypothesis| hypothesis.variance().sqrt())
+            .unwrap_or(1.0)
+            .clamp(0.12, 1.5)
+    }
+
+    fn zero_probability(&self) -> f64 {
+        if self.observed_s <= 0.0 {
+            0.0
+        } else {
+            (self.zero_progress_s / self.observed_s).clamp(0.0, 1.0)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EtaCostModel {
+    file_overhead_s: [f64; ETA_FILE_BIN_COUNT],
+    file_weight: [f64; ETA_FILE_BIN_COUNT],
+    dir_overhead_s: f64,
+    dir_weight: f64,
+}
+
+impl Default for EtaCostModel {
+    fn default() -> Self {
+        Self {
+            file_overhead_s: [0.0; ETA_FILE_BIN_COUNT],
+            file_weight: [0.0; ETA_FILE_BIN_COUNT],
+            dir_overhead_s: 0.0,
+            dir_weight: 0.0,
+        }
+    }
+}
+
+impl EtaCostModel {
+    fn observe(
+        &mut self,
+        dt_s: f64,
+        bytes: u64,
+        progress: EtaProgressTotals,
+        capacity_bps: Option<f64>,
+    ) {
+        let files = progress.file_count();
+        let objects = files.saturating_add(progress.dirs);
+        if dt_s <= 0.0 || objects == 0 {
+            return;
+        }
+        let byte_time_s = capacity_bps
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+            .map(|rate| bytes as f64 / rate)
+            .unwrap_or(0.0);
+        let residual_s = (dt_s - byte_time_s).max(0.0);
+        let per_object_s = residual_s / objects as f64;
+        if files > 0 {
+            for idx in 0..ETA_FILE_BIN_COUNT {
+                let count = progress.file_bins[idx];
+                if count == 0 {
+                    continue;
+                }
+                let weight = self.file_weight[idx];
+                let alpha = (count as f64 / (weight + count as f64)).clamp(0.05, 0.5);
+                self.file_overhead_s[idx] =
+                    self.file_overhead_s[idx] * (1.0 - alpha) + per_object_s * alpha;
+                self.file_weight[idx] += count as f64;
+            }
+        }
+        if progress.dirs > 0 {
+            let alpha =
+                (progress.dirs as f64 / (self.dir_weight + progress.dirs as f64)).clamp(0.05, 0.5);
+            self.dir_overhead_s = self.dir_overhead_s * (1.0 - alpha) + per_object_s * alpha;
+            self.dir_weight += progress.dirs as f64;
+        }
+    }
+
+    fn remaining_eta_s(&self, workload: EtaWorkload, progress: EtaProgressTotals) -> f64 {
+        let mut eta = 0.0;
+        for idx in 0..ETA_FILE_BIN_COUNT {
+            let remaining = workload.file_bins[idx].saturating_sub(progress.file_bins[idx]);
+            if self.file_weight[idx] >= 2.0 {
+                eta += remaining as f64 * self.file_overhead_s[idx].max(0.0);
+            }
+        }
+        if self.dir_weight >= 2.0 {
+            eta +=
+                workload.dirs.saturating_sub(progress.dirs) as f64 * self.dir_overhead_s.max(0.0);
+        }
+        eta
+    }
+
+    fn confidence(&self) -> f64 {
+        let weight: f64 = self.file_weight.iter().sum::<f64>() + self.dir_weight;
+        (1.0 - (-weight / 500.0).exp()).clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Default)]
@@ -920,11 +1218,15 @@ struct TransferEtaEstimator {
     display_finish_s: Option<f64>,
     last_elapsed_s: Option<f64>,
     last_done: Option<u64>,
+    last_model_sample: Option<EtaWorkSample>,
     regime_start_s: f64,
-    reference_bps: Option<f64>,
-    peak_bps: Option<f64>,
-    slowdown_since_s: Option<(f64, f64)>,
+    change_since_s: Option<(f64, f64)>,
     zero_progress_s: f64,
+    regime_model: EtaRegimeModel,
+    cost_model: EtaCostModel,
+    sequential_bps: Option<f64>,
+    sequential_weight: f64,
+    last_estimate: Option<EtaEstimate>,
 }
 
 fn rate_over_window(
@@ -967,43 +1269,8 @@ fn median_rate(rates: impl IntoIterator<Item = Option<f64>>) -> Option<f64> {
     Some(values[values.len() / 2])
 }
 
-fn eta_work_window(
-    samples: &VecDeque<EtaWorkSample>,
-    start_s: f64,
-    now_s: f64,
-    window_s: f64,
-) -> Option<(f64, u64, EtaProgressTotals)> {
-    let cutoff_s = (now_s - window_s).max(start_s);
-    let first = samples
-        .iter()
-        .filter(|sample| sample.elapsed_s >= start_s)
-        .find(|sample| sample.elapsed_s >= cutoff_s)
-        .copied()?;
-    let last = samples
-        .iter()
-        .rev()
-        .find(|sample| sample.elapsed_s >= start_s)
-        .copied()?;
-    let dt = last.elapsed_s - first.elapsed_s;
-    if dt <= 1e-6 {
-        return None;
-    }
-    Some((
-        dt,
-        last.bytes.saturating_sub(first.bytes),
-        EtaProgressTotals {
-            file_bins: std::array::from_fn(|idx| {
-                last.progress.file_bins[idx].saturating_sub(first.progress.file_bins[idx])
-            }),
-            file_bytes: std::array::from_fn(|idx| {
-                last.progress.file_bytes[idx].saturating_sub(first.progress.file_bytes[idx])
-            }),
-            dirs: last.progress.dirs.saturating_sub(first.progress.dirs),
-        },
-    ))
-}
-
 impl TransferEtaEstimator {
+    #[cfg(test)]
     fn update(
         &mut self,
         done: Option<u64>,
@@ -1014,6 +1281,31 @@ impl TransferEtaEstimator {
         workload: Option<EtaWorkload>,
         progress: Option<EtaProgressTotals>,
     ) -> Option<f64> {
+        self.update_with_telemetry(
+            done,
+            total,
+            instant_bps,
+            elapsed_s,
+            finalize_line,
+            workload,
+            progress,
+            EtaTelemetry::default(),
+            TransferProgressRates::default(),
+        )
+    }
+
+    fn update_with_telemetry(
+        &mut self,
+        done: Option<u64>,
+        total: u64,
+        instant_bps: Option<f64>,
+        elapsed_s: f64,
+        finalize_line: bool,
+        workload: Option<EtaWorkload>,
+        progress: Option<EtaProgressTotals>,
+        telemetry: EtaTelemetry,
+        rates: TransferProgressRates,
+    ) -> Option<f64> {
         let done = done?;
         if total == 0 {
             return None;
@@ -1021,6 +1313,16 @@ impl TransferEtaEstimator {
         let done_clamped = done.min(total);
         let remain = total.saturating_sub(done_clamped);
         if remain == 0 {
+            self.last_estimate = Some(EtaEstimate {
+                p10_s: Some(0.0),
+                p50_s: Some(0.0),
+                p90_s: Some(0.0),
+                confidence: 1.0,
+                activity: EtaActivity::Complete,
+            });
+            if finalize_line {
+                *self = Self::default();
+            }
             return Some(0.0);
         }
 
@@ -1043,39 +1345,18 @@ impl TransferEtaEstimator {
         self.last_elapsed_s = Some(elapsed_s);
         self.last_done = Some(done_clamped);
 
-        if self
-            .samples
-            .back()
-            .map(|(t, bytes)| *t != elapsed_s || *bytes != done_clamped)
-            .unwrap_or(true)
-        {
-            self.samples.push_back((elapsed_s, done_clamped));
-        }
+        self.samples.push_back((elapsed_s, done_clamped));
         if let (Some(_), Some(progress)) = (workload, progress) {
-            if self
-                .work_samples
-                .back()
-                .map(|sample| {
-                    sample.elapsed_s != elapsed_s
-                        || sample.bytes != done_clamped
-                        || sample.progress.file_bins != progress.file_bins
-                        || sample.progress.file_bytes != progress.file_bytes
-                        || sample.progress.dirs != progress.dirs
-                })
-                .unwrap_or(true)
-            {
-                self.work_samples.push_back(EtaWorkSample {
-                    elapsed_s,
-                    bytes: done_clamped,
-                    progress,
-                });
-            }
+            self.work_samples.push_back(EtaWorkSample {
+                elapsed_s,
+                bytes: done_clamped,
+                progress,
+            });
         }
-        const SAMPLE_RETENTION_S: f64 = 45.0;
         while self
             .samples
             .front()
-            .map(|(t, _)| elapsed_s - *t > SAMPLE_RETENTION_S)
+            .map(|(t, _)| elapsed_s - *t > ETA_SAMPLE_RETENTION_S)
             .unwrap_or(false)
         {
             self.samples.pop_front();
@@ -1083,19 +1364,80 @@ impl TransferEtaEstimator {
         while self
             .work_samples
             .front()
-            .map(|sample| elapsed_s - sample.elapsed_s > SAMPLE_RETENTION_S)
+            .map(|sample| elapsed_s - sample.elapsed_s > ETA_SAMPLE_RETENTION_S)
             .unwrap_or(false)
         {
             self.work_samples.pop_front();
+        }
+
+        let current_work_sample = EtaWorkSample {
+            elapsed_s,
+            bytes: done_clamped,
+            progress: progress.unwrap_or_default(),
+        };
+        if let Some(previous) = self.last_model_sample {
+            let model_dt = current_work_sample.elapsed_s - previous.elapsed_s;
+            if model_dt >= ETA_BUCKET_S {
+                let delta_bytes = current_work_sample.bytes.saturating_sub(previous.bytes);
+                let delta_progress = current_work_sample.progress.delta(previous.progress);
+                if delta_bytes > 0 {
+                    let rate = delta_bytes as f64 / model_dt;
+                    self.regime_model.observe(rate, model_dt);
+                    let files = delta_progress.file_count();
+                    let average_file_size = if files > 0 { delta_bytes / files } else { 0 };
+                    let sequential_sample = if workload.is_some() && progress.is_some() {
+                        delta_bytes >= 4 * 1024 * 1024
+                            && (files == 0 || average_file_size >= 1024 * 1024)
+                    } else {
+                        true
+                    };
+                    self.update_capacity(rate, sequential_sample, elapsed_s, model_dt);
+                    if workload.is_some() && progress.is_some() {
+                        self.cost_model.observe(
+                            model_dt,
+                            delta_bytes,
+                            delta_progress,
+                            self.sequential_bps.or(Some(rate)),
+                        );
+                    }
+                } else {
+                    self.regime_model.observe_zero(model_dt);
+                    if workload.is_some()
+                        && progress.is_some()
+                        && (delta_progress.file_count() > 0 || delta_progress.dirs > 0)
+                    {
+                        self.cost_model
+                            .observe(model_dt, 0, delta_progress, self.sequential_bps);
+                    }
+                }
+                self.last_model_sample = Some(current_work_sample);
+            }
+        } else {
+            self.last_model_sample = Some(current_work_sample);
         }
 
         if self.zero_progress_s > 0.0 {
             if let Some(finish) = &mut self.display_finish_s {
                 *finish += dt;
                 if self.zero_progress_s >= 5.0 {
+                    self.last_estimate = Some(EtaEstimate {
+                        p10_s: None,
+                        p50_s: None,
+                        p90_s: None,
+                        confidence: 0.0,
+                        activity: EtaActivity::Stalled,
+                    });
                     return None;
                 }
-                return Some((*finish - elapsed_s).max(0.0).round());
+                let eta = (*finish - elapsed_s).max(0.0).round();
+                self.last_estimate = Some(EtaEstimate {
+                    p10_s: Some(eta),
+                    p50_s: Some(eta),
+                    p90_s: Some(eta),
+                    confidence: 0.25,
+                    activity: EtaActivity::TransientStall,
+                });
+                return Some(eta);
             }
         }
 
@@ -1104,163 +1446,240 @@ impl TransferEtaEstimator {
             (Some((first_t, _)), Some((last_t, _))) => (last_t - first_t).max(0.0),
             _ => 0.0,
         };
-        let recent_rate = rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 1.2)
-            .or_else(|| instant_bps.filter(|rate| rate.is_finite() && *rate > 0.0));
+        let recent_rate = median_rate([
+            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 1.2),
+            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 2.5),
+            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 5.0),
+        ])
+        .or_else(|| instant_bps.filter(|rate| rate.is_finite() && *rate > 0.0));
 
-        if self.reference_bps.is_none() && sample_span_s >= WARMUP_S {
-            self.reference_bps = median_rate([
-                rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 2.5),
-                rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 5.0),
-            ]);
-        }
-
-        let mut regime_changed = false;
-        if let (Some(reference), Some(recent)) = (self.reference_bps, recent_rate) {
-            let ratio = recent / reference.max(1e-6);
-            let candidate = if ratio < 0.125 {
-                Some(1.2)
-            } else if ratio < 0.60 {
-                Some(2.5)
-            } else {
-                None
-            };
-            if let Some(confirm_after_s) = candidate {
-                if self.slowdown_since_s.is_none() {
-                    self.slowdown_since_s = Some((elapsed_s, confirm_after_s));
-                }
-                if self
-                    .slowdown_since_s
-                    .map(|(started, required)| elapsed_s - started >= required)
-                    .unwrap_or(false)
-                {
-                    self.regime_start_s = (elapsed_s - confirm_after_s).max(0.0);
-                    self.reference_bps = Some(recent.max(1.0));
-                    self.slowdown_since_s = None;
-                    regime_changed = true;
-                }
-            } else {
-                self.slowdown_since_s = None;
-                if recent.is_finite() && recent > 0.0 {
-                    self.reference_bps = Some(reference * 0.98 + recent * 0.02);
-                }
+        if let Some(rate) = recent_rate {
+            if self.regime_model.hypotheses.is_empty() {
+                self.regime_model
+                    .observe(rate, sample_span_s.max(ETA_BUCKET_S));
             }
         }
 
         if self.zero_progress_s >= 5.0 {
+            self.last_estimate = Some(EtaEstimate {
+                p10_s: None,
+                p50_s: None,
+                p90_s: None,
+                confidence: 0.0,
+                activity: EtaActivity::Stalled,
+            });
             return None;
         }
         if self.zero_progress_s >= 1.5 {
             if let Some(finish) = &mut self.display_finish_s {
                 *finish += dt;
-                return Some((*finish - elapsed_s).max(0.0).round());
+                let eta = (*finish - elapsed_s).max(0.0).round();
+                self.last_estimate = Some(EtaEstimate {
+                    p10_s: Some(eta),
+                    p50_s: Some(eta),
+                    p90_s: Some(eta),
+                    confidence: 0.25,
+                    activity: EtaActivity::TransientStall,
+                });
+                return Some(eta);
             }
             return None;
         }
 
-        let current_rate = median_rate([
-            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 1.2),
-            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 2.5),
-            rate_over_window(&self.samples, self.regime_start_s, elapsed_s, 5.0),
-        ])
-        .or_else(|| recent_rate.filter(|rate| *rate > 0.0));
+        let current_rate = recent_rate
+            .or_else(|| self.regime_model.current_rate_bps())
+            .filter(|rate| rate.is_finite() && *rate > 0.0);
         let rate = match current_rate {
-            Some(rate) if rate.is_finite() && rate > 0.0 => rate,
-            _ if sample_span_s < WARMUP_S => return None,
+            Some(rate) => rate,
+            _ if sample_span_s < WARMUP_S => {
+                self.last_estimate = Some(EtaEstimate {
+                    p10_s: None,
+                    p50_s: None,
+                    p90_s: None,
+                    confidence: 0.0,
+                    activity: EtaActivity::WarmingUp,
+                });
+                return None;
+            }
             _ => return None,
         };
-        self.peak_bps = Some(self.peak_bps.unwrap_or(rate).max(rate));
-        let scalar_eta_s = remain as f64 / rate;
-        let modeled_eta_s = workload.zip(progress).and_then(|(workload, progress)| {
-            self.workload_eta_s(workload, progress, remain, elapsed_s, rate)
-        });
-        let model_finish_s = elapsed_s + modeled_eta_s.unwrap_or(scalar_eta_s);
+
+        let capacity_bps = self.sequential_bps.unwrap_or(rate).max(1.0);
+        let byte_eta_s = remain as f64 / capacity_bps;
+        let object_eta_s = workload
+            .zip(progress)
+            .map(|(workload, progress)| self.cost_model.remaining_eta_s(workload, progress))
+            .unwrap_or(0.0);
+        let workload_model_active = workload.is_some()
+            && progress.is_some()
+            && (self.cost_model.confidence() > 0.05 || object_eta_s > 0.0);
+        let producer_eta_s = if workload_model_active {
+            byte_eta_s + object_eta_s
+        } else {
+            (byte_eta_s + object_eta_s).max(remain as f64 / rate)
+        };
+        let pipeline_eta_s = self.pipeline_eta_s(telemetry, rates, elapsed_s);
+        let model_eta_s = pipeline_eta_s
+            .map(|pipeline| producer_eta_s.max(pipeline))
+            .unwrap_or(producer_eta_s);
+        let model_eta_s = if model_eta_s.is_finite() && model_eta_s > 0.0 {
+            model_eta_s
+        } else {
+            return None;
+        };
+        let workload_confidence = workload
+            .zip(progress)
+            .map(|_| self.cost_model.confidence())
+            .unwrap_or(0.0);
+        let rate_uncertainty = self.regime_model.log_rate_sigma();
+        let pipeline_confidence = if pipeline_eta_s.is_some() { 0.45 } else { 0.0 };
+        let confidence = (((1.0 - (-(self.regime_model.observations as f64) / 20.0).exp()) * 0.65
+            + workload_confidence * 0.25
+            + pipeline_confidence * 0.10)
+            * (1.0 - 0.5 * self.regime_model.zero_probability()))
+        .clamp(0.0, 1.0);
+        let uncertainty = (rate_uncertainty * (1.0 - 0.45 * confidence) + 0.08).clamp(0.12, 1.35);
+        let p10_s = (model_eta_s / uncertainty.exp()).max(0.0);
+        let p90_s = (model_eta_s * uncertainty.exp()).max(model_eta_s);
+        let workload_bound = object_eta_s > byte_eta_s * 0.25;
+        let pipeline_bound = pipeline_eta_s
+            .map(|pipeline| pipeline > producer_eta_s * 1.25)
+            .unwrap_or(false);
+        let activity = if pipeline_bound {
+            EtaActivity::PipelineBound
+        } else if workload_bound {
+            EtaActivity::WorkloadBound
+        } else {
+            EtaActivity::Active
+        };
+        let model_finish_s = elapsed_s + model_eta_s;
+        let regime_changed = self.regime_model.recent_change_probability() > 0.65;
         if self.display_finish_s.is_none() || regime_changed {
             self.display_finish_s = Some(model_finish_s);
         } else if let Some(finish) = &mut self.display_finish_s {
+            let smoothing_s = 2.0 + 4.0 * (1.0 - confidence);
             let alpha = if dt > 0.0 {
-                1.0 - (-dt / 2.0).exp()
+                1.0 - (-dt / smoothing_s).exp()
             } else {
                 0.0
             };
             *finish += alpha * (model_finish_s - *finish);
         }
 
-        let result = self
+        let displayed_s = self
             .display_finish_s
             .map(|finish| (finish - elapsed_s).max(0.0).round());
+        self.last_estimate = Some(EtaEstimate {
+            p10_s: Some(p10_s),
+            p50_s: displayed_s.map(|value| value as f64),
+            p90_s: Some(p90_s),
+            confidence,
+            activity,
+        });
         if finalize_line {
+            let result = displayed_s;
             *self = Self::default();
+            return result;
         }
-        result
+        displayed_s
     }
 
-    // Use object rates only after a measured small-file phase; otherwise a
-    // physical capacity slowdown must continue to control the byte ETA.
-    fn workload_eta_s(
+    fn update_capacity(&mut self, rate: f64, sequential_sample: bool, elapsed_s: f64, dt_s: f64) {
+        if !sequential_sample || !rate.is_finite() || rate <= 0.0 {
+            return;
+        }
+        let previous = self.sequential_bps;
+        let ratio = previous.map(|old| rate / old.max(1.0));
+        let candidate_s = ratio.and_then(|ratio| {
+            if ratio < 0.125 || ratio > 8.0 {
+                Some(1.2)
+            } else if ratio < 0.60 || ratio > 1.67 {
+                Some(2.5)
+            } else {
+                None
+            }
+        });
+        let mut regime_changed = false;
+        if let Some(required_s) = candidate_s {
+            if self.change_since_s.is_none() {
+                self.change_since_s = Some(((elapsed_s - dt_s).max(0.0), required_s));
+            }
+            if self
+                .change_since_s
+                .map(|(started, required)| elapsed_s - started >= required)
+                .unwrap_or(false)
+            {
+                self.regime_start_s = self
+                    .change_since_s
+                    .map(|(started, _)| started)
+                    .unwrap_or((elapsed_s - dt_s).max(0.0));
+                self.change_since_s = None;
+                regime_changed = true;
+            }
+        } else {
+            self.change_since_s = None;
+        }
+
+        let alpha = if regime_changed { 0.65 } else { 0.20 };
+        self.sequential_bps = Some(match self.sequential_bps {
+            Some(previous) => previous * (1.0 - alpha) + rate * alpha,
+            None => rate,
+        });
+        self.sequential_weight += dt_s;
+    }
+
+    fn pipeline_eta_s(
         &self,
-        workload: EtaWorkload,
-        progress: EtaProgressTotals,
-        remaining_bytes: u64,
+        telemetry: EtaTelemetry,
+        rates: TransferProgressRates,
         elapsed_s: f64,
-        current_rate: f64,
     ) -> Option<f64> {
-        let (window_s, _, completed) =
-            eta_work_window(&self.work_samples, self.regime_start_s, elapsed_s, 5.0)?;
-        let small_files_completed: u64 = completed.file_bins[..=ETA_SMALL_FILE_BIN_LAST]
-            .iter()
-            .copied()
-            .sum();
-        if small_files_completed == 0 {
-            return None;
-        }
-        let small_file_rate = small_files_completed as f64 / window_s;
-        if !small_file_rate.is_finite() || small_file_rate <= 0.0 {
-            return None;
-        }
-
-        let mut remaining_files = [0u64; ETA_FILE_BIN_COUNT];
-        for (idx, remaining) in remaining_files.iter_mut().enumerate() {
-            *remaining = workload.file_bins[idx].saturating_sub(progress.file_bins[idx]);
-        }
-        let remaining_small_files: u64 = remaining_files[..=ETA_SMALL_FILE_BIN_LAST]
-            .iter()
-            .copied()
-            .sum();
-        if remaining_small_files == 0 {
-            return None;
-        }
-        let remaining_small_bytes = workload
-            .file_bytes
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| *idx <= ETA_SMALL_FILE_BIN_LAST)
-            .map(|(idx, bytes)| bytes.saturating_sub(progress.file_bytes[idx]))
-            .sum::<u64>();
-        let remaining_large_bytes = remaining_bytes.saturating_sub(remaining_small_bytes);
-
-        let completed_files: u64 = completed.file_bins.iter().copied().sum();
-        if completed_files == 0 || small_files_completed.saturating_mul(2) < completed_files {
-            return None;
-        }
-
-        let capacity_bps = self.peak_bps.unwrap_or(current_rate).max(current_rate);
-        let large_eta_s = if remaining_large_bytes > 0 {
-            remaining_large_bytes as f64 / capacity_bps
-        } else {
-            0.0
+        let write_backlog = match (telemetry.write_bytes, telemetry.write_complete) {
+            (Some(submitted), Some(completed)) => submitted.saturating_sub(completed),
+            _ => 0,
         };
-        let small_eta_s = remaining_small_files as f64 / small_file_rate;
-        let directory_eta_s = if completed.dirs > 0 && workload.dirs > progress.dirs {
-            (workload.dirs.saturating_sub(progress.dirs)) as f64 * window_s / completed.dirs as f64
-        } else {
-            0.0
+        let read_backlog = match (telemetry.read_bytes, telemetry.read_complete) {
+            (Some(submitted), Some(completed)) => submitted.saturating_sub(completed),
+            _ => 0,
         };
-        let eta = small_eta_s + large_eta_s + directory_eta_s;
-        if eta.is_finite() && eta > 0.0 {
-            Some(eta)
-        } else {
-            None
+        let write_rate = rates
+            .write_complete_bps
+            .filter(|rate| *rate > 0.0)
+            .or_else(|| {
+                if elapsed_s > 1.0 {
+                    telemetry
+                        .write_complete
+                        .map(|completed| completed as f64 / elapsed_s)
+                        .filter(|rate| *rate > 0.0)
+                } else {
+                    None
+                }
+            });
+        let read_rate = rates
+            .read_complete_bps
+            .filter(|rate| *rate > 0.0)
+            .or_else(|| {
+                if elapsed_s > 1.0 {
+                    telemetry
+                        .read_complete
+                        .map(|completed| completed as f64 / elapsed_s)
+                        .filter(|rate| *rate > 0.0)
+                } else {
+                    None
+                }
+            });
+        let write_eta = write_rate.map(|rate| write_backlog as f64 / rate);
+        let read_eta = read_rate.map(|rate| read_backlog as f64 / rate);
+        match (write_eta, read_eta) {
+            (Some(write), Some(read)) => Some(write.max(read)),
+            (Some(write), None) => Some(write),
+            (None, Some(read)) => Some(read),
+            (None, None) => None,
         }
+    }
+
+    fn last_estimate(&self) -> Option<EtaEstimate> {
+        self.last_estimate
     }
 }
 
@@ -1276,6 +1695,11 @@ fn progress_render_state() -> &'static Mutex<ProgressRenderState> {
     STATE.get_or_init(|| Mutex::new(ProgressRenderState::default()))
 }
 
+fn eta_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env::var_os("COPY_RS_ETA_DEBUG").is_some())
+}
+
 fn print_transfer_progress_bars(
     elapsed_s: f64,
     planned_bytes: u64,
@@ -1286,7 +1710,7 @@ fn print_transfer_progress_bars(
     device_totals_delta: DeviceIoDeltas,
     eta_workload: Option<EtaWorkload>,
     eta_progress: Option<EtaProgressTotals>,
-    eta_estimator: Option<&mut TransferEtaEstimator>,
+    mut eta_estimator: Option<&mut TransferEtaEstimator>,
     finalize_line: bool,
     flushing: bool,
 ) {
@@ -1302,16 +1726,29 @@ fn print_transfer_progress_bars(
     } else {
         None
     };
-    let eta = match eta_estimator {
-        Some(estimator) => estimator.update(
-            done,
-            planned_bytes,
-            rates.write_all_bps,
-            elapsed_s,
-            finalize_line,
-            eta_workload,
-            eta_progress,
-        ),
+    let eta_telemetry = EtaTelemetry {
+        write_bytes: proc_totals_delta.write_bytes,
+        write_complete: device_totals_delta.write_complete,
+        read_bytes: proc_totals_delta.read_bytes,
+        read_complete: device_totals_delta.read_complete,
+    };
+    let mut eta_estimate = None;
+    let eta = match eta_estimator.as_mut() {
+        Some(estimator) => {
+            let eta = estimator.update_with_telemetry(
+                done,
+                planned_bytes,
+                rates.write_all_bps,
+                elapsed_s,
+                finalize_line,
+                eta_workload,
+                eta_progress,
+                eta_telemetry,
+                rates,
+            );
+            eta_estimate = estimator.last_estimate();
+            eta
+        }
         None if done.map(|value| value >= planned_bytes).unwrap_or(false) => Some(0.0),
         None => None,
     };
@@ -1346,6 +1783,31 @@ fn print_transfer_progress_bars(
         Some(v) => fmt_hms_tenths(v.max(0.0)),
         None => "--:--:--.-".to_string(),
     };
+    let eta_debug = if eta_debug_enabled() {
+        eta_estimate
+            .map(|estimate| {
+                let p10 = estimate
+                    .p10_s
+                    .map(fmt_hms_tenths)
+                    .unwrap_or_else(|| "--:--:--.-".to_string());
+                let p50 = estimate
+                    .p50_s
+                    .map(fmt_hms_tenths)
+                    .unwrap_or_else(|| "--:--:--.-".to_string());
+                let p90 = estimate
+                    .p90_s
+                    .map(fmt_hms_tenths)
+                    .unwrap_or_else(|| "--:--:--.-".to_string());
+                format!(
+                    " [p10 {p10} p50 {p50} p90 {p90} {} {:.0}%]",
+                    estimate.activity.label(),
+                    estimate.confidence * 100.0
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let pct_s = match pct {
         Some(v) => format!("{v:>6.2}%"),
         None => "  ---%".to_string(),
@@ -1363,7 +1825,7 @@ fn print_transfer_progress_bars(
 
     let mut lines = vec![
         clamp_line_for_term(format!(
-            "{pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta",
+            "{pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta{eta_debug}",
             build_progress_bar(pct, BAR_WIDTH)
         )),
         String::new(),
@@ -9567,5 +10029,81 @@ Host dev-*
             long_stall_eta.is_none(),
             "long stall should report an unavailable ETA"
         );
+    }
+
+    #[test]
+    fn eta_estimator_exposes_ordered_percentiles_for_mixed_workload() {
+        let mut estimator = TransferEtaEstimator::default();
+        let kib = 1024u64;
+        let mut workload = EtaWorkload::default();
+        workload.file_bins[0] = 2_000;
+        workload.file_bytes[0] = workload.file_bins[0] * 4 * kib;
+        workload.file_bins[7] = 2;
+        workload.file_bytes[7] = 2 * 1024 * 1024 * 1024;
+        let total = workload.file_bytes.iter().sum::<u64>();
+        let mut progress = EtaProgressTotals::default();
+        let mut done = 0u64;
+
+        for tick in 1..=80 {
+            let elapsed = tick as f64 * 0.2;
+            done = done.saturating_add(4 * 4 * kib);
+            progress.file_bins[0] += 4;
+            progress.file_bytes[0] += 4 * 4 * kib;
+            let _ = estimator.update(
+                Some(done),
+                total,
+                Some(16.0 * kib as f64 / 0.2),
+                elapsed,
+                false,
+                Some(workload),
+                Some(progress),
+            );
+        }
+
+        let estimate = estimator.last_estimate().expect("mixed-workload estimate");
+        let p10 = estimate.p10_s.expect("p10");
+        let p50 = estimate.p50_s.expect("p50");
+        let p90 = estimate.p90_s.expect("p90");
+        assert!(p10 <= p50 && p50 <= p90);
+        assert!(p90.is_finite() && p90 > 0.0);
+        assert!(estimate.confidence > 0.0);
+    }
+
+    #[test]
+    fn eta_estimator_accounts_for_downstream_pipeline_backlog() {
+        let mut estimator = TransferEtaEstimator::default();
+        let mib = 1024.0 * 1024.0;
+        let total = 10 * 1024 * 1024 * 1024u64;
+        let mut estimate = None;
+
+        for tick in 1..=50 {
+            let elapsed = tick as f64 * 0.2;
+            let done = (elapsed * 100.0 * mib) as u64;
+            let write_complete = (elapsed * mib) as u64;
+            estimate = estimator.update_with_telemetry(
+                Some(done),
+                total,
+                Some(100.0 * mib),
+                elapsed,
+                false,
+                None,
+                None,
+                EtaTelemetry {
+                    write_bytes: Some(done),
+                    write_complete: Some(write_complete),
+                    ..EtaTelemetry::default()
+                },
+                TransferProgressRates {
+                    write_complete_bps: Some(mib),
+                    ..TransferProgressRates::default()
+                },
+            );
+        }
+
+        assert!(estimate.expect("pipeline estimate") > 300.0);
+        assert!(estimator
+            .last_estimate()
+            .map(|value| value.activity == EtaActivity::PipelineBound)
+            .unwrap_or(false));
     }
 }

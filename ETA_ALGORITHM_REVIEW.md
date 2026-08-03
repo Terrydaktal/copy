@@ -1,284 +1,130 @@
-# Previous ETA Algorithm Review
+# ETA Estimator
 
-This document contains the ETA implementation that was replaced, plus the
-runtime context used to review it. It is retained as the before-state and
-failure-case record for the new estimator.
+The live estimator is implemented by `TransferEtaEstimator` in `src/main.rs`.
+It predicts the remaining logical transfer time while accounting for known file
+work, recent throughput regimes, and approximate downstream I/O backlog.
 
 ## Inputs
 
-The progress display calls `smoothed_transfer_eta_s` every 0.2 seconds with:
+The progress ticker samples every 200 ms:
 
-- `done`: cumulative logical bytes completed by the transfer code
-- `total`: planned transfer bytes
-- `instant_bps`: logical bytes completed since the previous 0.2-second update,
-  divided by elapsed time
-- `elapsed_s`: elapsed transfer time
-- `phase_label`: currently `"Transfer"`
-- `finalize_line`: whether the transfer progress line is final
+- logical bytes accepted by the transfer loop (`write_all_total`);
+- planned logical bytes;
+- process I/O counters from `/proc/<pid>/io`;
+- device counters from `/proc/diskstats`;
+- completed files by size bin and completed directories;
+- the pre-scanned remaining file and directory workload.
 
-The ETA does not use `write_bytes`, `read_bytes`, `/proc/diskstats`,
-`WriteComplete`, or `ReadComplete`.
+The estimator aggregates byte observations into approximately one-second
+statistical buckets. The 200 ms cadence remains a UI requirement and is not
+treated as independent evidence at every tick.
 
-## Current implementation
+## Regime model
 
-```rust
-fn transfer_eta_s(done: Option<u64>, total: u64, bps: Option<f64>) -> Option<f64> {
-    if total == 0 {
-        return None;
-    }
-    let done = done?;
-    let bps = bps?;
-    if bps <= 0.0 {
-        return None;
-    }
-    let remain = total.saturating_sub(done.min(total));
-    Some(remain as f64 / bps)
-}
+Positive bucket rates are modelled in log space. The estimator maintains up to
+64 online run-length hypotheses. Each hypothesis contains:
 
-#[derive(Default)]
-struct EtaSmootherState {
-    key: String,
-    samples: VecDeque<(f64, u64)>,
-    display_eta_s: Option<f64>,
-    last_elapsed_s: Option<f64>,
-    slowdown_since_s: Option<f64>,
-}
+- the time since its most recent regime change;
+- a running log-rate mean and variance;
+- a normalized posterior probability.
 
-fn eta_smoother_state() -> &'static Mutex<EtaSmootherState> {
-    static STATE: OnceLock<Mutex<EtaSmootherState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(EtaSmootherState::default()))
-}
+The predictive likelihood is Student-t-like, which reduces the impact of one
+short burst or one delayed sample. A constant-hazard change model provides an
+independent regime-change signal. A deterministic guard confirms severe changes
+when a sequential byte rate falls below 12.5% of the previous capacity, or rises
+above 8 times it. Moderate changes use 60% and 1.67 times with a longer
+confirmation period.
 
-fn quantize_eta_s(eta_s: f64) -> f64 {
-    eta_s.max(0.0).round()
-}
+The whole-transfer average is not used as a permanent forecast weight. Once a
+sequential-capacity change is confirmed, the remaining-byte forecast uses the
+new regime instead of retaining the obsolete cache-backed rate.
 
-fn ew_regression_speed_bps(
-    samples: &VecDeque<(f64, u64)>,
-    now_t: f64,
-    tau_s: f64,
-) -> Option<f64> {
-    if samples.len() < 2 || !tau_s.is_finite() || tau_s <= 0.0 {
-        return None;
-    }
+## Workload model
 
-    let mut sw = 0.0;
-    let mut swt = 0.0;
-    let mut swx = 0.0;
-    for (t, bytes) in samples {
-        let age = (now_t - *t).max(0.0);
-        let w = (-age / tau_s).exp();
-        sw += w;
-        swt += w * *t;
-        swx += w * (*bytes as f64);
-    }
-    if sw <= 0.0 {
-        return None;
-    }
-    let t_bar = swt / sw;
-    let x_bar = swx / sw;
+The scan is represented by eight logarithmic regular-file size bins and a
+directory count. Every completed file increments its size-bin count and byte
+count atomically. Every completed directory increments the directory count.
 
-    let mut num = 0.0;
-    let mut den = 0.0;
-    for (t, bytes) in samples {
-        let age = (now_t - *t).max(0.0);
-        let w = (-age / tau_s).exp();
-        let dt = *t - t_bar;
-        let dx = (*bytes as f64) - x_bar;
-        num += w * dt * dx;
-        den += w * dt * dt;
-    }
-    if den <= 1e-12 {
-        return None;
-    }
-    let v_hat = num / den;
-    if v_hat.is_finite() && v_hat > 0.0 {
-        Some(v_hat)
-    } else {
-        None
-    }
-}
-
-fn smoothed_transfer_eta_s(
-    phase_label: &str,
-    done: Option<u64>,
-    total: u64,
-    instant_bps: Option<f64>,
-    elapsed_s: f64,
-    finalize_line: bool,
-) -> Option<f64> {
-    if total == 0 {
-        return None;
-    }
-    let done = done?;
-    let done_clamped = done.min(total);
-    let remain = total.saturating_sub(done_clamped);
-    if remain == 0 {
-        return Some(0.0);
-    }
-
-    let key = format!("{phase_label}:{total}");
-    if let Ok(mut st) = eta_smoother_state().lock() {
-        if st.key != key || st.last_elapsed_s.map(|v| elapsed_s < v).unwrap_or(false) {
-            st.key = key.clone();
-            st.samples.clear();
-            st.display_eta_s = None;
-            st.last_elapsed_s = None;
-            st.slowdown_since_s = None;
-        }
-
-        if st
-            .samples
-            .back()
-            .map(|(t, b)| *t != elapsed_s || *b != done_clamped)
-            .unwrap_or(true)
-        {
-            st.samples.push_back((elapsed_s, done_clamped));
-        }
-        const REGRESSION_WINDOW_S: f64 = 60.0;
-        while st
-            .samples
-            .front()
-            .map(|(t, _)| elapsed_s - *t > REGRESSION_WINDOW_S)
-            .unwrap_or(false)
-        {
-            st.samples.pop_front();
-        }
-
-        const TAU_S: f64 = 20.0;
-        let sample_span_s = match (st.samples.front(), st.samples.back()) {
-            (Some((first_t, _)), Some((last_t, _))) => (last_t - first_t).max(0.0),
-            _ => 0.0,
-        };
-        const ETA_WARMUP_S: f64 = 5.0;
-        if st.display_eta_s.is_none() && sample_span_s < ETA_WARMUP_S {
-            st.last_elapsed_s = Some(elapsed_s);
-            return None;
-        }
-
-        let reg_bps = if sample_span_s >= 3.0 {
-            ew_regression_speed_bps(&st.samples, elapsed_s, TAU_S)
-        } else {
-            None
-        };
-        let avg_bps = if elapsed_s > 0.25 && done_clamped > 0 {
-            Some(done_clamped as f64 / elapsed_s.max(1e-6))
-        } else {
-            None
-        };
-        let speed_bps = match (reg_bps, avg_bps, instant_bps) {
-            (Some(r), Some(a), _) => Some((r * 0.80) + (a * 0.20)),
-            (Some(r), None, Some(i)) if i > 0.0 => Some((r * 0.85) + (i * 0.15)),
-            (Some(r), _, _) => Some(r),
-            (None, Some(a), Some(i)) if i > 0.0 => Some((a * 0.80) + (i * 0.20)),
-            (None, Some(a), _) => Some(a),
-            (None, None, Some(i)) if i > 0.0 => Some(i),
-            _ => None,
-        }?;
-        let raw_eta = transfer_eta_s(Some(done_clamped), total, Some(speed_bps))?;
-
-        let dt = st
-            .last_elapsed_s
-            .map(|prev| (elapsed_s - prev).max(0.0))
-            .unwrap_or(0.0);
-        st.last_elapsed_s = Some(elapsed_s);
-
-        let next_eta = if let Some(prev_display) = st.display_eta_s {
-            let countdown = (prev_display - dt).max(0.0);
-            let margin = (0.05 * countdown).max(10.0);
-            if raw_eta < countdown {
-                let down_alpha = if dt > 0.0 {
-                    1.0 - (-dt / 5.0).exp()
-                } else {
-                    0.0
-                };
-                st.slowdown_since_s = None;
-                countdown + down_alpha * (raw_eta - countdown)
-            } else if raw_eta <= countdown + margin {
-                st.slowdown_since_s = None;
-                countdown
-            } else {
-                if st.slowdown_since_s.is_none() {
-                    st.slowdown_since_s = Some(elapsed_s);
-                }
-                let severe_slowdown = raw_eta >= countdown.max(10.0) * 2.0;
-                let sustained = st
-                    .slowdown_since_s
-                    .map(|start| (elapsed_s - start) >= 2.0)
-                    .unwrap_or(false);
-                if severe_slowdown || sustained {
-                    let up_alpha = if dt > 0.0 {
-                        let tau = if severe_slowdown { 3.0 } else { 12.0 };
-                        1.0 - (-dt / tau).exp()
-                    } else {
-                        0.0
-                    };
-                    countdown + up_alpha * (raw_eta - countdown)
-                } else {
-                    countdown
-                }
-            }
-        } else {
-            raw_eta
-        };
-
-        st.display_eta_s = Some(next_eta.max(0.0));
-        let out = st.display_eta_s.map(quantize_eta_s);
-        if finalize_line {
-            st.key.clear();
-            st.samples.clear();
-            st.display_eta_s = None;
-            st.last_elapsed_s = None;
-            st.slowdown_since_s = None;
-        }
-        return out;
-    }
-
-    transfer_eta_s(Some(done_clamped), total, instant_bps).map(quantize_eta_s)
-}
-```
-
-The call site is:
-
-```rust
-let eta = smoothed_transfer_eta_s(
-    phase_label,
-    write_all_total,
-    planned_bytes,
-    rates.write_all_bps,
-    elapsed_s,
-    finalize_line,
-);
-```
-
-## Observed failure case
+The estimator learns fixed object overhead online. For each one-second sample it
+subtracts the estimated byte service time from elapsed time, then updates the
+observed per-file-bin and per-directory overhead. The remaining producer time
+is:
 
 ```text
-57.92% 38.411 GiB / 66.317 GiB 00:00:48.0 eta
-
-Transfer        38.411 GiB      9.726 MiB/s
-WriteDisk       38.739 GiB      10.29 MiB/s
-WriteComplete    6.926 GiB        0.000 B/s
-ReadCache       27.539 GiB      24.52 MiB/s
-ReadDisk        10.880 GiB      9.173 MiB/s
-ReadComplete    10.877 GiB      9.817 MiB/s
+remaining bytes / sequential capacity
+  + remaining file overhead
+  + remaining directory overhead
 ```
 
-Approximately 27.906 GiB remained. At 9.726 MiB/s, the instantaneous ETA was
-about 49 minutes, while the display showed 48 seconds. The likely regime change
-was an initially fast page-cache-backed transfer followed by physical USB HDD
-throughput.
+This prevents a temporary run of tiny files from redefining the large-file
+device capacity. Conversely, when the transfer is dominated by tiny files, the
+learned object cost prevents the current tiny-file byte rate from being applied
+to all remaining large bytes.
 
-## Review goals
+The model uses the planned workload histogram. It does not claim an exact
+future operation order because the Rust backend executes regular files in
+parallel; the manifest's lexical order is not a reliable execution order.
 
-Please recommend an ETA algorithm that:
+## Pipeline model
 
-- remains stable during ordinary short throughput fluctuations;
-- detects sustained cache-to-disk or fast-to-slow regime changes within a few
-  seconds;
-- does not retain a misleading whole-transfer average after such a change;
-- handles temporary zero-progress stalls without immediately producing extreme
-  ETAs;
-- remains useful for both large files and trees containing many small files;
-- updates every 0.2 seconds but may aggregate samples over longer windows;
-- reports hours, minutes, and seconds with one-second display granularity.
+When compatible counters are available, the estimator calculates advisory
+backlog values:
+
+```text
+write backlog = process write_bytes - device write-complete
+read backlog  = process read_bytes  - device read-complete
+```
+
+The corresponding drain time is estimated from the current device-completion
+rate. Producer time and drain time overlap, so the larger value controls the
+pipeline estimate rather than the two values being blindly added.
+
+`/proc/diskstats` is device-wide and may include unrelated processes. Therefore
+this part is intentionally treated as approximate and lowers confidence rather
+than pretending it is a per-process durable-write counter.
+
+## Display stability
+
+The displayed ETA is derived from a predicted finish timestamp rather than
+smoothing remaining seconds directly:
+
+- stable operation uses a confidence-dependent two-to-six-second response;
+- a confirmed capacity regime change updates immediately;
+- a short zero-progress interval advances the predicted finish timestamp so the
+  ETA freezes instead of counting down falsely;
+- after five seconds without progress the numerical ETA is suppressed as
+  `unknown` by the renderer;
+- the displayed value is rounded only at the final presentation step.
+
+The estimator internally keeps P10, P50, P90, confidence, and activity state.
+Set `COPY_RS_ETA_DEBUG=1` to append those values to the live progress line.
+Normal output continues to show the P50 value to preserve the existing layout.
+
+## Completion semantics
+
+The transfer ETA targets logical completion of the copy loop. Flush and cleanup
+are separate phases in the command and continue to report their own counters.
+The pipeline estimate can account for observed downstream drain before logical
+completion, but no userspace counter can prove durable device completion until
+the explicit flush operation returns.
+
+## Known limits
+
+- Device-completion counters remain device-wide rather than per-process.
+- Extended attributes, sparse extents, hardlinks, and metadata operations are
+  not currently separate workload classes.
+- Remote and rsync transfers without a local manifest use the robust byte-regime
+  model but cannot use file-composition costs.
+- The estimator has no persisted cross-command hardware history; it learns from
+  the current transfer and its pre-scan.
+
+These limits are surfaced through the confidence value rather than hidden by a
+false precision claim.
+
+## Failure case covered
+
+The previous failure displayed a 48-second ETA while approximately 28 GiB
+remained at 9.7 MiB/s after a cache-backed phase. The current model detects the
+sequential capacity collapse within the confirmation window, starts the rate
+estimate at the detected transition, and no longer blends the old whole-transfer
+average into the forecast.
