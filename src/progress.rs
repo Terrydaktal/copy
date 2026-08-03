@@ -916,12 +916,24 @@ struct ProgressRenderState {
     active: bool,
     lines: usize,
     finalized_lines: usize,
+    terminal_width: usize,
     last_frame: String,
 }
 
 fn progress_render_state() -> &'static Mutex<ProgressRenderState> {
     static STATE: OnceLock<Mutex<ProgressRenderState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(ProgressRenderState::default()))
+}
+
+fn visual_rows_for_frame(frame: &str, terminal_width: usize) -> usize {
+    let width = terminal_width.max(1);
+    frame
+        .split('\n')
+        .map(|line| {
+            let columns = line.chars().count().max(1);
+            (columns + width - 1) / width
+        })
+        .sum()
 }
 
 pub(super) fn eta_debug_enabled() -> bool {
@@ -944,6 +956,7 @@ pub(super) fn print_transfer_progress_bars(
     flushing: bool,
 ) {
     const BAR_WIDTH: usize = 34;
+    const PROGRESS_LABEL_WIDTH: usize = 8;
     const LABEL_COL_WIDTH: usize = 13;
     const BYTES_COL_WIDTH: usize = 11;
     const RATE_COL_WIDTH: usize = 14;
@@ -1053,38 +1066,62 @@ pub(super) fn print_transfer_progress_bars(
         )
     };
 
-    let object_progress_lines = eta_workload.zip(eta_progress).map(|(workload, progress)| {
+    let object_progress = eta_workload.zip(eta_progress).map(|(workload, progress)| {
         let total_files: u64 = workload.file_bins.iter().copied().sum();
         let completed_files = progress.file_count().min(total_files);
         let completed_dirs = progress.dirs.min(workload.dirs);
-        vec![
-            clamp(format!(
-                "{:<label_width$}  {} / {}",
-                "Files",
-                format_number(completed_files),
-                format_number(total_files),
-                label_width = LABEL_COL_WIDTH
-            )),
-            clamp(format!(
-                "{:<label_width$}  {} / {}",
-                "Dirs",
-                format_number(completed_dirs),
-                format_number(workload.dirs),
-                label_width = LABEL_COL_WIDTH
-            )),
-        ]
+        (completed_files, total_files, completed_dirs, workload.dirs)
     });
 
-    let mut lines = vec![
-        clamp(format!(
-            "{pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta{eta_debug}",
-            build_progress_bar(pct, BAR_WIDTH)
-        )),
-        String::new(),
-    ];
-    if let Some(object_lines) = object_progress_lines {
-        lines.extend(object_lines);
+    let transfer_progress_line = |bar_width: usize| {
+        format!(
+            "{:<label_width$} {pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta{eta_debug}",
+            "Transfer",
+            build_progress_bar(pct, bar_width),
+            label_width = PROGRESS_LABEL_WIDTH
+        )
+    };
+    let progress_line_width = |bar_width: usize| {
+        let mut width = transfer_progress_line(bar_width).chars().count();
+        if let Some((completed_files, total_files, completed_dirs, total_dirs)) = object_progress {
+            width = width.max(
+                format_object_progress_line("Files", completed_files, total_files, bar_width)
+                    .chars()
+                    .count(),
+            );
+            width = width.max(
+                format_object_progress_line("Dirs", completed_dirs, total_dirs, bar_width)
+                    .chars()
+                    .count(),
+            );
+        }
+        width
+    };
+    let max_progress_columns = terminal_width.saturating_sub(1).max(40);
+    let mut bar_width = BAR_WIDTH;
+    while progress_line_width(bar_width) > max_progress_columns && bar_width > 8 {
+        let excess = progress_line_width(bar_width) - max_progress_columns;
+        bar_width = bar_width.saturating_sub(excess).max(8);
     }
+
+    let mut lines = vec![clamp(transfer_progress_line(bar_width))];
+    if let Some((completed_files, total_files, completed_dirs, total_dirs)) = object_progress {
+        lines.extend([
+            clamp(format_object_progress_line(
+                "Files",
+                completed_files,
+                total_files,
+                bar_width,
+            )),
+            clamp(format_object_progress_line(
+                "Dirs",
+                completed_dirs,
+                total_dirs,
+                bar_width,
+            )),
+        ]);
+    }
+    lines.push(String::new());
     lines.extend([
         clamp(format!(
             "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
@@ -1157,7 +1194,11 @@ pub(super) fn print_transfer_progress_bars(
         if state.active && !finalize_line && state.last_frame == frame {
             return;
         }
-        let previous_row_count = if state.active {
+        let terminal_width_changed =
+            state.terminal_width != 0 && state.terminal_width != terminal_width;
+        let previous_row_count = if terminal_width_changed {
+            visual_rows_for_frame(&state.last_frame, terminal_width)
+        } else if state.active {
             state.lines
         } else {
             state.finalized_lines
@@ -1198,11 +1239,13 @@ pub(super) fn print_transfer_progress_bars(
             state.active = false;
             state.lines = 0;
             state.finalized_lines = lines.len();
-            state.last_frame.clear();
+            state.terminal_width = terminal_width;
+            state.last_frame = frame;
         } else {
             state.active = true;
             state.lines = lines.len();
             state.finalized_lines = 0;
+            state.terminal_width = terminal_width;
             state.last_frame = frame;
         }
         let stdout = io::stdout();
@@ -1210,6 +1253,30 @@ pub(super) fn print_transfer_progress_bars(
         let _ = locked.write_all(output.as_bytes());
         let _ = locked.flush();
     }
+}
+
+fn format_object_progress_line(
+    label: &str,
+    completed: u64,
+    total: u64,
+    bar_width: usize,
+) -> String {
+    const PROGRESS_LABEL_WIDTH: usize = 8;
+
+    let completed = completed.min(total);
+    let pct = if total > 0 {
+        completed as f64 * 100.0 / total as f64
+    } else {
+        100.0
+    };
+    let pct_s = format!("{:>6.2}%", pct);
+    format!(
+        "{label:<label_width$} {pct_s} [{}] {} / {}",
+        build_progress_bar(Some(pct), bar_width),
+        format_number(completed),
+        format_number(total),
+        label_width = PROGRESS_LABEL_WIDTH,
+    )
 }
 
 pub(super) fn reset_progress_render_state() {
@@ -1241,6 +1308,8 @@ pub(super) fn finish_progress_render_state() {
         state.active = false;
         state.lines = 0;
         state.finalized_lines = 0;
+        state.terminal_width = 0;
+        state.last_frame.clear();
     }
 }
 
@@ -1292,4 +1361,35 @@ pub(super) fn print_copy_duration_summary(
         );
     }
     println!("{:<26}{}", "Total Duration:", fmt_hms_ms(total_duration_s));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_progress_lines_use_the_shared_bar_format() {
+        let line = format_object_progress_line("Files", 3_466, 10_000, 34);
+        let dirs = format_object_progress_line("Dirs", 123, 456, 34);
+
+        assert!(line.starts_with("Files     34.66% ["));
+        assert!(line.ends_with(" 3,466 / 10,000"));
+        assert_eq!(line.matches('=').count() + line.matches('>').count(), 12);
+        assert_eq!(line.find('%'), dirs.find('%'));
+        assert_eq!(line.find('['), dirs.find('['));
+    }
+
+    #[test]
+    fn empty_object_workload_is_rendered_as_complete() {
+        let line = format_object_progress_line("Dirs", 0, 0, 34);
+
+        assert!(line.starts_with("Dirs     100.00% ["));
+        assert!(line.ends_with(" 0 / 0"));
+    }
+
+    #[test]
+    fn resized_frames_count_reflowed_rows() {
+        assert_eq!(visual_rows_for_frame("0123456789\nabc", 10), 2);
+        assert_eq!(visual_rows_for_frame("0123456789\nabc", 5), 3);
+    }
 }
