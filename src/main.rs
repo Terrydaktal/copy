@@ -345,6 +345,8 @@ struct ProgressSnapshot {
     rates: TransferProgressRates,
     proc_deltas: ProcIoDeltas,
     device_deltas: DeviceIoDeltas,
+    eta_workload: Option<EtaWorkload>,
+    eta_progress: Option<EtaProgressTotals>,
 }
 
 #[derive(Default)]
@@ -419,6 +421,7 @@ struct DeleteCleanupOutcome {
 }
 
 fn log(mode: TransferMode, msg: &str, level: LogLevel) {
+    finish_progress_render_state();
     match level {
         LogLevel::Error => eprintln!("{FAIL}ERROR: {msg}{ENDC}"),
         LogLevel::Warn => eprintln!("{WARNING}WARNING: {msg}{ENDC}"),
@@ -725,6 +728,10 @@ fn terminal_columns() -> usize {
                 .filter(|v| *v >= 40)
         })
         .unwrap_or(120)
+}
+
+fn stdout_is_tty() -> bool {
+    unsafe { nix::libc::isatty(io::stdout().as_raw_fd()) == 1 }
 }
 
 fn fmt_bytes_block_opt(byte_value: Option<u64>, decimals: usize) -> String {
@@ -1714,7 +1721,6 @@ fn print_transfer_progress_bars(
     finalize_line: bool,
     flushing: bool,
 ) {
-    const LINES: usize = 8;
     const BAR_WIDTH: usize = 34;
     const LABEL_COL_WIDTH: usize = 13;
     const BYTES_COL_WIDTH: usize = 11;
@@ -1823,12 +1829,39 @@ fn print_transfer_progress_bars(
         )
     };
 
+    let object_progress_lines = eta_workload.zip(eta_progress).map(|(workload, progress)| {
+        let total_files: u64 = workload.file_bins.iter().copied().sum();
+        let completed_files = progress.file_count().min(total_files);
+        let completed_dirs = progress.dirs.min(workload.dirs);
+        vec![
+            clamp_line_for_term(format!(
+                "{:<label_width$}  {} / {}",
+                "Files",
+                format_number(completed_files),
+                format_number(total_files),
+                label_width = LABEL_COL_WIDTH
+            )),
+            clamp_line_for_term(format!(
+                "{:<label_width$}  {} / {}",
+                "Dirs",
+                format_number(completed_dirs),
+                format_number(workload.dirs),
+                label_width = LABEL_COL_WIDTH
+            )),
+        ]
+    });
+
     let mut lines = vec![
         clamp_line_for_term(format!(
             "{pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta{eta_debug}",
             build_progress_bar(pct, BAR_WIDTH)
         )),
         String::new(),
+    ];
+    if let Some(object_lines) = object_progress_lines {
+        lines.extend(object_lines);
+    }
+    lines.extend([
         clamp_line_for_term(format!(
             "{:<label_width$}  {:>bytes_width$}   {:>rate_width$}",
             phase_label,
@@ -1884,25 +1917,52 @@ fn print_transfer_progress_bars(
             bytes_width = BYTES_COL_WIDTH,
             rate_width = RATE_COL_WIDTH
         )),
-    ];
-    if lines.len() > LINES {
-        lines.truncate(LINES);
+    ]);
+
+    if !stdout_is_tty() {
+        if finalize_line {
+            for line in &lines {
+                println!("{line}");
+            }
+        }
+        return;
     }
 
     if let Ok(mut state) = progress_render_state().lock() {
-        if state.active {
-            let up = state.lines.saturating_sub(1);
-            if up > 0 {
-                print!("\x1b[{}A", up);
-            }
-        } else if state.finalized_lines > 0 {
-            print!("\x1b[{}A", state.finalized_lines);
+        let previous_row_count = if state.active {
+            state.lines
+        } else {
+            state.finalized_lines
+        };
+        let previous_lines = if state.active {
+            previous_row_count.saturating_sub(1)
+        } else {
+            previous_row_count
+        };
+        if previous_lines > 0 {
+            print!("\x1b[{}A\r", previous_lines);
         }
+
+        // Keep each frame to one terminal row. Vertical cursor movement avoids
+        // line-feed scrolling when the frame is rendered at the bottom edge.
+        print!("\x1b[?7l");
         for (idx, line) in lines.iter().enumerate() {
             print!("\r\x1b[2K{line}");
             if idx + 1 < lines.len() {
-                print!("\n");
+                if previous_lines == 0 {
+                    print!("\n");
+                } else {
+                    print!("\x1b[1B\r");
+                }
             }
+        }
+        print!("\x1b[?7h");
+        let trailing_lines = previous_row_count.saturating_sub(lines.len());
+        if trailing_lines > 0 {
+            for _ in 0..trailing_lines {
+                print!("\x1b[1B\r\x1b[2K");
+            }
+            print!("\x1b[{}A\r", trailing_lines);
         }
         if finalize_line {
             println!();
@@ -1919,11 +1979,31 @@ fn print_transfer_progress_bars(
 }
 
 fn reset_progress_render_state() {
+    finish_progress_render_state();
+}
+
+fn finish_progress_render_state() {
     if let Ok(mut state) = progress_render_state().lock() {
+        if state.active {
+            let up = state.lines.saturating_sub(1);
+            if up > 0 {
+                print!("\x1b[{}A\r", up);
+            }
+            for idx in 0..state.lines {
+                print!("\r\x1b[2K");
+                if idx + 1 < state.lines {
+                    print!("\x1b[1B\r");
+                }
+            }
+            // Leave the cursor below the cleared frame so the next message
+            // starts on a fresh line rather than overwriting its last row.
+            println!();
+        }
         state.active = false;
         state.lines = 0;
         state.finalized_lines = 0;
     }
+    let _ = io::stdout().flush();
 }
 
 fn print_summary_rate_line(label: &str, bps: f64, duration_s: f64, total: bool) {
@@ -4083,8 +4163,8 @@ fn flush_destination_writes(
                         display_rates,
                         merged_proc_deltas,
                         merged_device_deltas,
-                        None,
-                        None,
+                        snapshot.eta_workload,
+                        snapshot.eta_progress,
                         None,
                         false,
                         true,
@@ -4151,8 +4231,8 @@ fn flush_destination_writes(
             display_rates,
             merged_proc_deltas,
             merged_device_deltas,
-            None,
-            None,
+            snapshot.eta_workload,
+            snapshot.eta_progress,
             None,
             true,
             true,
@@ -5318,7 +5398,7 @@ fn pre_scan_directory(
         mut manifest_copy_files,
         mut manifest_identical_files,
         mut changed_parent_dirs,
-        overlap_count,
+        _overlap_count,
         file_relation_breakdown,
     ): FileReduce = files
         .par_iter()
@@ -5929,8 +6009,7 @@ fn run_rsync_transfer(
             }
             Ok(RsyncStreamEvent::Text(line)) => {
                 if progress_line_active {
-                    println!();
-                    reset_progress_render_state();
+                    finish_progress_render_state();
                     progress_line_active = false;
                 }
                 println!("{line}");
@@ -5985,8 +6064,7 @@ fn run_rsync_transfer(
                     }
                     RsyncStreamEvent::Text(line) => {
                         if progress_line_active {
-                            println!();
-                            reset_progress_render_state();
+                            finish_progress_render_state();
                             progress_line_active = false;
                         }
                         println!("{line}");
@@ -6066,6 +6144,8 @@ fn run_rsync_transfer(
             rates: last_io_rates,
             proc_deltas: io_delta,
             device_deltas: device_delta,
+            eta_workload: None,
+            eta_progress: None,
         }),
     }
 }
@@ -6240,6 +6320,8 @@ fn run_rust_transfer(
                     rates: final_io_rates,
                     proc_deltas: io_delta,
                     device_deltas: device_delta,
+                    eta_workload,
+                    eta_progress: Some(eta_progress.snapshot()),
                 }),
             };
         }};
