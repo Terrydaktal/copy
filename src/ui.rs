@@ -1,0 +1,888 @@
+//! Preview trees, change summaries, and terminal tree rendering.
+
+use super::*;
+
+pub(super) fn dev_media_kind(path: &Path) -> MediaKind {
+    let mut probe = path;
+    let md = loop {
+        if let Ok(md) = fs::metadata(probe) {
+            break md;
+        }
+        probe = match probe.parent() {
+            Some(parent) if parent != probe => parent,
+            _ => return MediaKind::Other,
+        };
+    };
+    let dev = md.dev();
+    let maj = major(dev);
+    let min = minor(dev);
+    let sys_link = PathBuf::from(format!("/sys/dev/block/{maj}:{min}"));
+    let canon = match fs::canonicalize(&sys_link) {
+        Ok(c) => c,
+        Err(_) => return MediaKind::Other,
+    };
+
+    let mut rotational: Option<bool> = None;
+    let mut saw_nvme = false;
+
+    for anc in canon.ancestors() {
+        if let Some(name) = anc.file_name() {
+            let n = name.to_string_lossy();
+            if n.starts_with("nvme") {
+                saw_nvme = true;
+            }
+            let q = Path::new("/sys/class/block")
+                .join(n.as_ref())
+                .join("queue/rotational");
+            if let Ok(s) = fs::read_to_string(&q) {
+                let t = s.trim();
+                if t == "0" {
+                    rotational = Some(false);
+                    if n.starts_with("nvme") {
+                        saw_nvme = true;
+                    }
+                    break;
+                }
+                if t == "1" {
+                    rotational = Some(true);
+                    break;
+                }
+            }
+        }
+    }
+
+    match rotational {
+        Some(true) => MediaKind::Hdd,
+        Some(false) if saw_nvme => MediaKind::Nvme,
+        Some(false) => MediaKind::Other,
+        None if canon.to_string_lossy().contains("/nvme") => MediaKind::Nvme,
+        _ => MediaKind::Other,
+    }
+}
+
+#[derive(Default, Clone)]
+pub(super) struct TreeNode {
+    children: FxHashMap<String, TreeNode>,
+    state: Option<String>,
+    is_dir: bool,
+}
+
+pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
+    let mut root = TreeNode {
+        children: FxHashMap::default(),
+        state: None,
+        is_dir: true,
+    };
+
+    for it in items {
+        let mut p = it.rel.trim().trim_start_matches("./").to_string();
+        if p.is_empty() {
+            continue;
+        }
+        let leaf_is_dir = p.ends_with('/');
+        p = p.trim_end_matches('/').to_string();
+        if p.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = p.split('/').collect();
+
+        let leaf_state = match it.kind {
+            ChangeKind::NewFile | ChangeKind::NewDir => "added",
+            ChangeKind::RemovedDir => "removed",
+            _ => "modified",
+        }
+        .to_string();
+
+        let mut node = &mut root;
+        for (idx, part) in parts.iter().enumerate() {
+            let is_leaf = idx == parts.len() - 1;
+            node = node
+                .children
+                .entry((*part).to_string())
+                .or_insert_with(|| TreeNode {
+                    children: FxHashMap::default(),
+                    state: None,
+                    is_dir: true,
+                });
+
+            if is_leaf {
+                node.is_dir = leaf_is_dir;
+                match leaf_state.as_str() {
+                    "added" => {
+                        if node.state.is_none() {
+                            node.state = Some("added".to_string());
+                        }
+                    }
+                    "removed" => node.state = Some("removed".to_string()),
+                    _ => {
+                        if node.state.as_deref() != Some("added") {
+                            node.state = Some("modified".to_string());
+                        }
+                    }
+                }
+            } else {
+                node.is_dir = true;
+                if node.state.as_deref() != Some("added") {
+                    node.state = Some("modified".to_string());
+                }
+            }
+        }
+    }
+
+    root
+}
+
+#[derive(Clone)]
+pub(super) struct LevelEntry {
+    name: String,
+    state: String,
+    is_dir: bool,
+    node: Option<TreeNode>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub(super) struct HiddenStateCounts {
+    new_count: usize,
+    modified_count: usize,
+    identical_count: usize,
+    uncollided_count: usize,
+    deleted_count: usize,
+}
+
+impl HiddenStateCounts {
+    fn total(self) -> usize {
+        self.new_count
+            + self.modified_count
+            + self.identical_count
+            + self.uncollided_count
+            + self.deleted_count
+    }
+}
+
+pub(super) fn join_rel(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+pub(super) fn remap_item_under_prefix(item: &str, prefix: &str) -> String {
+    if item.is_empty() {
+        return format!("{prefix}/");
+    }
+    if item == prefix || item.starts_with(&format!("{prefix}/")) {
+        item.to_string()
+    } else {
+        format!("{prefix}/{item}")
+    }
+}
+
+pub(super) fn remap_path_set_under_prefix(
+    paths: &HashSet<String>,
+    prefix: &str,
+) -> HashSet<String> {
+    paths
+        .iter()
+        .map(|item| {
+            remap_item_under_prefix(item, prefix)
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .collect()
+}
+
+pub(super) fn state_sort_priority(state: &str) -> u8 {
+    match state {
+        "modified" | "replaced" => 0,
+        "added" => 1,
+        "removed" => 2,
+        "identical" => 3,
+        "uncollided" => 4,
+        _ => 9,
+    }
+}
+
+pub(super) fn collect_level_entries(
+    abs_dir: &Path,
+    node: Option<&TreeNode>,
+    extra: &HashMap<String, String>,
+    source_display_paths: &HashSet<String>,
+    rel_prefix: &str,
+    dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
+) -> Vec<LevelEntry> {
+    let existing = dir_cache
+        .entry(abs_dir.to_path_buf())
+        .or_insert_with(|| {
+            if !abs_dir.is_dir() {
+                return Vec::new();
+            }
+            let mut rows: Vec<(String, bool)> = Vec::new();
+            if let Ok(rd) = fs::read_dir(abs_dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    rows.push((name, is_dir));
+                }
+            }
+            rows
+        })
+        .clone();
+    let mut existing_entries: BTreeSet<String> = BTreeSet::new();
+    let mut existing_is_dir: HashMap<String, bool> = HashMap::new();
+    for (name, is_dir) in existing {
+        existing_entries.insert(name.clone());
+        existing_is_dir.insert(name, is_dir);
+    }
+
+    let mut changed: BTreeSet<String> = BTreeSet::new();
+    if let Some(n) = node {
+        for k in n.children.keys() {
+            changed.insert(k.clone());
+        }
+    }
+
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    all.extend(existing_entries.iter().cloned());
+    all.extend(changed.iter().cloned());
+    all.extend(extra.keys().cloned());
+
+    let mut out = Vec::new();
+    for name in all {
+        let child = node.and_then(|n| n.children.get(&name)).cloned();
+        let mut state = extra.get(&name).cloned();
+        if state.is_none() {
+            state = child.as_ref().and_then(|c| c.state.clone());
+        }
+        let mut state = state.unwrap_or_else(|| "unchanged".to_string());
+        if state == "unchanged" {
+            if !source_display_paths.is_empty() {
+                let rel = join_rel(rel_prefix, &name);
+                state = if source_display_paths.contains(rel.as_str()) {
+                    "identical".to_string()
+                } else {
+                    "uncollided".to_string()
+                };
+            }
+        }
+        let full = abs_dir.join(&name);
+        let is_dir = child
+            .as_ref()
+            .map(|c| c.is_dir)
+            .or_else(|| existing_is_dir.get(&name).copied())
+            .unwrap_or_else(|| full.is_dir());
+        out.push(LevelEntry {
+            name,
+            state,
+            is_dir,
+            node: child,
+        });
+    }
+    out
+}
+
+pub(super) fn select_level_entries(
+    entries: &[LevelEntry],
+    max_entries: usize,
+    include_unchanged: bool,
+) -> (Vec<LevelEntry>, HiddenStateCounts) {
+    let mut ordered: Vec<LevelEntry> = if include_unchanged {
+        entries.to_vec()
+    } else {
+        entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.state.as_str(),
+                    "added" | "modified" | "replaced" | "removed"
+                )
+            })
+            .cloned()
+            .collect()
+    };
+    ordered.sort_by(|a, b| {
+        let pa = state_sort_priority(a.state.as_str());
+        let pb = state_sort_priority(b.state.as_str());
+        pa.cmp(&pb).then(a.name.cmp(&b.name))
+    });
+
+    let selected: Vec<LevelEntry> = ordered.iter().take(max_entries).cloned().collect();
+    let selected_names: HashSet<String> = selected.iter().map(|e| e.name.clone()).collect();
+
+    let mut hidden = HiddenStateCounts::default();
+
+    for e in entries {
+        if selected_names.contains(&e.name) {
+            continue;
+        }
+        match e.state.as_str() {
+            "added" => hidden.new_count += 1,
+            "removed" => hidden.deleted_count += 1,
+            "identical" => hidden.identical_count += 1,
+            "uncollided" | "unchanged" => hidden.uncollided_count += 1,
+            _ => hidden.modified_count += 1,
+        }
+    }
+
+    (selected, hidden)
+}
+
+pub(super) fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
+    let suffix = if entry.is_dir { "/" } else { "" };
+    if row_kind == Some("replaced_old") {
+        return format!("{FAIL}{}{} (old){ENDC}", entry.name, suffix);
+    }
+    if row_kind == Some("replaced_new") {
+        return format!("{OKGREEN}{}{} (new){ENDC}", entry.name, suffix);
+    }
+    match entry.state.as_str() {
+        "removed" => format!("{FAIL}{}{} (removed){ENDC}", entry.name, suffix),
+        "added" => format!("{OKGREEN}{}{}{ENDC}", entry.name, suffix),
+        "modified" => format!("{WARNING}{}{}{ENDC}", entry.name, suffix),
+        "identical" => format!("{LIGHT_TEAL}{}{}{ENDC}", entry.name, suffix),
+        "uncollided" => format!("{WHITE}{}{}{ENDC}", entry.name, suffix),
+        _ => format!("{WHITE}{}{}{ENDC}", entry.name, suffix),
+    }
+}
+
+pub(super) fn render_showall_level(
+    abs_dir: &Path,
+    node: Option<&TreeNode>,
+    prefix: &str,
+    extras: &HashMap<String, String>,
+    source_display_paths: &HashSet<String>,
+    rel_prefix: &str,
+    include_unchanged: bool,
+    depth: usize,
+    max_depth: usize,
+    trunc: usize,
+    dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
+    out: &mut String,
+    max_lines: Option<usize>,
+    line_count: &mut usize,
+) -> bool {
+    let entries = collect_level_entries(
+        abs_dir,
+        node,
+        extras,
+        source_display_paths,
+        rel_prefix,
+        dir_cache,
+    );
+    let (selected, hidden) = select_level_entries(&entries, trunc, include_unchanged);
+
+    enum Unit {
+        Entry(LevelEntry, Option<&'static str>),
+        Summary(HiddenStateCounts),
+    }
+
+    let mut units: Vec<Unit> = Vec::new();
+    for entry in selected {
+        if entry.state == "replaced" {
+            units.push(Unit::Entry(entry.clone(), Some("replaced_old")));
+            units.push(Unit::Entry(entry, Some("replaced_new")));
+        } else {
+            units.push(Unit::Entry(entry, None));
+        }
+    }
+
+    if hidden.total() > 0 {
+        units.push(Unit::Summary(hidden));
+    }
+
+    for (idx, unit) in units.iter().enumerate() {
+        let last = idx + 1 == units.len();
+        let branch = if last { "└── " } else { "├── " };
+
+        match unit {
+            Unit::Summary(hidden) => {
+                if max_lines.map(|m| *line_count >= m).unwrap_or(false) {
+                    return false;
+                }
+                if let Some(summary) = format_hidden_top_summary(
+                    hidden.new_count,
+                    hidden.modified_count,
+                    hidden.identical_count,
+                    hidden.uncollided_count,
+                    hidden.deleted_count,
+                    !include_unchanged,
+                ) {
+                    let _ = writeln!(out, "{prefix}{branch}... and {summary}");
+                    *line_count += 1;
+                }
+            }
+            Unit::Entry(entry, row_kind) => {
+                if max_lines.map(|m| *line_count >= m).unwrap_or(false) {
+                    return false;
+                }
+                let _ = writeln!(out, "{prefix}{branch}{}", format_entry(entry, *row_kind));
+                *line_count += 1;
+                let should_expand = row_kind.is_none()
+                    && entry.is_dir
+                    && depth + 1 < max_depth
+                    && entry.state != "removed";
+                if should_expand {
+                    let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+                    let child_rel = join_rel(rel_prefix, &entry.name);
+                    let empty: HashMap<String, String> = HashMap::new();
+                    if !render_showall_level(
+                        &abs_dir.join(&entry.name),
+                        entry.node.as_ref(),
+                        &child_prefix,
+                        &empty,
+                        source_display_paths,
+                        &child_rel,
+                        include_unchanged,
+                        depth + 1,
+                        max_depth,
+                        trunc,
+                        dir_cache,
+                        out,
+                        max_lines,
+                        line_count,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+pub(super) fn render_showall_preview_to_string_with_cache(
+    preview_root: &Path,
+    preview_items: &[ChangeItem],
+    source_display_paths: &HashSet<String>,
+    include_unchanged: bool,
+    extra_added: &HashSet<String>,
+    extra_modified: &HashSet<String>,
+    extra_replaced: &HashSet<String>,
+    extra_removed: &HashSet<String>,
+    max_depth: usize,
+    trunc: usize,
+    max_lines: Option<usize>,
+    dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
+) -> Option<String> {
+    let mut root_extra: HashMap<String, String> = HashMap::new();
+    for n in extra_added {
+        root_extra.insert(n.clone(), "added".to_string());
+    }
+    for n in extra_modified {
+        if root_extra.get(n).map(|s| s.as_str()) != Some("added") {
+            root_extra.insert(n.clone(), "modified".to_string());
+        }
+    }
+    for n in extra_replaced {
+        root_extra.insert(n.clone(), "replaced".to_string());
+    }
+    for n in extra_removed {
+        root_extra.insert(n.clone(), "removed".to_string());
+    }
+
+    let tree = build_change_tree(preview_items);
+    let mut out = String::new();
+    let mut line_count = 0usize;
+    let ok = render_showall_level(
+        preview_root,
+        Some(&tree),
+        "",
+        &root_extra,
+        source_display_paths,
+        "",
+        include_unchanged,
+        0,
+        max_depth,
+        trunc,
+        dir_cache,
+        &mut out,
+        max_lines,
+        &mut line_count,
+    );
+    if !ok {
+        return None;
+    }
+    Some(out)
+}
+
+pub(super) struct TopPreviewData {
+    root: PathBuf,
+    top_states: HashMap<String, String>,
+    top_is_dir: HashMap<String, bool>,
+    unchanged_identical: usize,
+    unchanged_uncollided: usize,
+}
+
+pub(super) fn collect_top_level_preview(
+    preview_root: &Path,
+    preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
+    extra_added: &HashSet<String>,
+    extra_modified: &HashSet<String>,
+    extra_replaced: &HashSet<String>,
+    extra_removed: &HashSet<String>,
+) -> TopPreviewData {
+    let root = preview_root.to_path_buf();
+
+    let mut existing_entries: BTreeSet<String> = BTreeSet::new();
+    if root.is_dir() {
+        if let Ok(rd) = fs::read_dir(&root) {
+            for e in rd.flatten() {
+                existing_entries.insert(e.file_name().to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let mut top_states: HashMap<String, String> = HashMap::new();
+    let mut top_is_dir: HashMap<String, bool> = HashMap::new();
+    let mut unchanged_identical = 0usize;
+    let mut unchanged_uncollided = 0usize;
+
+    for it in preview_items {
+        let mut item = it.rel.trim().trim_start_matches("./").to_string();
+        if item.is_empty() {
+            continue;
+        }
+        let is_dir = item.ends_with('/');
+        item = item.trim_end_matches('/').to_string();
+        if item.is_empty() {
+            continue;
+        }
+        let top = item.split('/').next().unwrap_or("").to_string();
+        if top.is_empty() {
+            continue;
+        }
+
+        if is_dir || item.contains('/') {
+            top_is_dir.insert(top.clone(), true);
+        } else {
+            top_is_dir.entry(top.clone()).or_insert(false);
+        }
+
+        let state = match it.kind {
+            ChangeKind::NewFile | ChangeKind::NewDir => "added",
+            ChangeKind::RemovedDir => "removed",
+            _ => "modified",
+        }
+        .to_string();
+
+        let prev = top_states.get(&top).cloned();
+        if prev.as_deref() == Some("added") {
+            continue;
+        }
+        if state == "added" || prev.is_none() {
+            top_states.insert(top, state);
+        } else {
+            top_states.insert(top, "modified".to_string());
+        }
+    }
+
+    for n in extra_added {
+        top_states.insert(n.clone(), "added".to_string());
+    }
+    for n in extra_modified {
+        if top_states.get(n).map(|s| s.as_str()) != Some("added") {
+            top_states.insert(n.clone(), "modified".to_string());
+        }
+    }
+    for n in extra_replaced {
+        top_states.insert(n.clone(), "replaced".to_string());
+    }
+    for n in extra_removed {
+        top_states.insert(n.clone(), "removed".to_string());
+    }
+
+    for name in top_states.clone().keys() {
+        if top_states.get(name).map(|s| s.as_str()) == Some("added")
+            && existing_entries.contains(name)
+        {
+            top_states.insert(name.clone(), "modified".to_string());
+        }
+    }
+
+    if include_unchanged {
+        for name in &existing_entries {
+            if top_states.contains_key(name) {
+                continue;
+            }
+            if source_top_entries.contains(name.as_str()) {
+                top_states.insert(name.clone(), "identical".to_string());
+            } else {
+                top_states.insert(name.clone(), "uncollided".to_string());
+            }
+        }
+    } else {
+        for name in &existing_entries {
+            if top_states.contains_key(name) {
+                continue;
+            }
+            if source_top_entries.contains(name.as_str()) {
+                unchanged_identical += 1;
+            } else {
+                unchanged_uncollided += 1;
+            }
+        }
+    }
+
+    TopPreviewData {
+        root,
+        top_states,
+        top_is_dir,
+        unchanged_identical,
+        unchanged_uncollided,
+    }
+}
+
+pub(super) fn collect_source_top_entries(
+    src_mnt: &Path,
+    src_obj_kind: SrcObjKind,
+    include_root: bool,
+    simple_rename_dst: Option<&str>,
+    rename_target_only: Option<&str>,
+    rename_target_is_dir: bool,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let rename_target_name = simple_rename_dst
+        .or_else(|| {
+            if src_obj_kind == SrcObjKind::Dir && rename_target_is_dir {
+                rename_target_only
+            } else if src_obj_kind == SrcObjKind::File {
+                rename_target_only
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    match src_obj_kind {
+        SrcObjKind::File => {
+            if let Some(name) = rename_target_name {
+                out.insert(name);
+            } else if let Some(name) = src_mnt.file_name().map(|s| s.to_string_lossy().to_string())
+            {
+                out.insert(name);
+            }
+        }
+        SrcObjKind::Dir => {
+            if include_root {
+                if let Some(name) = rename_target_name {
+                    out.insert(name);
+                } else if let Some(name) =
+                    src_mnt.file_name().map(|s| s.to_string_lossy().to_string())
+                {
+                    out.insert(name);
+                }
+            } else if let Ok(rd) = fs::read_dir(src_mnt) {
+                for e in rd.flatten() {
+                    out.insert(e.file_name().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(super) fn render_changed_top_preview_to_string(
+    preview_root: &Path,
+    preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
+    extra_added: &HashSet<String>,
+    extra_modified: &HashSet<String>,
+    extra_replaced: &HashSet<String>,
+    extra_removed: &HashSet<String>,
+    max_top_entries: usize,
+) -> String {
+    let d = collect_top_level_preview(
+        preview_root,
+        preview_items,
+        source_top_entries,
+        include_unchanged,
+        extra_added,
+        extra_modified,
+        extra_replaced,
+        extra_removed,
+    );
+
+    let mut visible_ordered_names: Vec<(String, String)> = d
+        .top_states
+        .iter()
+        .map(|(name, state)| (name.clone(), state.clone()))
+        .collect();
+    visible_ordered_names.sort_by(|(name_a, state_a), (name_b, state_b)| {
+        state_sort_priority(state_a.as_str())
+            .cmp(&state_sort_priority(state_b.as_str()))
+            .then(name_a.cmp(name_b))
+    });
+
+    let visible_names: Vec<String> = visible_ordered_names
+        .iter()
+        .take(max_top_entries)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let hidden_names: Vec<String> = visible_ordered_names
+        .iter()
+        .skip(max_top_entries)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let mut hidden_new = 0usize;
+    let mut hidden_modified = 0usize;
+    let mut hidden_identical = d.unchanged_identical;
+    let mut hidden_uncollided = d.unchanged_uncollided;
+    let mut hidden_removed = 0usize;
+
+    for n in hidden_names {
+        match d
+            .top_states
+            .get(&n)
+            .map(|s| s.as_str())
+            .unwrap_or("modified")
+        {
+            "added" => hidden_new += 1,
+            "removed" => hidden_removed += 1,
+            "identical" => hidden_identical += 1,
+            "uncollided" => hidden_uncollided += 1,
+            _ => hidden_modified += 1,
+        }
+    }
+
+    if visible_names.is_empty() {
+        let mut out = String::new();
+        let _ = writeln!(out, "(no new additions)");
+        if let Some(summary) = format_hidden_top_summary(
+            hidden_new,
+            hidden_modified,
+            hidden_identical,
+            hidden_uncollided,
+            hidden_removed,
+            !include_unchanged,
+        ) {
+            let _ = writeln!(out, "... and {summary}");
+        }
+        return out;
+    } else {
+        let mut out = String::new();
+        let mut rows: Vec<(String, String, bool)> = Vec::new();
+        for name in visible_names {
+            let full = d.root.join(&name);
+            let is_dir = *d.top_is_dir.get(&name).unwrap_or(&full.is_dir());
+            let state = d
+                .top_states
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| "modified".to_string());
+            if state == "replaced" {
+                rows.push(("replaced_old".to_string(), name.clone(), is_dir));
+                rows.push(("replaced_new".to_string(), name.clone(), is_dir));
+            } else {
+                rows.push(("single".to_string(), name.clone(), is_dir));
+            }
+        }
+
+        for (idx, (kind, name, is_dir)) in rows.iter().enumerate() {
+            let last = idx + 1 == rows.len();
+            let branch = if last { "└── " } else { "├── " };
+            let suffix = if *is_dir { "/" } else { "" };
+            let state = d
+                .top_states
+                .get(name)
+                .map(|s| s.as_str())
+                .unwrap_or("modified");
+            let (color, label) = if kind == "replaced_old" {
+                (FAIL, " (old)")
+            } else if kind == "replaced_new" {
+                (OKGREEN, " (new)")
+            } else if state == "removed" {
+                (FAIL, " (removed)")
+            } else if state == "added" {
+                (OKGREEN, "")
+            } else if state == "identical" {
+                (LIGHT_TEAL, "")
+            } else if state == "uncollided" {
+                (WHITE, "")
+            } else {
+                (WARNING, "")
+            };
+            let _ = writeln!(out, "{branch}{color}{name}{suffix}{label}{ENDC}");
+        }
+        if let Some(summary) = format_hidden_top_summary(
+            hidden_new,
+            hidden_modified,
+            hidden_identical,
+            hidden_uncollided,
+            hidden_removed,
+            !include_unchanged,
+        ) {
+            let _ = writeln!(out, "... and {summary}");
+        }
+        return out;
+    }
+}
+
+pub(super) fn print_changed_top_preview(
+    preview_root: &Path,
+    preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
+    extra_added: &HashSet<String>,
+    extra_modified: &HashSet<String>,
+    extra_replaced: &HashSet<String>,
+    extra_removed: &HashSet<String>,
+    max_top_entries: usize,
+) {
+    let out = render_changed_top_preview_to_string(
+        preview_root,
+        preview_items,
+        source_top_entries,
+        include_unchanged,
+        extra_added,
+        extra_modified,
+        extra_replaced,
+        extra_removed,
+        max_top_entries,
+    );
+    print!("{out}");
+    println!();
+}
+
+pub(super) fn format_hidden_top_summary(
+    hidden_new: usize,
+    hidden_modified: usize,
+    hidden_identical: usize,
+    hidden_uncollided: usize,
+    hidden_deleted: usize,
+    combine_unchanged: bool,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if hidden_new > 0 {
+        parts.push(format!("{hidden_new} more new"));
+    }
+    if hidden_modified > 0 {
+        parts.push(format!("{hidden_modified} more modified"));
+    }
+    if combine_unchanged {
+        let combined = hidden_identical + hidden_uncollided;
+        if combined > 0 {
+            parts.push(format!("{combined} more identical/uncollided"));
+        }
+    } else {
+        if hidden_identical > 0 {
+            parts.push(format!("{hidden_identical} more identical"));
+        }
+        if hidden_uncollided > 0 {
+            parts.push(format!("{hidden_uncollided} more uncollided"));
+        }
+    }
+    if hidden_deleted > 0 {
+        parts.push(format!("{hidden_deleted} more deleted"));
+    }
+    if !parts.is_empty() {
+        Some(parts.join(" "))
+    } else {
+        None
+    }
+}
