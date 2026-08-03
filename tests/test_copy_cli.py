@@ -67,6 +67,7 @@ class CopyCliIntegrationTests(unittest.TestCase):
         self.assertIn("--collision source:newer,larger", out)
         self.assertIn("--collision dest:newer+larger", out)
         self.assertIn("--sync", out)
+        self.assertIn("--create-destination-parents", out)
 
     def test_preview_shows_policy_independent_file_relation_breakdown(self):
         with tempfile.TemporaryDirectory() as td:
@@ -178,6 +179,20 @@ class CopyCliIntegrationTests(unittest.TestCase):
             rc, out, _ = run_copy([str(src), str(dst)], confirm=True)
             self.assertEqual(rc, 0, out)
             self.assertTrue((dst / "A" / "file.txt").exists())
+
+    def test_create_destination_parents_allows_nested_exact_directory_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "Users"
+            dst = Path(td) / "backup" / "2022PCWindowsBackup" / "Users"
+            write_file(src / "Public" / "desktop.ini", "desktop\n")
+
+            rc, out, _ = run_copy(
+                [str(src), str(dst), "--create-destination-parents"],
+                confirm=True,
+            )
+            self.assertEqual(rc, 0, out)
+            self.assertTrue((dst / "Public" / "desktop.ini").exists(), out)
+            self.assertFalse((dst / "Users").exists(), out)
 
     def test_copy_directory_contents_only_merges_into_destination(self):
         with tempfile.TemporaryDirectory() as td:

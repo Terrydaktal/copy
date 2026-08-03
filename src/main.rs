@@ -122,7 +122,7 @@ enum DstObjKind {
     FileExistingForDir,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MediaKind {
     Nvme,
     Hdd,
@@ -279,6 +279,7 @@ struct CliArgs {
     sudo: bool,
     overwrite: bool,
     contents_only: bool,
+    create_destination_parents: bool,
     backup: bool,
     sync_mode: bool,
     showall: bool,
@@ -1533,7 +1534,11 @@ fn parse_env_u64(name: &str) -> Option<u64> {
 
 fn preferred_thread_count(media: MediaKind) -> usize {
     if let Some(n) = parse_env_threads() {
-        return n;
+        return match media {
+            MediaKind::Hdd => n.clamp(1, 2),
+            MediaKind::Nvme => n.clamp(2, 32),
+            MediaKind::Other => n.clamp(1, 8),
+        };
     }
     let logical = thread::available_parallelism()
         .map(|n| n.get())
@@ -1542,6 +1547,16 @@ fn preferred_thread_count(media: MediaKind) -> usize {
         MediaKind::Hdd => logical.clamp(2, 2),
         MediaKind::Nvme => logical.clamp(2, 32),
         MediaKind::Other => logical.clamp(1, 8),
+    }
+}
+
+fn transfer_media_kind(source: MediaKind, destination: MediaKind) -> MediaKind {
+    if source == MediaKind::Hdd || destination == MediaKind::Hdd {
+        MediaKind::Hdd
+    } else if source == MediaKind::Nvme && destination == MediaKind::Nvme {
+        MediaKind::Nvme
+    } else {
+        MediaKind::Other
     }
 }
 
@@ -2558,6 +2573,26 @@ fn resolve_destination_for_file(
     Ok((dst_real, DstObjKind::File))
 }
 
+fn create_destination_parents(value: &str, mode: TransferMode) -> Result<(), i32> {
+    let destination = to_real_path(value);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    if parent.is_dir() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(parent).map_err(|err| {
+        log(
+            mode,
+            &format!(
+                "Could not create destination parent directory {}: {err}",
+                parent.display()
+            ),
+            LogLevel::Error,
+        );
+        1
+    })
+}
+
 fn resolve_destination_for_dir(
     value: &str,
     mode: TransferMode,
@@ -2733,13 +2768,13 @@ fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut FxHashSet<Strin
 
 fn usage() {
     eprintln!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
 }
 
 fn print_help() {
     println!(
-        "usage: copy [-h] [-m] [-s] [-o] [-c] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
+        "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
     println!();
     println!("Standalone copy/move with preview/progress.");
@@ -2763,6 +2798,11 @@ fn print_help() {
     println!("                        This does not control file-vs-file collisions inside a merged folder.");
     println!("  -c, --contents-only   Transfer source directory children into destination (like source/*; do not nest source basename).");
     println!("                        In --move mode, source directories are removed if they become empty.");
+    println!("  --create-destination-parents");
+    println!("                        Create missing destination parent directories before planning the transfer.");
+    println!(
+        "                        The final destination target still follows the normal path rules."
+    );
     println!("  -b, --backup          Create a timestamped backup when destination data will be merged or overwritten.");
     println!("  --sync              Rsync-style in-place sync with destination deletions (like rsync -a --delete).");
     println!("                        Merge/sync semantics; not target replacement semantics like --overwrite.");
@@ -3178,7 +3218,7 @@ fn run_multi_source_file_batch(
 
     for (src_mnt, item_planned_bytes) in batch_items {
         let src_path = src_mnt.display().to_string();
-        let media = dev_media_kind(&src_mnt);
+        let media = transfer_media_kind(dev_media_kind(&src_mnt), dev_media_kind(&dst_mnt));
         let transfer = match backend {
             TransferBackend::Rsync => run_rsync_transfer(
                 &src_path,
@@ -3322,6 +3362,7 @@ fn parse_args() -> Result<CliArgs, i32> {
             "-s" | "--sudo" => args.sudo = true,
             "-o" | "--overwrite" => args.overwrite = true,
             "-c" | "--contents-only" => args.contents_only = true,
+            "--create-destination-parents" => args.create_destination_parents = true,
             "-b" | "--backup" => args.backup = true,
             "--sync" => args.sync_mode = true,
             "-v" | "--verbose" | "--showall" => args.showall = true,
@@ -6043,9 +6084,15 @@ fn run_rust_transfer(
 }
 
 fn dev_media_kind(path: &Path) -> MediaKind {
-    let md = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return MediaKind::Other,
+    let mut probe = path;
+    let md = loop {
+        if let Ok(md) = fs::metadata(probe) {
+            break md;
+        }
+        probe = match probe.parent() {
+            Some(parent) if parent != probe => parent,
+            _ => return MediaKind::Other,
+        };
     };
     let dev = md.dev();
     let maj = major(dev);
@@ -7237,6 +7284,16 @@ fn real_main() -> i32 {
     let source_remote = parse_remote_spec(&source);
     let destination_remote = parse_remote_spec(&destination).map(enrich_remote_spec);
 
+    if args.create_destination_parents && (source_remote.is_some() || destination_remote.is_some())
+    {
+        log(
+            requested_mode,
+            "--create-destination-parents is currently supported for local transfers only.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+
     if (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::default())
         && (use_sudo || source_remote.is_some() || destination_remote.is_some())
     {
@@ -7301,6 +7358,11 @@ fn real_main() -> i32 {
             );
             return 1;
         }
+        if args.create_destination_parents {
+            if let Err(code) = create_destination_parents(&args.destination, requested_mode) {
+                return code;
+            }
+        }
         return run_multi_source_file_batch(
             requested_mode,
             &batch_sources,
@@ -7343,6 +7405,12 @@ fn real_main() -> i32 {
             LogLevel::Error,
         );
         return 1;
+    }
+
+    if args.create_destination_parents {
+        if let Err(code) = create_destination_parents(&destination, requested_mode) {
+            return code;
+        }
     }
 
     let (dst_mnt, dst_obj_kind) = match src_obj_kind {
@@ -7710,7 +7778,9 @@ fn real_main() -> i32 {
         let _ = Command::new("sudo").arg("-v").status();
     }
 
-    let media = dev_media_kind(&src_mnt);
+    let source_media = dev_media_kind(&src_mnt);
+    let destination_media = dev_media_kind(&dst_mnt);
+    let media = transfer_media_kind(source_media, destination_media);
     let backend = if use_sudo || args.sync_mode {
         TransferBackend::Rsync
     } else {
@@ -9209,6 +9279,34 @@ mod tests {
     fn parse_remote_spec_rejects_local_path_with_colon() {
         assert!(parse_remote_spec("/tmp/a:b").is_none());
         assert!(parse_remote_spec("mtp://phone/path").is_none());
+    }
+
+    #[test]
+    fn transfer_media_uses_conservative_endpoint_kind() {
+        assert_eq!(
+            transfer_media_kind(MediaKind::Nvme, MediaKind::Hdd),
+            MediaKind::Hdd
+        );
+        assert_eq!(
+            transfer_media_kind(MediaKind::Hdd, MediaKind::Nvme),
+            MediaKind::Hdd
+        );
+        assert_eq!(
+            transfer_media_kind(MediaKind::Nvme, MediaKind::Nvme),
+            MediaKind::Nvme
+        );
+        assert_eq!(
+            transfer_media_kind(MediaKind::Nvme, MediaKind::Other),
+            MediaKind::Other
+        );
+    }
+
+    #[test]
+    fn dev_media_kind_probes_existing_parent_for_missing_target() {
+        let td = tempdir().expect("tempdir");
+        let existing = dev_media_kind(td.path());
+        let missing = dev_media_kind(&td.path().join("not-created").join("target"));
+        assert_eq!(missing, existing);
     }
 
     #[test]
