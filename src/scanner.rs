@@ -48,14 +48,6 @@ pub(super) fn count_tree_any(path: &Path, include_root_dir: bool) -> TreeCounts 
     counts
 }
 
-pub(super) fn count_regular_files_any(path: &Path) -> u64 {
-    count_tree_any(path, false).files
-}
-
-pub(super) fn count_directories_any(path: &Path, include_root: bool) -> u64 {
-    count_tree_any(path, include_root).dirs
-}
-
 pub(super) fn top_level_rel_component(rel: &str) -> Option<&str> {
     let trimmed = rel.trim_start_matches("./").trim_start_matches('/');
     let first = trimmed.split('/').next().unwrap_or("");
@@ -181,26 +173,43 @@ pub(super) fn destination_file_counts(
         return (0, 0);
     }
     let idx = build_destination_index(destination_root);
-    let total = idx.file_sizes.len() as u64;
+    let total = idx
+        .entries
+        .values()
+        .filter(|entry| entry.kind == DestinationKind::Regular)
+        .count() as u64;
     let uncollided = idx
-        .file_sizes
-        .keys()
-        .filter(|rel| !source_rel_files.contains(*rel))
+        .entries
+        .iter()
+        .filter(|(rel, entry)| {
+            entry.kind == DestinationKind::Regular && !source_rel_files.contains(*rel)
+        })
         .count() as u64;
     (total, uncollided)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DestinationKind {
+    Regular,
+    Directory,
+    Symlink,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DestinationEntry {
+    pub(super) kind: DestinationKind,
+    pub(super) size: u64,
+    pub(super) mtime: Option<SystemTime>,
+}
+
 #[derive(Default)]
 pub(super) struct DestinationIndex {
-    pub(super) file_sizes: FxHashMap<String, u64>,
-    pub(super) file_mtimes: FxHashMap<String, SystemTime>,
-    pub(super) dirs: FxHashSet<String>,
-    pub(super) symlinks: FxHashSet<String>,
+    pub(super) entries: FxHashMap<String, DestinationEntry>,
 }
 
 impl DestinationIndex {
     pub(super) fn path_exists(&self, rel: &str) -> bool {
-        self.file_sizes.contains_key(rel) || self.dirs.contains(rel) || self.symlinks.contains(rel)
+        self.entries.contains_key(rel)
     }
 }
 
@@ -209,10 +218,7 @@ pub(super) fn build_destination_index(destination_root: &Path) -> DestinationInd
         return DestinationIndex::default();
     }
 
-    let mut file_sizes: FxHashMap<String, u64> = FxHashMap::default();
-    let mut file_mtimes: FxHashMap<String, SystemTime> = FxHashMap::default();
-    let mut dirs: FxHashSet<String> = FxHashSet::default();
-    let mut symlinks: FxHashSet<String> = FxHashSet::default();
+    let mut entries: FxHashMap<String, DestinationEntry> = FxHashMap::default();
 
     for ent in WalkDir::new(destination_root)
         .sort(false)
@@ -237,23 +243,37 @@ pub(super) fn build_destination_index(destination_root: &Path) -> DestinationInd
                 .or_else(|_| fs::symlink_metadata(ent.path()))
                 .ok();
             let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-            if let Some(mtime) = metadata.and_then(|m| m.modified().ok()) {
-                file_mtimes.insert(rel.clone(), mtime);
-            }
-            file_sizes.insert(rel, size);
+            let mtime = metadata.and_then(|m| m.modified().ok());
+            entries.insert(
+                rel,
+                DestinationEntry {
+                    kind: DestinationKind::Regular,
+                    size,
+                    mtime,
+                },
+            );
         } else if fty.is_dir() && ent.depth() > 0 {
-            dirs.insert(rel);
+            entries.insert(
+                rel,
+                DestinationEntry {
+                    kind: DestinationKind::Directory,
+                    size: 0,
+                    mtime: None,
+                },
+            );
         } else if fty.is_symlink() {
-            symlinks.insert(rel);
+            entries.insert(
+                rel,
+                DestinationEntry {
+                    kind: DestinationKind::Symlink,
+                    size: 0,
+                    mtime: None,
+                },
+            );
         }
     }
 
-    DestinationIndex {
-        file_sizes,
-        file_mtimes,
-        dirs,
-        symlinks,
-    }
+    DestinationIndex { entries }
 }
 
 pub(super) fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut FxHashSet<String>) {
@@ -285,12 +305,12 @@ pub(super) fn add_parent_dir_chain(rel: &str, include_root: bool, out: &mut FxHa
 }
 
 pub(super) fn normalize_rel(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if s.contains('\\') {
-        s.replace('\\', "/")
-    } else {
-        s.into_owned()
-    }
+    // Join actual path components so a literal backslash in a Unix filename
+    // is preserved instead of being mistaken for a directory separator.
+    path.iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub(super) fn map_dir_dest_path(
@@ -342,6 +362,7 @@ pub(super) fn bounded_preview_change(
     bounded.push('/');
     let bounded_kind = match kind {
         ChangeKind::NewFile => ChangeKind::NewDir,
+        ChangeKind::RemovedFile => ChangeKind::RemovedDir,
         other => other,
     };
     (bounded, bounded_kind)
@@ -514,6 +535,7 @@ pub(super) fn scan_source_entries(
     src_root: &Path,
     exclude_rel: Option<&str>,
     parallel_directory_walk: bool,
+    collect_dir_times: bool,
 ) -> SrcScanEntries {
     if parallel_directory_walk {
         let mut dirs = Vec::new();
@@ -544,11 +566,13 @@ pub(super) fn scan_source_entries(
                 Err(_) => continue,
             };
             if meta.is_dir() {
-                dir_times.push(ManifestDirTimeEntry {
-                    rel: rel.clone(),
-                    atime: FileTime::from_last_access_time(&meta),
-                    mtime: FileTime::from_last_modification_time(&meta),
-                });
+                if collect_dir_times {
+                    dir_times.push(ManifestDirTimeEntry {
+                        rel: rel.clone(),
+                        atime: FileTime::from_last_access_time(&meta),
+                        mtime: FileTime::from_last_modification_time(&meta),
+                    });
+                }
                 if !rel.is_empty() {
                     dirs.push(rel);
                 }
@@ -590,6 +614,7 @@ pub(super) fn scan_source_entries(
         dirs: &mut Vec<String>,
         files: &mut Vec<ScannedFileEntry>,
         dir_times: &mut Vec<ManifestDirTimeEntry>,
+        collect_dir_times: bool,
     ) {
         let meta = match current_meta {
             Some(meta) => meta,
@@ -599,11 +624,13 @@ pub(super) fn scan_source_entries(
             },
         };
         if meta.is_dir() {
-            dir_times.push(ManifestDirTimeEntry {
-                rel: rel.to_string(),
-                atime: FileTime::from_last_access_time(&meta),
-                mtime: FileTime::from_last_modification_time(&meta),
-            });
+            if collect_dir_times {
+                dir_times.push(ManifestDirTimeEntry {
+                    rel: rel.to_string(),
+                    atime: FileTime::from_last_access_time(&meta),
+                    mtime: FileTime::from_last_modification_time(&meta),
+                });
+            }
             if !rel.is_empty() {
                 dirs.push(rel.to_string());
             }
@@ -641,6 +668,7 @@ pub(super) fn scan_source_entries(
                         dirs,
                         files,
                         dir_times,
+                        collect_dir_times,
                     );
                 } else if child_meta.is_file() {
                     files.push(ScannedFileEntry {
@@ -677,6 +705,7 @@ pub(super) fn scan_source_entries(
         &mut dirs,
         &mut files,
         &mut dir_times,
+        collect_dir_times,
     );
 
     (dirs, files, dir_times)
@@ -687,8 +716,10 @@ pub(super) fn pre_scan_directory(
     dst_path: &str,
     src_mnt: &Path,
     build_manifest: bool,
+    retain_identical_manifest: bool,
     build_source_display_paths: bool,
     collect_file_relation_breakdown: bool,
+    sync_mode: bool,
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
     exclude_rel: Option<&str>,
@@ -740,19 +771,22 @@ pub(super) fn pre_scan_directory(
         Vec<ManifestDirTimeEntry>,
         Option<DestinationIndex>,
     ) = if destination_missing {
-        let (d, f, t) = scan_source_entries(src_root, exclude_rel, parallel_source_scan);
+        let (d, f, t) =
+            scan_source_entries(src_root, exclude_rel, parallel_source_scan, build_manifest);
         (d, f, t, None)
     } else if can_parallel_scans {
         std::thread::scope(|scope| {
             let idx_handle = scope.spawn(|| build_destination_index(&destination_root));
-            let (d, f, t) = scan_source_entries(src_root, exclude_rel, parallel_source_scan);
+            let (d, f, t) =
+                scan_source_entries(src_root, exclude_rel, parallel_source_scan, build_manifest);
             let idx = idx_handle
                 .join()
                 .unwrap_or_else(|_| build_destination_index(&destination_root));
             (d, f, t, Some(idx))
         })
     } else {
-        let (d, f, t) = scan_source_entries(src_root, exclude_rel, parallel_source_scan);
+        let (d, f, t) =
+            scan_source_entries(src_root, exclude_rel, parallel_source_scan, build_manifest);
         let idx = build_destination_index(&destination_root);
         (d, f, t, Some(idx))
     };
@@ -768,26 +802,36 @@ pub(super) fn pre_scan_directory(
     );
     if build_source_display_paths {
         let mut source_display_paths: FxHashSet<String> = FxHashSet::default();
+        let within_display_depth = |key: &str| {
+            bounded_preview_depth
+                .map(|depth| key.split('/').count() <= depth)
+                .unwrap_or(true)
+        };
         if include_root && !src_base.is_empty() {
             source_display_paths.insert(src_base.clone());
         }
         for rel in &dirs {
             let mapped = map_display_rel(include_root, &src_base, rel);
             let key = mapped.trim_end_matches('/').to_string();
-            if !key.is_empty() {
+            if !key.is_empty() && within_display_depth(&key) {
                 source_display_paths.insert(key);
             }
         }
         for entry in &files {
             let mapped = map_display_rel(include_root, &src_base, &entry.rel);
             let key = mapped.trim_end_matches('/').to_string();
-            if !key.is_empty() {
+            if !key.is_empty() && within_display_depth(&key) {
                 source_display_paths.insert(key);
             }
         }
         out.source_display_paths = source_display_paths;
     }
     let source_rel_dirs: FxHashSet<String> = dirs.iter().cloned().collect();
+    let source_rel_files: FxHashSet<String> = if sync_mode {
+        files.iter().map(|entry| entry.rel.to_string()).collect()
+    } else {
+        FxHashSet::default()
+    };
     let root_new_dir = include_root && !destination_root.is_dir();
     out.total_dirs = Some(dirs.len() as u64 + u64::from(include_root));
 
@@ -808,10 +852,11 @@ pub(super) fn pre_scan_directory(
     }
 
     let mut missing_dir_prefixes: FxHashSet<String> = FxHashSet::default();
-    dirs.sort_by(|a, b| {
-        let a_depth = a.bytes().filter(|byte| *byte == b'/').count();
-        let b_depth = b.bytes().filter(|byte| *byte == b'/').count();
-        a_depth.cmp(&b_depth).then_with(|| a.cmp(b))
+    dirs.sort_by_cached_key(|rel| {
+        (
+            rel.bytes().filter(|byte| *byte == b'/').count(),
+            rel.clone(),
+        )
     });
 
     for rel in &dirs {
@@ -822,7 +867,10 @@ pub(super) fn pre_scan_directory(
         let dir_missing = if destination_missing || parent_missing {
             true
         } else if let Some(idx) = destination_index.as_ref() {
-            !idx.dirs.contains(rel.as_str())
+            !matches!(
+                idx.entries.get(rel.as_str()).map(|entry| entry.kind),
+                Some(DestinationKind::Directory)
+            )
         } else {
             !map_dir_dest_path(include_root, &src_base, rel, dst_base).is_dir()
         };
@@ -894,7 +942,10 @@ pub(super) fn pre_scan_directory(
                     Some(ChangeKind::NewFile)
                 } else if is_symlink {
                     if let Some(idx) = dst_idx {
-                        if idx.symlinks.contains(rel.as_ref()) {
+                        if matches!(
+                            idx.entries.get(rel.as_ref()).map(|entry| entry.kind),
+                            Some(DestinationKind::Symlink)
+                        ) {
                             if symlink_targets_equal(
                                 src_file.as_ref().unwrap(),
                                 ensure_dst_file_path(
@@ -942,8 +993,9 @@ pub(super) fn pre_scan_directory(
                         }
                     }
                 } else {
-                    let needs_mtime =
-                        merge_collision_policy.requires_mtime() || collect_file_relation_breakdown;
+                    let needs_mtime = sync_mode
+                        || merge_collision_policy.requires_mtime()
+                        || collect_file_relation_breakdown;
                     let src_mtime = needs_mtime.then_some(entry.mtime).flatten();
                     let dst_exists = if let Some(idx) = dst_idx {
                         idx.path_exists(rel.as_ref())
@@ -959,8 +1011,9 @@ pub(super) fn pre_scan_directory(
                     };
                     let dst_path =
                         ensure_dst_file_path(&mut dst_file, include_root, &src_base, rel, dst_base);
-                    let dst_is_symlink = if let Some(idx) = dst_idx {
-                        idx.symlinks.contains(rel.as_ref())
+                    let dst_entry = dst_idx.and_then(|idx| idx.entries.get(rel.as_ref()));
+                    let dst_is_symlink = if let Some(entry) = dst_entry {
+                        entry.kind == DestinationKind::Symlink
                     } else {
                         fs::symlink_metadata(dst_path)
                             .map(|dm| dm.file_type().is_symlink())
@@ -968,8 +1021,8 @@ pub(super) fn pre_scan_directory(
                     };
                     let dst_size = if replace_dest_symlink && dst_is_symlink {
                         None
-                    } else if let Some(idx) = dst_idx {
-                        idx.file_sizes.get(rel.as_ref()).copied()
+                    } else if let Some(entry) = dst_entry {
+                        (entry.kind == DestinationKind::Regular).then_some(entry.size)
                     } else {
                         match fs::symlink_metadata(&dst_path) {
                             Ok(dm) if dm.is_file() => fs::metadata(&dst_path).ok().map(|m| m.len()),
@@ -980,11 +1033,13 @@ pub(super) fn pre_scan_directory(
                     let dst_mtime = if replace_dest_symlink && dst_is_symlink {
                         None
                     } else if needs_mtime {
-                        if let Some(idx) = dst_idx {
-                            idx.file_mtimes.get(rel.as_ref()).copied()
-                        } else {
-                            fs::metadata(dst_path).ok().and_then(|m| m.modified().ok())
-                        }
+                        dst_entry.and_then(|entry| entry.mtime).or_else(|| {
+                            if dst_idx.is_none() {
+                                fs::metadata(dst_path).ok().and_then(|m| m.modified().ok())
+                            } else {
+                                None
+                            }
+                        })
                     } else {
                         None
                     };
@@ -995,14 +1050,24 @@ pub(super) fn pre_scan_directory(
                             acc.8.add_assign(breakdown);
                         }
                     }
-                    regular_file_collision_change(
-                        merge_collision_policy,
-                        size,
-                        src_mtime,
-                        dst_exists,
-                        dst_size,
-                        dst_mtime,
-                    )
+                    if sync_mode {
+                        sync_regular_file_change(
+                            size,
+                            src_mtime,
+                            dst_exists && !dst_is_symlink && dst_size.is_some(),
+                            dst_size,
+                            dst_mtime,
+                        )
+                    } else {
+                        regular_file_collision_change(
+                            merge_collision_policy,
+                            size,
+                            src_mtime,
+                            dst_exists,
+                            dst_size,
+                            dst_mtime,
+                        )
+                    }
                 };
                 let is_overlap = !matches!(change, Some(ChangeKind::NewFile));
                 if is_overlap {
@@ -1031,7 +1096,7 @@ pub(super) fn pre_scan_directory(
                         insert_preview_change(&mut acc.3, display_rel, kind, bounded_preview_depth);
                     }
                     add_parent_dir_chain(&rel, include_root, &mut acc.6);
-                } else if build_manifest {
+                } else if build_manifest && retain_identical_manifest {
                     acc.5.push(ManifestFileEntry {
                         rel: rel.clone(),
                         size,
@@ -1084,7 +1149,11 @@ pub(super) fn pre_scan_directory(
         let idx = destination_index
             .as_ref()
             .expect("destination index should exist when destination is present");
-        let dest_total_files = idx.file_sizes.len() as u64;
+        let dest_total_files = idx
+            .entries
+            .values()
+            .filter(|entry| entry.kind == DestinationKind::Regular)
+            .count() as u64;
         let source_regular_total = out.total_regular_files.unwrap_or(0);
         let overlap_files = source_regular_total.saturating_sub(add_files);
         let uncollided_by_overlap = dest_total_files.saturating_sub(overlap_files);
@@ -1114,11 +1183,17 @@ pub(super) fn pre_scan_directory(
         let idx = destination_index
             .as_ref()
             .expect("destination index should exist when destination is present");
-        let dest_total_dirs = idx.dirs.len() as u64;
+        let dest_total_dirs = idx
+            .entries
+            .values()
+            .filter(|entry| entry.kind == DestinationKind::Directory)
+            .count() as u64;
         let uncollided_dirs_by_scan = idx
-            .dirs
+            .entries
             .iter()
-            .filter(|rel| !source_rel_dirs.contains(rel.as_str()))
+            .filter(|(rel, entry)| {
+                entry.kind == DestinationKind::Directory && !source_rel_dirs.contains(rel.as_str())
+            })
             .count() as u64;
         let source_dir_total_no_root = source_dir_count as u64;
         let source_dirs_not_new =
@@ -1127,7 +1202,79 @@ pub(super) fn pre_scan_directory(
         out.uncollided_dirs = uncollided_dirs_by_scan.max(uncollided_dirs_by_overlap);
     }
 
-    if out.add_files > 0 || out.mod_files > 0 {
+    let mut sync_delete_files = Vec::new();
+    let mut sync_delete_dirs = Vec::new();
+    if sync_mode {
+        if let Some(idx) = destination_index.as_ref() {
+            for (rel, entry) in &idx.entries {
+                if entry.kind == DestinationKind::Regular
+                    && !source_rel_files.contains(rel)
+                    && !source_rel_dirs.contains(rel)
+                {
+                    sync_delete_files.push(ManifestDeleteEntry {
+                        rel: Arc::from(rel.as_str()),
+                        size: entry.size,
+                    });
+                    let display_rel = map_display_rel(include_root, &src_base, rel);
+                    insert_preview_change(
+                        &mut directory_preview_changes,
+                        display_rel,
+                        ChangeKind::RemovedFile,
+                        bounded_preview_depth,
+                    );
+                }
+            }
+            for (rel, entry) in &idx.entries {
+                if entry.kind == DestinationKind::Symlink
+                    && !source_rel_files.contains(rel)
+                    && !source_rel_dirs.contains(rel)
+                {
+                    sync_delete_files.push(ManifestDeleteEntry {
+                        rel: Arc::from(rel.as_str()),
+                        size: 0,
+                    });
+                    let display_rel = map_display_rel(include_root, &src_base, rel);
+                    insert_preview_change(
+                        &mut directory_preview_changes,
+                        display_rel,
+                        ChangeKind::RemovedFile,
+                        bounded_preview_depth,
+                    );
+                }
+            }
+            for (rel, entry) in &idx.entries {
+                if entry.kind == DestinationKind::Directory
+                    && !source_rel_dirs.contains(rel)
+                    && !source_rel_files.contains(rel)
+                {
+                    sync_delete_dirs.push(rel.clone());
+                    let display_rel = format!(
+                        "{}/",
+                        map_display_rel(include_root, &src_base, rel).trim_end_matches('/')
+                    );
+                    insert_preview_change(
+                        &mut directory_preview_changes,
+                        display_rel,
+                        ChangeKind::RemovedDir,
+                        bounded_preview_depth,
+                    );
+                }
+            }
+        }
+        sync_delete_files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        sync_delete_dirs.sort_by_cached_key(|rel| {
+            (
+                std::cmp::Reverse(rel.bytes().filter(|byte| *byte == b'/').count()),
+                rel.clone(),
+            )
+        });
+    }
+
+    if out.add_files > 0
+        || out.mod_files > 0
+        || !sync_delete_files.is_empty()
+        || !sync_delete_dirs.is_empty()
+    {
         out.has_itemized_changes = true;
     }
 
@@ -1142,17 +1289,22 @@ pub(super) fn pre_scan_directory(
     if build_manifest {
         if let Some(d) = manifest_dirs.take() {
             manifest_copy_files.sort_by(|a, b| a.rel.cmp(&b.rel));
-            manifest_identical_files.sort_by(|a, b| a.rel.cmp(&b.rel));
-            dir_times.sort_by(|a, b| {
-                let a_depth = a.rel.bytes().filter(|byte| *byte == b'/').count();
-                let b_depth = b.rel.bytes().filter(|byte| *byte == b'/').count();
-                b_depth.cmp(&a_depth).then_with(|| a.rel.cmp(&b.rel))
+            if retain_identical_manifest {
+                manifest_identical_files.sort_by(|a, b| a.rel.cmp(&b.rel));
+            }
+            dir_times.sort_by_cached_key(|entry| {
+                (
+                    std::cmp::Reverse(entry.rel.bytes().filter(|byte| *byte == b'/').count()),
+                    entry.rel.clone(),
+                )
             });
             out.transfer_manifest = Some(TransferManifest {
                 dirs: d,
                 dir_times,
                 copy_files: manifest_copy_files,
                 identical_files: manifest_identical_files,
+                sync_delete_files,
+                sync_delete_dirs,
             });
         }
     }
@@ -1242,9 +1394,11 @@ pub(super) fn pre_scan_file(
             }
             let uncollided_by_scan = if let Some(index) = destination_index {
                 index
-                    .file_sizes
-                    .keys()
-                    .filter(|rel| !source_rel_files.contains(*rel))
+                    .entries
+                    .iter()
+                    .filter(|(rel, entry)| {
+                        entry.kind == DestinationKind::Regular && !source_rel_files.contains(*rel)
+                    })
                     .count() as u64
             } else {
                 destination_file_counts(&root, &source_rel_files).1

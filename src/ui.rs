@@ -88,7 +88,7 @@ pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
 
         let leaf_state = match it.kind {
             ChangeKind::NewFile | ChangeKind::NewDir => "added",
-            ChangeKind::RemovedDir => "removed",
+            ChangeKind::RemovedFile | ChangeKind::RemovedDir => "removed",
             _ => "modified",
         }
         .to_string();
@@ -133,11 +133,11 @@ pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
 }
 
 #[derive(Clone)]
-pub(super) struct LevelEntry {
+pub(super) struct LevelEntry<'a> {
     name: String,
     state: String,
     is_dir: bool,
-    node: Option<TreeNode>,
+    node: Option<&'a TreeNode>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -203,56 +203,56 @@ pub(super) fn state_sort_priority(state: &str) -> u8 {
     }
 }
 
-pub(super) fn collect_level_entries(
+pub(super) fn collect_level_entries<'a>(
     abs_dir: &Path,
-    node: Option<&TreeNode>,
+    node: Option<&'a TreeNode>,
     extra: &HashMap<String, String>,
     source_display_paths: &HashSet<String>,
     rel_prefix: &str,
     dir_cache: &mut HashMap<PathBuf, Vec<(String, bool)>>,
-) -> Vec<LevelEntry> {
-    let existing = dir_cache
-        .entry(abs_dir.to_path_buf())
-        .or_insert_with(|| {
-            if !abs_dir.is_dir() {
-                return Vec::new();
+) -> Vec<LevelEntry<'a>> {
+    let existing = dir_cache.entry(abs_dir.to_path_buf()).or_insert_with(|| {
+        if !abs_dir.is_dir() {
+            return Vec::new();
+        }
+        let mut rows: Vec<(String, bool)> = Vec::new();
+        if let Ok(rd) = fs::read_dir(abs_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                rows.push((name, is_dir));
             }
-            let mut rows: Vec<(String, bool)> = Vec::new();
-            if let Ok(rd) = fs::read_dir(abs_dir) {
-                for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    rows.push((name, is_dir));
-                }
-            }
-            rows
-        })
-        .clone();
-    let mut existing_entries: BTreeSet<String> = BTreeSet::new();
+        }
+        rows
+    });
+    let mut all: Vec<String> = Vec::with_capacity(existing.len());
     let mut existing_is_dir: HashMap<String, bool> = HashMap::new();
-    for (name, is_dir) in existing {
-        existing_entries.insert(name.clone());
-        existing_is_dir.insert(name, is_dir);
+    let mut seen: HashSet<String> = HashSet::with_capacity(existing.len());
+    for (name, is_dir) in existing.iter() {
+        seen.insert(name.clone());
+        all.push(name.clone());
+        existing_is_dir.insert(name.clone(), *is_dir);
     }
 
-    let mut changed: BTreeSet<String> = BTreeSet::new();
     if let Some(n) = node {
         for k in n.children.keys() {
-            changed.insert(k.clone());
+            if seen.insert(k.clone()) {
+                all.push(k.clone());
+            }
+        }
+    }
+    for name in extra.keys() {
+        if seen.insert(name.clone()) {
+            all.push(name.clone());
         }
     }
 
-    let mut all: BTreeSet<String> = BTreeSet::new();
-    all.extend(existing_entries.iter().cloned());
-    all.extend(changed.iter().cloned());
-    all.extend(extra.keys().cloned());
-
     let mut out = Vec::new();
     for name in all {
-        let child = node.and_then(|n| n.children.get(&name)).cloned();
+        let child = node.and_then(|n| n.children.get(&name));
         let mut state = extra.get(&name).cloned();
         if state.is_none() {
-            state = child.as_ref().and_then(|c| c.state.clone());
+            state = child.and_then(|c| c.state.clone());
         }
         let mut state = state.unwrap_or_else(|| "unchanged".to_string());
         if state == "unchanged" {
@@ -267,7 +267,6 @@ pub(super) fn collect_level_entries(
         }
         let full = abs_dir.join(&name);
         let is_dir = child
-            .as_ref()
             .map(|c| c.is_dir)
             .or_else(|| existing_is_dir.get(&name).copied())
             .unwrap_or_else(|| full.is_dir());
@@ -281,11 +280,11 @@ pub(super) fn collect_level_entries(
     out
 }
 
-pub(super) fn select_level_entries(
-    entries: &[LevelEntry],
+pub(super) fn select_level_entries<'a>(
+    entries: &[LevelEntry<'a>],
     max_entries: usize,
     include_unchanged: bool,
-) -> (Vec<LevelEntry>, HiddenStateCounts) {
+) -> (Vec<LevelEntry<'a>>, HiddenStateCounts) {
     let mut ordered: Vec<LevelEntry> = if include_unchanged {
         entries.to_vec()
     } else {
@@ -300,19 +299,24 @@ pub(super) fn select_level_entries(
             .cloned()
             .collect()
     };
-    ordered.sort_by(|a, b| {
+    let compare_entries = |a: &LevelEntry<'a>, b: &LevelEntry<'a>| {
         let pa = state_sort_priority(a.state.as_str());
         let pb = state_sort_priority(b.state.as_str());
         pa.cmp(&pb).then(a.name.cmp(&b.name))
-    });
+    };
 
-    let selected: Vec<LevelEntry> = ordered.iter().take(max_entries).cloned().collect();
-    let selected_names: HashSet<String> = selected.iter().map(|e| e.name.clone()).collect();
+    if ordered.len() > max_entries {
+        let (_, _, _) = ordered.select_nth_unstable_by(max_entries, compare_entries);
+        ordered.truncate(max_entries);
+    }
+    ordered.sort_unstable_by(compare_entries);
+    let selected = ordered;
+    let selected_names: HashSet<&str> = selected.iter().map(|e| e.name.as_str()).collect();
 
     let mut hidden = HiddenStateCounts::default();
 
     for e in entries {
-        if selected_names.contains(&e.name) {
+        if selected_names.contains(e.name.as_str()) {
             continue;
         }
         match e.state.as_str() {
@@ -371,8 +375,8 @@ pub(super) fn render_showall_level(
     );
     let (selected, hidden) = select_level_entries(&entries, trunc, include_unchanged);
 
-    enum Unit {
-        Entry(LevelEntry, Option<&'static str>),
+    enum Unit<'a> {
+        Entry(LevelEntry<'a>, Option<&'static str>),
         Summary(HiddenStateCounts),
     }
 
@@ -427,7 +431,7 @@ pub(super) fn render_showall_level(
                     let empty: HashMap<String, String> = HashMap::new();
                     if !render_showall_level(
                         &abs_dir.join(&entry.name),
-                        entry.node.as_ref(),
+                        entry.node,
                         &child_prefix,
                         &empty,
                         source_display_paths,
@@ -450,9 +454,9 @@ pub(super) fn render_showall_level(
     true
 }
 
-pub(super) fn render_showall_preview_to_string_with_cache(
+pub(super) fn render_showall_tree_to_string_with_cache(
     preview_root: &Path,
-    preview_items: &[ChangeItem],
+    tree: &TreeNode,
     source_display_paths: &HashSet<String>,
     include_unchanged: bool,
     extra_added: &HashSet<String>,
@@ -480,12 +484,11 @@ pub(super) fn render_showall_preview_to_string_with_cache(
         root_extra.insert(n.clone(), "removed".to_string());
     }
 
-    let tree = build_change_tree(preview_items);
     let mut out = String::new();
     let mut line_count = 0usize;
     let ok = render_showall_level(
         preview_root,
-        Some(&tree),
+        Some(tree),
         "",
         &root_extra,
         source_display_paths,
@@ -513,7 +516,7 @@ pub(super) struct TopPreviewData {
     unchanged_uncollided: usize,
 }
 
-pub(super) fn collect_top_level_preview(
+fn collect_top_level_preview_with_cache(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
@@ -522,11 +525,31 @@ pub(super) fn collect_top_level_preview(
     extra_modified: &HashSet<String>,
     extra_replaced: &HashSet<String>,
     extra_removed: &HashSet<String>,
+    dir_cache: Option<&mut HashMap<PathBuf, Vec<(String, bool)>>>,
 ) -> TopPreviewData {
     let root = preview_root.to_path_buf();
 
-    let mut existing_entries: BTreeSet<String> = BTreeSet::new();
-    if root.is_dir() {
+    let mut existing_entries: HashSet<String> = HashSet::new();
+    if let Some(cache) = dir_cache {
+        let entries = cache.entry(root.clone()).or_insert_with(|| {
+            if !root.is_dir() {
+                return Vec::new();
+            }
+            fs::read_dir(&root)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let is_dir = entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false);
+                    (name, is_dir)
+                })
+                .collect()
+        });
+        for (name, _) in entries.iter() {
+            existing_entries.insert(name.clone());
+        }
+    } else if root.is_dir() {
         if let Ok(rd) = fs::read_dir(&root) {
             for e in rd.flatten() {
                 existing_entries.insert(e.file_name().to_string_lossy().to_string());
@@ -562,7 +585,7 @@ pub(super) fn collect_top_level_preview(
 
         let state = match it.kind {
             ChangeKind::NewFile | ChangeKind::NewDir => "added",
-            ChangeKind::RemovedDir => "removed",
+            ChangeKind::RemovedFile | ChangeKind::RemovedDir => "removed",
             _ => "modified",
         }
         .to_string();
@@ -685,7 +708,7 @@ pub(super) fn collect_source_top_entries(
     out
 }
 
-pub(super) fn render_changed_top_preview_to_string(
+pub(super) fn render_changed_top_preview_to_string_with_cache(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
@@ -695,8 +718,9 @@ pub(super) fn render_changed_top_preview_to_string(
     extra_replaced: &HashSet<String>,
     extra_removed: &HashSet<String>,
     max_top_entries: usize,
+    mut dir_cache: Option<&mut HashMap<PathBuf, Vec<(String, bool)>>>,
 ) -> String {
-    let d = collect_top_level_preview(
+    let d = collect_top_level_preview_with_cache(
         preview_root,
         preview_items,
         source_top_entries,
@@ -705,29 +729,31 @@ pub(super) fn render_changed_top_preview_to_string(
         extra_modified,
         extra_replaced,
         extra_removed,
+        dir_cache.take(),
     );
 
-    let mut visible_ordered_names: Vec<(String, String)> = d
+    let mut visible_ordered_names: Vec<(&String, &String)> = d
         .top_states
         .iter()
-        .map(|(name, state)| (name.clone(), state.clone()))
+        .map(|(name, state)| (name, state))
         .collect();
-    visible_ordered_names.sort_by(|(name_a, state_a), (name_b, state_b)| {
+    let compare_top = |(name_a, state_a): &(&String, &String),
+                       (name_b, state_b): &(&String, &String)| {
         state_sort_priority(state_a.as_str())
             .cmp(&state_sort_priority(state_b.as_str()))
             .then(name_a.cmp(name_b))
-    });
+    };
+    if visible_ordered_names.len() > max_top_entries {
+        let (_, _, _) = visible_ordered_names.select_nth_unstable_by(max_top_entries, compare_top);
+        visible_ordered_names.truncate(max_top_entries);
+    }
+    visible_ordered_names.sort_unstable_by(compare_top);
 
     let visible_names: Vec<String> = visible_ordered_names
         .iter()
-        .take(max_top_entries)
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| (*name).clone())
         .collect();
-    let hidden_names: Vec<String> = visible_ordered_names
-        .iter()
-        .skip(max_top_entries)
-        .map(|(name, _)| name.clone())
-        .collect();
+    let visible_set: HashSet<&str> = visible_names.iter().map(String::as_str).collect();
 
     let mut hidden_new = 0usize;
     let mut hidden_modified = 0usize;
@@ -735,13 +761,11 @@ pub(super) fn render_changed_top_preview_to_string(
     let mut hidden_uncollided = d.unchanged_uncollided;
     let mut hidden_removed = 0usize;
 
-    for n in hidden_names {
-        match d
-            .top_states
-            .get(&n)
-            .map(|s| s.as_str())
-            .unwrap_or("modified")
-        {
+    for (name, state) in &d.top_states {
+        if visible_set.contains(name.as_str()) {
+            continue;
+        }
+        match state.as_str() {
             "added" => hidden_new += 1,
             "removed" => hidden_removed += 1,
             "identical" => hidden_identical += 1,
@@ -769,7 +793,11 @@ pub(super) fn render_changed_top_preview_to_string(
         let mut rows: Vec<(String, String, bool)> = Vec::new();
         for name in visible_names {
             let full = d.root.join(&name);
-            let is_dir = *d.top_is_dir.get(&name).unwrap_or(&full.is_dir());
+            let is_dir = d
+                .top_is_dir
+                .get(&name)
+                .copied()
+                .unwrap_or_else(|| full.is_dir());
             let state = d
                 .top_states
                 .get(&name)
@@ -834,7 +862,7 @@ pub(super) fn print_changed_top_preview(
     extra_removed: &HashSet<String>,
     max_top_entries: usize,
 ) {
-    let out = render_changed_top_preview_to_string(
+    print_changed_top_preview_with_cache(
         preview_root,
         preview_items,
         source_top_entries,
@@ -844,6 +872,33 @@ pub(super) fn print_changed_top_preview(
         extra_replaced,
         extra_removed,
         max_top_entries,
+        None,
+    );
+}
+
+pub(super) fn print_changed_top_preview_with_cache(
+    preview_root: &Path,
+    preview_items: &[ChangeItem],
+    source_top_entries: &HashSet<String>,
+    include_unchanged: bool,
+    extra_added: &HashSet<String>,
+    extra_modified: &HashSet<String>,
+    extra_replaced: &HashSet<String>,
+    extra_removed: &HashSet<String>,
+    max_top_entries: usize,
+    dir_cache: Option<&mut HashMap<PathBuf, Vec<(String, bool)>>>,
+) {
+    let out = render_changed_top_preview_to_string_with_cache(
+        preview_root,
+        preview_items,
+        source_top_entries,
+        include_unchanged,
+        extra_added,
+        extra_modified,
+        extra_replaced,
+        extra_removed,
+        max_top_entries,
+        dir_cache,
     );
     print!("{out}");
     println!();

@@ -2,19 +2,36 @@
 
 use super::*;
 
+fn remember_transfer_error(
+    errors: &Arc<Mutex<Option<String>>>,
+    operation: &str,
+    path: &Path,
+    error: &io::Error,
+) {
+    let message = format!("{operation} '{}': {error}", path.display());
+    if let Ok(mut slot) = errors.lock() {
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+}
+
 pub(super) fn run_rust_transfer(
     src_path: &str,
     dst_path: &str,
     src_obj_kind: SrcObjKind,
     _is_move: bool,
+    requested_mode: TransferMode,
     planned_bytes: u64,
     manifest: Option<&TransferManifest>,
     media: MediaKind,
     replace_dest_symlink: bool,
     merge_collision_policy: MergeCollisionPolicy,
+    sync_mode: bool,
     exclude_rel: Option<&str>,
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
+    let transfer_errors = Arc::new(Mutex::new(None::<String>));
     let copy_buf_bytes = copy_chunk_bytes_for_media(media);
     let inflight_limiter = inflight_max_bytes_for_media(media)
         .map(InflightWriteLimiter::new)
@@ -160,6 +177,15 @@ pub(super) fn run_rust_transfer(
                 true,
                 false,
             );
+            if let Ok(guard) = transfer_errors.lock() {
+                if let Some(detail) = guard.as_deref() {
+                    log(
+                        requested_mode,
+                        &format!("Rust backend failure: {detail}"),
+                        LogLevel::Error,
+                    );
+                }
+            }
             return TransferOutcome {
                 rc: $rc,
                 bytes_done: final_done,
@@ -196,19 +222,28 @@ pub(super) fn run_rust_transfer(
             let dst = dst_buf.as_path();
             let src_lmd = match fs::symlink_metadata(src) {
                 Ok(v) => v,
-                Err(_) => finish_transfer!(1),
+                Err(err) => {
+                    remember_transfer_error(&transfer_errors, "read source metadata", src, &err);
+                    finish_transfer!(1);
+                }
             };
             if src_lmd.file_type().is_symlink() {
                 let needs_copy = !symlink_targets_equal(src, dst);
-                if needs_copy && copy_symlink(src, dst).is_err() {
-                    finish_transfer!(1);
+                if needs_copy {
+                    if let Err(err) = copy_symlink(src, dst) {
+                        remember_transfer_error(&transfer_errors, "copy symlink", src, &err);
+                        finish_transfer!(1);
+                    }
                 }
                 eta_progress.mark_file(0);
                 finish_transfer!(0);
             }
             let src_meta = match fs::metadata(src) {
                 Ok(v) => v,
-                Err(_) => finish_transfer!(1),
+                Err(err) => {
+                    remember_transfer_error(&transfer_errors, "read source metadata", src, &err);
+                    finish_transfer!(1);
+                }
             };
             let src_mtime = src_meta.modified().ok();
             let dst_lmd = fs::symlink_metadata(dst).ok();
@@ -240,15 +275,23 @@ pub(super) fn run_rust_transfer(
                     && fs::symlink_metadata(dst)
                         .map(|md| md.file_type().is_symlink())
                         .unwrap_or(false)
-                    && fs::remove_file(dst).is_err()
                 {
+                    if let Err(err) = fs::remove_file(dst) {
+                        remember_transfer_error(
+                            &transfer_errors,
+                            "remove destination symlink",
+                            dst,
+                            &err,
+                        );
+                    }
                     finish_transfer!(1);
                 }
-                if copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
-                    done.fetch_add(n, Ordering::Relaxed);
-                })
-                .is_err()
+                if let Err(err) =
+                    copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
+                        done.fetch_add(n, Ordering::Relaxed);
+                    })
                 {
+                    remember_transfer_error(&transfer_errors, "copy file", src, &err);
                     finish_transfer!(1);
                 }
             }
@@ -265,12 +308,25 @@ pub(super) fn run_rust_transfer(
                 .unwrap_or_default();
 
             if include_root {
-                if fs::create_dir_all(dst_base.join(&src_base)).is_err() {
+                let target = dst_base.join(&src_base);
+                if let Err(err) = ensure_directory_target(&target, sync_mode) {
+                    remember_transfer_error(
+                        &transfer_errors,
+                        "create destination directory",
+                        &target,
+                        &err,
+                    );
                     finish_transfer!(1);
                 }
                 eta_progress.mark_dir();
             } else {
-                if fs::create_dir_all(dst_base).is_err() {
+                if let Err(err) = ensure_directory_target(dst_base, sync_mode) {
+                    remember_transfer_error(
+                        &transfer_errors,
+                        "create destination directory",
+                        dst_base,
+                        &err,
+                    );
                     finish_transfer!(1);
                 }
             }
@@ -278,7 +334,13 @@ pub(super) fn run_rust_transfer(
             if let Some(m) = manifest {
                 for rel in &m.dirs {
                     let (dst_dir, _) = map_dir_dest(include_root, &src_base, rel, dst_base);
-                    if fs::create_dir_all(&dst_dir).is_err() {
+                    if let Err(err) = ensure_directory_target(&dst_dir, sync_mode) {
+                        remember_transfer_error(
+                            &transfer_errors,
+                            "create destination directory",
+                            &dst_dir,
+                            &err,
+                        );
                         finish_transfer!(1);
                     }
                     eta_progress.mark_dir();
@@ -292,14 +354,37 @@ pub(super) fn run_rust_transfer(
                             map_dir_dest(include_root, &src_base, &entry.rel, dst_base);
                         let src_md = match fs::symlink_metadata(&src_file) {
                             Ok(md) => md,
-                            Err(_) => return false,
+                            Err(err) => {
+                                remember_transfer_error(
+                                    &transfer_errors,
+                                    "read source metadata",
+                                    &src_file,
+                                    &err,
+                                );
+                                return false;
+                            }
                         };
                         if src_md.file_type().is_symlink() {
-                            let ok = copy_symlink(&src_file, &dst_item).is_ok();
-                            if ok {
-                                eta_progress.mark_file(0);
+                            let result = if sync_mode {
+                                copy_symlink_atomic(&src_file, &dst_item)
+                            } else {
+                                copy_symlink(&src_file, &dst_item)
+                            };
+                            match result {
+                                Ok(()) => {
+                                    eta_progress.mark_file(0);
+                                    true
+                                }
+                                Err(err) => {
+                                    remember_transfer_error(
+                                        &transfer_errors,
+                                        "copy symlink",
+                                        &src_file,
+                                        &err,
+                                    );
+                                    false
+                                }
                             }
-                            ok
                         } else if src_md.is_file() {
                             let src_mtime = src_md.modified().ok();
                             let dst_lmd = fs::symlink_metadata(&dst_item).ok();
@@ -308,6 +393,10 @@ pub(super) fn run_rust_transfer(
                                 .map(|md| md.file_type().is_symlink())
                                 .unwrap_or(false);
                             let dst_exists = dst_lmd.is_some();
+                            let dst_is_regular_file = dst_lmd
+                                .as_ref()
+                                .map(|md| md.file_type().is_file())
+                                .unwrap_or(false);
                             let dst_meta = if replace_dest_symlink && dst_is_symlink {
                                 None
                             } else {
@@ -315,15 +404,26 @@ pub(super) fn run_rust_transfer(
                             };
                             let dst_size = dst_meta.as_ref().map(|m| m.len());
                             let dst_mtime = dst_meta.as_ref().and_then(|m| m.modified().ok());
-                            let needs_copy = regular_file_collision_change(
-                                merge_collision_policy,
-                                src_md.len(),
-                                src_mtime,
-                                dst_exists,
-                                dst_size,
-                                dst_mtime,
-                            )
-                            .is_some();
+                            let needs_copy = if sync_mode {
+                                sync_regular_file_change(
+                                    src_md.len(),
+                                    src_mtime,
+                                    dst_is_regular_file,
+                                    dst_size,
+                                    dst_mtime,
+                                )
+                                .is_some()
+                            } else {
+                                regular_file_collision_change(
+                                    merge_collision_policy,
+                                    src_md.len(),
+                                    src_mtime,
+                                    dst_exists,
+                                    dst_size,
+                                    dst_mtime,
+                                )
+                                .is_some()
+                            };
                             if !needs_copy {
                                 eta_progress.mark_file(src_md.len());
                                 return true;
@@ -337,23 +437,54 @@ pub(super) fn run_rust_transfer(
                                 && fs::symlink_metadata(&dst_item)
                                     .map(|md| md.file_type().is_symlink())
                                     .unwrap_or(false)
-                                && fs::remove_file(&dst_item).is_err()
                             {
-                                return false;
+                                if let Err(err) = fs::remove_file(&dst_item) {
+                                    remember_transfer_error(
+                                        &transfer_errors,
+                                        "remove destination symlink",
+                                        &dst_item,
+                                        &err,
+                                    );
+                                    return false;
+                                }
                             }
-                            let ok = copy_file_preserve_with_progress_buf(
-                                &src_file,
-                                &dst_item,
-                                copy_buf_bytes,
-                                |n| {
-                                    done.fetch_add(n, Ordering::Relaxed);
-                                },
-                            )
-                            .is_ok();
-                            if ok {
-                                eta_progress.mark_file(src_md.len());
+                            let result = if sync_mode {
+                                copy_file_preserve_atomic_with_progress_buf(
+                                    &src_file,
+                                    &dst_item,
+                                    media,
+                                    copy_buf_bytes,
+                                    |n| {
+                                        done.fetch_add(n, Ordering::Relaxed);
+                                    },
+                                )
+                                .map(|_| ())
+                            } else {
+                                copy_file_preserve_with_progress_buf(
+                                    &src_file,
+                                    &dst_item,
+                                    copy_buf_bytes,
+                                    |n| {
+                                        done.fetch_add(n, Ordering::Relaxed);
+                                    },
+                                )
+                                .map(|_| ())
+                            };
+                            match result {
+                                Ok(()) => {
+                                    eta_progress.mark_file(src_md.len());
+                                    true
+                                }
+                                Err(err) => {
+                                    remember_transfer_error(
+                                        &transfer_errors,
+                                        "copy file",
+                                        &src_file,
+                                        &err,
+                                    );
+                                    false
+                                }
                             }
-                            ok
                         } else {
                             true
                         }

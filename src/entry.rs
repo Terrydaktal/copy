@@ -537,7 +537,7 @@ pub(crate) fn run() -> i32 {
     let source_media = dev_media_kind(&src_mnt);
     let destination_media = dev_media_kind(&dst_mnt);
     let media = transfer_media_kind(source_media, destination_media);
-    let backend = if use_sudo || args.sync_mode {
+    let backend = if use_sudo {
         TransferBackend::Rsync
     } else {
         TransferBackend::Rust
@@ -570,8 +570,10 @@ pub(crate) fn run() -> i32 {
                 &pre_dst_path,
                 &src_mnt,
                 build_transfer_manifest,
+                is_move,
                 args.showall,
                 preview_only,
+                args.sync_mode,
                 args.replace_dest_symlink,
                 args.merge_collision_policy,
                 descendant_target_exclude_rel.as_deref(),
@@ -886,12 +888,13 @@ pub(crate) fn run() -> i32 {
         let max_depth = args.tree_depth.unwrap_or(1);
         let trunc = args.tree_trunc.max(1);
         let mut dir_cache: HashMap<PathBuf, Vec<(String, bool)>> = HashMap::new();
+        let preview_tree = build_change_tree(&display_change_preview);
 
         let mut best_render: Option<String> = None;
         for try_depth in 1..=max_depth {
-            if let Some(rendered) = render_showall_preview_to_string_with_cache(
+            if let Some(rendered) = render_showall_tree_to_string_with_cache(
                 preview_root_path,
-                &display_change_preview,
+                &preview_tree,
                 &source_display_paths,
                 args.showall,
                 &extra_added,
@@ -921,7 +924,7 @@ pub(crate) fn run() -> i32 {
                 rename_target_only.as_deref(),
                 rename_target_is_dir,
             );
-            print_changed_top_preview(
+            print_changed_top_preview_with_cache(
                 preview_root_path,
                 &display_change_preview,
                 &source_top_entries,
@@ -931,6 +934,7 @@ pub(crate) fn run() -> i32 {
                 &extra_replaced,
                 &extra_removed,
                 trunc,
+                Some(&mut dir_cache),
             );
         }
     }
@@ -966,6 +970,13 @@ pub(crate) fn run() -> i32 {
         0
     };
 
+    let overwrite_target_counts = if !args.sync_mode {
+        overwrite_target_path
+            .as_ref()
+            .map(|path| count_tree_any(path, true))
+    } else {
+        None
+    };
     let file_row = total_regular_files.map(|total_regular| {
         let identical_files = total_regular.saturating_sub(add_files + mod_files);
         let deleted_src_files = if is_move && !source_already_in_destination {
@@ -977,10 +988,13 @@ pub(crate) fn run() -> i32 {
         } else {
             0
         };
-        let deleted_dest_files = overwrite_target_path
-            .as_ref()
-            .map(|p| count_regular_files_any(p))
-            .unwrap_or(0);
+        let deleted_dest_files = if args.sync_mode {
+            uncollided_files
+        } else {
+            overwrite_target_counts
+                .map(|counts| counts.files)
+                .unwrap_or(0)
+        };
         (
             add_files,
             mod_files,
@@ -997,10 +1011,13 @@ pub(crate) fn run() -> i32 {
         } else {
             0
         };
-        let deleted_dest_dirs = overwrite_target_path
-            .as_ref()
-            .map(|p| count_directories_any(p, true))
-            .unwrap_or(0);
+        let deleted_dest_dirs = if args.sync_mode {
+            uncollided_dirs
+        } else {
+            overwrite_target_counts
+                .map(|counts| counts.dirs)
+                .unwrap_or(0)
+        };
         (
             add_dirs,
             mod_dirs,
@@ -1321,11 +1338,13 @@ pub(crate) fn run() -> i32 {
                         &stage_path.display().to_string(),
                         src_obj_kind,
                         is_move,
+                        requested_mode,
                         planned_bytes,
                         transfer_manifest.as_ref(),
                         media,
                         args.replace_dest_symlink,
                         args.merge_collision_policy,
+                        args.sync_mode,
                         descendant_target_exclude_rel.as_deref(),
                     ),
                 };
@@ -1632,11 +1651,13 @@ pub(crate) fn run() -> i32 {
                 &dst_path,
                 src_obj_kind,
                 is_move,
+                requested_mode,
                 planned_bytes,
                 transfer_manifest.as_ref(),
                 media,
                 args.replace_dest_symlink,
                 args.merge_collision_policy,
+                args.sync_mode,
                 descendant_target_exclude_rel.as_deref(),
             ),
         };
@@ -1682,6 +1703,31 @@ pub(crate) fn run() -> i32 {
                 cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
                 if let Some(b) = cleanup.flush.flushed_bytes {
                     cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+                }
+            }
+            if args.sync_mode && matches!(backend, TransferBackend::Rust) {
+                if let Some(manifest) = transfer_manifest.as_ref() {
+                    if !manifest.sync_delete_files.is_empty()
+                        || !manifest.sync_delete_dirs.is_empty()
+                    {
+                        let cleanup =
+                            run_sync_cleanup_phase(&src_path, &dst_path, requested_mode, manifest);
+                        deleted_cleanup_total.files = deleted_cleanup_total
+                            .files
+                            .saturating_add(cleanup.stats.deleted.files);
+                        deleted_cleanup_total.bytes = deleted_cleanup_total
+                            .bytes
+                            .saturating_add(cleanup.stats.deleted.bytes);
+                        cleanup_elapsed_total_s += cleanup.stats.cleanup_elapsed_s;
+                        cleanup_flush_elapsed_s += cleanup.stats.flush.elapsed_s;
+                        if let Some(bytes) = cleanup.stats.flush.flushed_bytes {
+                            cleanup_flush_bytes_total =
+                                cleanup_flush_bytes_total.saturating_add(bytes);
+                        }
+                        if !cleanup.success {
+                            return 1;
+                        }
+                    }
                 }
             }
             return 0;
@@ -1757,7 +1803,9 @@ pub(crate) fn run() -> i32 {
     } else {
         0.0
     };
-    let cleanup_summary = if is_move {
+    let cleanup_summary = if is_move
+        || (args.sync_mode && (cleanup_elapsed_total_s > 0.0 || cleanup_flush_elapsed_s > 0.0))
+    {
         let cleanup_bps = if cleanup_elapsed_total_s > 0.0 {
             deleted_cleanup_total.bytes as f64 / cleanup_elapsed_total_s.max(1e-6)
         } else {

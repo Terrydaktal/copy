@@ -8,6 +8,7 @@ pub(super) fn run_rust_file_batch(
     planned_bytes: u64,
     media: MediaKind,
     replace_dest_symlink: bool,
+    requested_mode: TransferMode,
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
     let eta_progress = Arc::new(AtomicEtaProgress::default());
@@ -114,7 +115,7 @@ pub(super) fn run_rust_file_batch(
     });
 
     let cancelled = AtomicBool::new(false);
-    let copy_result: Result<(), ()> =
+    let copy_result: Result<(), String> =
         items
             .par_iter()
             .try_for_each_init(Vec::new, |buffer, (source, _, needs_copy)| {
@@ -122,14 +123,21 @@ pub(super) fn run_rust_file_batch(
                     return Ok(());
                 }
                 if cancelled.load(Ordering::Relaxed) {
-                    return Err(());
+                    return Err("transfer cancelled after another worker failed".to_string());
                 }
 
-                let source_meta = fs::symlink_metadata(source).map_err(|_| ())?;
-                let name = source.file_name().ok_or(())?;
+                let source_meta = fs::symlink_metadata(source)
+                    .map_err(|err| format!("read source metadata '{}': {err}", source.display()))?;
+                let name = source.file_name().ok_or_else(|| {
+                    format!(
+                        "resolve destination name for '{}': source has no filename",
+                        source.display()
+                    )
+                })?;
                 let target = destination.join(name);
                 if source_meta.file_type().is_symlink() {
-                    copy_symlink(source, &target).map_err(|_| ())?;
+                    copy_symlink(source, &target)
+                        .map_err(|err| format!("copy symlink '{}': {err}", source.display()))?;
                     eta_progress.mark_file(0);
                     return Ok(());
                 }
@@ -141,13 +149,15 @@ pub(super) fn run_rust_file_batch(
                         .map(|meta| meta.file_type().is_symlink())
                         .unwrap_or(false)
                 {
-                    remove_path_local_if_exists(&target).map_err(|_| ())?;
+                    remove_path_local_if_exists(&target).map_err(|err| {
+                        format!("remove destination '{}': {err}", target.display())
+                    })?;
                 }
 
                 copy_file_preserve_with_progress_buffer(source, &target, media, buffer, |count| {
                     done.fetch_add(count, Ordering::Relaxed);
                 })
-                .map_err(|_| ())?;
+                .map_err(|err| format!("copy file '{}': {err}", source.display()))?;
                 eta_progress.mark_file(size);
                 Ok(())
             });
@@ -187,6 +197,13 @@ pub(super) fn run_rust_file_batch(
         true,
         false,
     );
+    if let Err(detail) = &copy_result {
+        log(
+            requested_mode,
+            &format!("Rust backend failure: {detail}"),
+            LogLevel::Error,
+        );
+    }
 
     TransferOutcome {
         rc: i32::from(copy_result.is_err()),
@@ -313,9 +330,11 @@ pub(super) fn run_multi_source_file_batch(
     }
 
     let uncollided_files = destination_index
-        .file_sizes
-        .keys()
-        .filter(|rel| !source_rel_files.contains(*rel))
+        .entries
+        .iter()
+        .filter(|(rel, entry)| {
+            entry.kind == DestinationKind::Regular && !source_rel_files.contains(*rel)
+        })
         .count() as u64;
 
     let preview_root_path = Path::new(&dst_display);
@@ -557,6 +576,7 @@ pub(super) fn run_multi_source_file_batch(
             planned_bytes,
             media,
             replace_dest_symlink,
+            requested_mode,
         );
         transferred_bytes_total = transfer.bytes_done;
         transferred_elapsed_total_s = transfer.elapsed_s;
@@ -1025,6 +1045,76 @@ pub(super) struct CleanupPhaseStats {
     pub(super) flush: FlushStats,
 }
 
+pub(super) struct SyncCleanupPhaseResult {
+    pub(super) stats: CleanupPhaseStats,
+    pub(super) success: bool,
+}
+
+fn render_cleanup_phase_completion(
+    total_elapsed_s: f64,
+    cleanup_elapsed_s: f64,
+    deleted: DeleteCleanupOutcome,
+    expected_bytes: u64,
+    proc_start: Option<ProcIoCounters>,
+    device_window: &DeviceIoWindow,
+    device_start: (Option<u64>, Option<u64>),
+    flush: FlushStats,
+    completed: bool,
+) {
+    let proc_end = read_proc_io_counters(std::process::id());
+    let proc_delta = proc_io_deltas(proc_start, proc_end);
+    let device_end = device_window.current_totals();
+    let device_delta = device_io_deltas(device_start, device_end);
+
+    let mut rates = TransferProgressRates::default();
+    if cleanup_elapsed_s > 0.0 {
+        rates.write_all_bps = Some(deleted.bytes as f64 / cleanup_elapsed_s.max(1e-6));
+    }
+    rates.rchar_bps = proc_delta.rchar.map(|v| v as f64 / total_elapsed_s);
+    rates.wchar_bps = proc_delta.wchar.map(|v| v as f64 / total_elapsed_s);
+    rates.read_bytes_bps = proc_delta.read_bytes.map(|v| v as f64 / total_elapsed_s);
+    rates.write_bytes_bps = proc_delta.write_bytes.map(|v| v as f64 / total_elapsed_s);
+    rates.read_complete_bps = device_delta
+        .read_complete
+        .map(|v| v as f64 / total_elapsed_s);
+    rates.write_complete_bps = if flush.elapsed_s > 0.0 {
+        flush
+            .flushed_bytes
+            .map(|v| v as f64 / flush.elapsed_s.max(1e-6))
+            .or_else(|| {
+                device_delta
+                    .write_complete
+                    .map(|v| v as f64 / total_elapsed_s)
+            })
+    } else {
+        device_delta
+            .write_complete
+            .map(|v| v as f64 / total_elapsed_s)
+    };
+
+    let delete_total = deleted.bytes.max(expected_bytes);
+    let delete_done = if completed {
+        delete_total
+    } else {
+        deleted.bytes.min(delete_total)
+    };
+    let mut eta_estimator = TransferEtaEstimator::default();
+    print_transfer_progress_bars(
+        total_elapsed_s,
+        delete_total,
+        Some(delete_done),
+        "Delete",
+        rates,
+        proc_delta,
+        device_delta,
+        None,
+        None,
+        Some(&mut eta_estimator),
+        true,
+        true,
+    );
+}
+
 pub(super) fn run_move_cleanup_phase(
     src_path: &str,
     dst_path: &str,
@@ -1078,55 +1168,15 @@ pub(super) fn run_move_cleanup_phase(
 
     let flush = flush_source_cleanup_writes(src_mnt, use_sudo, mode);
     let total_elapsed_s = (cleanup_elapsed_s + flush.elapsed_s).max(1e-6);
-    let proc_end = read_proc_io_counters(pid);
-    let proc_delta = proc_io_deltas(proc_start, proc_end);
-    let device_end = device_window.current_totals();
-    let device_delta = device_io_deltas(device_start, device_end);
-
-    let mut rates = TransferProgressRates::default();
-    if cleanup_elapsed_s > 0.0 {
-        rates.write_all_bps = Some(deleted.bytes as f64 / cleanup_elapsed_s.max(1e-6));
-    }
-    rates.rchar_bps = proc_delta.rchar.map(|v| v as f64 / total_elapsed_s);
-    rates.wchar_bps = proc_delta.wchar.map(|v| v as f64 / total_elapsed_s);
-    rates.read_bytes_bps = proc_delta.read_bytes.map(|v| v as f64 / total_elapsed_s);
-    rates.write_bytes_bps = proc_delta.write_bytes.map(|v| v as f64 / total_elapsed_s);
-    rates.read_complete_bps = device_delta
-        .read_complete
-        .map(|v| v as f64 / total_elapsed_s);
-    rates.write_complete_bps = if flush.elapsed_s > 0.0 {
-        flush
-            .flushed_bytes
-            .map(|v| v as f64 / flush.elapsed_s.max(1e-6))
-            .or_else(|| {
-                device_delta
-                    .write_complete
-                    .map(|v| v as f64 / total_elapsed_s)
-            })
-    } else {
-        device_delta
-            .write_complete
-            .map(|v| v as f64 / total_elapsed_s)
-    };
-
-    let delete_total = if deleted.bytes > 0 {
-        deleted.bytes
-    } else {
-        expected_bytes
-    };
-    let mut eta_estimator = TransferEtaEstimator::default();
-    print_transfer_progress_bars(
+    render_cleanup_phase_completion(
         total_elapsed_s,
-        delete_total,
-        Some(delete_total),
-        "Delete",
-        rates,
-        proc_delta,
-        device_delta,
-        None,
-        None,
-        Some(&mut eta_estimator),
-        true,
+        cleanup_elapsed_s,
+        deleted,
+        expected_bytes,
+        proc_start,
+        &device_window,
+        device_start,
+        flush,
         true,
     );
 
@@ -1135,5 +1185,92 @@ pub(super) fn run_move_cleanup_phase(
         deleted,
         cleanup_elapsed_s,
         flush,
+    }
+}
+
+pub(super) fn run_sync_cleanup_phase(
+    src_path: &str,
+    dst_path: &str,
+    mode: TransferMode,
+    manifest: &TransferManifest,
+) -> SyncCleanupPhaseResult {
+    log(mode, "Starting sync cleanup", LogLevel::Info);
+    println!();
+    reset_progress_render_state();
+
+    let src_root = Path::new(src_path.trim_end_matches('/'));
+    let dst_base = Path::new(dst_path.trim_end_matches('/'));
+    let include_root = !src_path.ends_with('/');
+    let src_base = src_root
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let destination_root = if include_root {
+        dst_base.join(&src_base)
+    } else {
+        dst_base.to_path_buf()
+    };
+    let expected_bytes = manifest
+        .sync_delete_files
+        .iter()
+        .map(|entry| entry.size)
+        .sum();
+
+    let proc_start = read_proc_io_counters(std::process::id());
+    let destination_key = destination_root.display().to_string();
+    let device_window = DeviceIoWindow::from_transfer_paths(&destination_key, &destination_key);
+    let device_start = device_window.current_totals();
+    let cleanup_start = Instant::now();
+    let deletion = delete_sync_destination_extras(&destination_root, manifest);
+    let cleanup_elapsed_s = cleanup_start.elapsed().as_secs_f64();
+    let (deleted, cleanup_error) = match deletion {
+        Ok(deleted) => (deleted, None),
+        Err(err) => (DeleteCleanupOutcome::default(), Some(err)),
+    };
+    let success = cleanup_error.is_none();
+
+    preserve_directory_times_tree(
+        src_root,
+        dst_base,
+        include_root,
+        &src_base,
+        Some(&manifest.dir_times),
+    );
+    let flush = flush_source_cleanup_writes(&destination_root, false, mode);
+    let total_elapsed_s = (cleanup_elapsed_s + flush.elapsed_s).max(1e-6);
+    render_cleanup_phase_completion(
+        total_elapsed_s,
+        cleanup_elapsed_s,
+        deleted,
+        expected_bytes,
+        proc_start,
+        &device_window,
+        device_start,
+        flush,
+        success,
+    );
+
+    if success {
+        log(mode, "Sync cleanup complete.", LogLevel::Info);
+    } else {
+        log(
+            mode,
+            &format!(
+                "Sync cleanup failed; destination-only entries may remain: {}",
+                cleanup_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "unknown cleanup error".to_string())
+            ),
+            LogLevel::Error,
+        );
+    }
+    SyncCleanupPhaseResult {
+        stats: CleanupPhaseStats {
+            deleted,
+            cleanup_elapsed_s,
+            flush,
+        },
+        success,
     }
 }

@@ -44,6 +44,10 @@ copy/
   - Merge source contents directly into destination path (no source-basename nesting).
 - `-b`, `--backup`
   - Create timestamped backup when destination data would be merged/replaced.
+- `--sync`
+  - Make the destination tree match the source using native Rust transfer and cleanup phases for local, non-elevated operations.
+  - Copy files whose type, size, or modification time differs, then delete destination-only entries after the transfer has flushed.
+  - Remote and `--sudo` sync operations retain the rsync backend.
 - `-v`, `--verbose`, `--showall`
   - Show hierarchical preview: up to 5 changed entries per level (modified first), expand only modified folders, and abbreviate remaining new/modified/unchanged/removed counts.
 - `--preview`
@@ -54,10 +58,9 @@ copy/
 ## Backend Selection
 
 - Preview is always done in Rust using `jwalk` traversal + `rayon` parallel comparison.
-- Transfer backend is selected from source device type:
-  - NVMe / non-rotational: Rust native transfer path.
-  - Rotational HDD: `rsync` transfer path.
-- `--sudo` forces `rsync` backend (so elevated transfers can run via `sudo`).
+- Local, non-elevated copy, move, and sync operations use the Rust backend.
+- The Rust backend tunes worker count, buffering, and writeback pacing for NVMe, HDD, and other media.
+- Remote endpoints and `--sudo` force the rsync backend.
 
 ## Performance Build Settings
 

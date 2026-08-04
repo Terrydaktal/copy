@@ -1076,7 +1076,7 @@ pub(super) fn print_transfer_progress_bars(
     let transfer_progress_line = |bar_width: usize| {
         format!(
             "{:<label_width$} {pct_s} [{}] {done_s} / {planned_s}  {eta_s} eta{eta_debug}",
-            "Transfer",
+            phase_label,
             build_progress_bar(pct, bar_width),
             label_width = PROGRESS_LABEL_WIDTH
         )

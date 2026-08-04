@@ -60,7 +60,8 @@ pub(super) fn print_help() {
         "                        The final destination target still follows the normal path rules."
     );
     println!("  -b, --backup          Create a timestamped backup when destination data will be merged or overwritten.");
-    println!("  --sync              Rsync-style in-place sync with destination deletions (like rsync -a --delete).");
+    println!("  --sync              Native exact-tree sync with destination deletions (rsync-style semantics).");
+    println!("                        Local transfers use the Rust backend; remote or --sudo transfers use rsync.");
     println!("                        Merge/sync semantics; not target replacement semantics like --overwrite.");
     println!("  -v, --verbose, --showall");
     println!("                        Show full preview tree (new, modified, identical, uncollided, deleted).");

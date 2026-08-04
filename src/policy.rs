@@ -182,6 +182,26 @@ pub(super) fn regular_file_collision_change(
     }
 }
 
+pub(super) fn sync_regular_file_change(
+    src_size: u64,
+    src_mtime: Option<SystemTime>,
+    dst_is_regular_file: bool,
+    dst_size: Option<u64>,
+    dst_mtime: Option<SystemTime>,
+) -> Option<ChangeKind> {
+    if !dst_is_regular_file {
+        return Some(ChangeKind::ModFile);
+    }
+
+    let same_size = dst_size == Some(src_size);
+    let same_mtime = matches!((src_mtime, dst_mtime), (Some(src), Some(dst)) if src == dst);
+    if same_size && same_mtime {
+        None
+    } else {
+        Some(ChangeKind::ModFile)
+    }
+}
+
 pub(super) fn classify_file_relation(
     src_size: u64,
     src_mtime: Option<SystemTime>,

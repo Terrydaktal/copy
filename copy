@@ -5,8 +5,12 @@ SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || realpath -- "${
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 BIN="$SCRIPT_DIR/target/release/copy-rs"
 
-if [[ ! -x "$BIN" || "$SCRIPT_DIR/src/main.rs" -nt "$BIN" || "$SCRIPT_DIR/Cargo.toml" -nt "$BIN" || "$SCRIPT_DIR/.cargo/config.toml" -nt "$BIN" ]]; then
-  cargo build --release --quiet --manifest-path "$SCRIPT_DIR/Cargo.toml"
+rust_source_is_newer() {
+	find "$SCRIPT_DIR/src" -type f -name '*.rs' -newer "$BIN" -print -quit | grep -q .
+}
+
+if [[ ! -x "$BIN" || "$SCRIPT_DIR/Cargo.toml" -nt "$BIN" || "$SCRIPT_DIR/Cargo.lock" -nt "$BIN" || "$SCRIPT_DIR/.cargo/config.toml" -nt "$BIN" ]] || rust_source_is_newer; then
+	cargo build --release --quiet --manifest-path "$SCRIPT_DIR/Cargo.toml"
 fi
 
 exec "$BIN" "$@"

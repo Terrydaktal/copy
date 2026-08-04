@@ -264,6 +264,43 @@ where
     )
 }
 
+pub(super) fn copy_file_preserve_atomic_with_progress_buf<F>(
+    src: &Path,
+    dst: &Path,
+    media: MediaKind,
+    buf_bytes: usize,
+    on_bytes: F,
+) -> io::Result<u64>
+where
+    F: FnMut(u64),
+{
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".copy-rs-partial-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    let mut buf = vec![0u8; buf_bytes.max(64 * 1024)];
+    let copied = copy_file_preserve_with_progress_buffer_inner(
+        src,
+        staged.as_ref(),
+        media,
+        &mut buf,
+        true,
+        None,
+        on_bytes,
+    )?;
+
+    if fs::symlink_metadata(dst)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        fs::remove_dir_all(dst)?;
+    }
+    staged.persist(dst).map_err(|err| err.error)?;
+    Ok(copied)
+}
+
 pub(super) fn copy_file_preserve_with_progress_buffer_inner<F>(
     src: &Path,
     dst: &Path,
@@ -479,6 +516,41 @@ pub(super) fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
     }
     remove_path_local_if_exists(dst)?;
     symlink(target, dst)
+}
+
+pub(super) fn copy_symlink_atomic(src: &Path, dst: &Path) -> io::Result<()> {
+    let target = fs::read_link(src)?;
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".copy-rs-partial-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    let staged_path: &Path = staged.as_ref();
+    fs::remove_file(staged_path)?;
+    symlink(target, staged_path)?;
+
+    if fs::symlink_metadata(dst)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        fs::remove_dir_all(dst)?;
+    }
+    staged.persist(dst).map_err(|err| err.error)?;
+    Ok(())
+}
+
+pub(super) fn ensure_directory_target(path: &Path, replace_conflict: bool) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) if replace_conflict => {
+            remove_path_local_if_exists(path)?;
+            fs::create_dir_all(path)
+        }
+        Ok(_) => fs::create_dir_all(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path),
+        Err(err) => Err(err),
+    }
 }
 
 pub(super) fn symlink_targets_equal(src: &Path, dst: &Path) -> bool {

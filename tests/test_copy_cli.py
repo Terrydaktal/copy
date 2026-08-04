@@ -216,6 +216,30 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertTrue((dst / "print_extension_groups.sh").exists(), out)
 
+    def test_rust_backend_reports_failed_path_and_os_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "file.txt", "payload\n")
+            (dst / "A" / "file.txt").mkdir(parents=True)
+
+            rc, out, _ = run_copy([str(src), str(dst)], confirm=True)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("Rust backend failure:", out)
+            self.assertIn(str(src / "file.txt"), out)
+            self.assertIn("Is a directory", out)
+
+    def test_copy_preserves_literal_backslash_in_unix_filename(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            filename = "notes\\Oscillators with RC Feedback Circuits.pdf"
+            write_file(src / filename, "payload\n")
+
+            rc, out, _ = run_copy([str(src), str(dst)], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue((dst / filename).is_file(), out)
+
     def test_sync_mode_deletes_destination_only_entries(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "A"
@@ -227,8 +251,79 @@ class CopyCliIntegrationTests(unittest.TestCase):
             rc, out, _ = run_copy([str(src), str(dst), "--sync"], confirm=True)
             self.assertEqual(rc, 0, out)
             self.assertIn("Sync", out)
+            self.assertIn("Starting copy (rust backend)", out)
             self.assertTrue((dst / "A" / "keep.txt").exists(), out)
             self.assertFalse((dst / "A" / "only-dst.txt").exists(), out)
+
+    def test_sync_mode_copies_same_size_files_when_mtime_differs(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "source-newer.txt", "source\n")
+            write_file(dst / "A" / "source-newer.txt", "target\n")
+            write_file(src / "source-older.txt", "source\n")
+            write_file(dst / "A" / "source-older.txt", "target\n")
+
+            base = 1_700_000_000
+            os.utime(src / "source-newer.txt", (base + 20, base + 20))
+            os.utime(dst / "A" / "source-newer.txt", (base, base))
+            os.utime(src / "source-older.txt", (base, base))
+            os.utime(dst / "A" / "source-older.txt", (base + 20, base + 20))
+
+            rc, out, _ = run_copy([str(src), str(dst), "--sync"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertIn("Starting copy (rust backend)", out)
+            self.assertEqual((dst / "A" / "source-newer.txt").read_text(), "source\n")
+            self.assertEqual((dst / "A" / "source-older.txt").read_text(), "source\n")
+
+    def test_sync_mode_replaces_type_conflicts_and_nested_extras(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "source-dir" / "inside.txt", "inside\n")
+            write_file(src / "source-file", "file\n")
+            write_file(dst / "A" / "source-dir", "old-file\n")
+            write_file(dst / "A" / "source-file" / "nested.txt", "old-dir\n")
+            write_file(dst / "A" / "stale" / "nested" / "old.txt", "remove\n")
+
+            rc, out, _ = run_copy([str(src), str(dst), "--sync"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertTrue((dst / "A" / "source-dir").is_dir(), out)
+            self.assertEqual((dst / "A" / "source-dir" / "inside.txt").read_text(), "inside\n")
+            self.assertTrue((dst / "A" / "source-file").is_file(), out)
+            self.assertEqual((dst / "A" / "source-file").read_text(), "file\n")
+            self.assertFalse((dst / "A" / "stale").exists(), out)
+            self.assertFalse(
+                any((dst / "A").glob(".copy-rs-partial-*")),
+                "atomic sync staging files should not remain after success",
+            )
+
+    def test_sync_mode_contents_maps_source_children_directly_to_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src"
+            dst = Path(td) / "dst"
+            write_file(src / "keep" / "source.txt", "source\n")
+            write_file(dst / "keep" / "source.txt", "old\n")
+            write_file(dst / "stale.txt", "remove\n")
+
+            rc, out, _ = run_copy([str(src), str(dst), "--sync", "-c"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual((dst / "keep" / "source.txt").read_text(), "source\n")
+            self.assertFalse((dst / "stale.txt").exists(), out)
+            self.assertFalse((dst / "src").exists(), out)
+
+    def test_sync_mode_deletes_destination_only_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src" / "A"
+            dst = Path(td) / "dst"
+            write_file(src / "keep.txt", "same\n")
+            write_file(dst / "A" / "keep.txt", "same\n")
+            os.symlink("missing-target", dst / "A" / "stale-link")
+
+            rc, out, _ = run_copy([str(src), str(dst), "--sync"], confirm=True)
+            self.assertEqual(rc, 0, out)
+            self.assertFalse((dst / "A" / "stale-link").is_symlink(), out)
+            self.assertEqual((dst / "A" / "keep.txt").read_text(), "same\n")
 
     def test_sync_mode_with_backup_creates_snapshot_before_delete_sync(self):
         with tempfile.TemporaryDirectory() as td:

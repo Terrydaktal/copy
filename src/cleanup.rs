@@ -2,6 +2,10 @@
 
 use super::*;
 
+fn path_was_removed_or_replaced(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound || err.raw_os_error() == Some(nix::libc::ENOTDIR)
+}
+
 pub(super) fn remove_path_recursive(path: &Path, use_sudo: bool, mode: TransferMode) -> bool {
     if !path.exists() {
         return true;
@@ -40,6 +44,47 @@ pub(super) fn remove_path_recursive(path: &Path, use_sudo: bool, mode: TransferM
         }
         true
     }
+}
+
+pub(super) fn delete_sync_destination_extras(
+    destination_root: &Path,
+    manifest: &TransferManifest,
+) -> io::Result<DeleteCleanupOutcome> {
+    let mut deleted = DeleteCleanupOutcome::default();
+
+    for entry in &manifest.sync_delete_files {
+        let path = destination_root.join(entry.rel.as_ref());
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                return Err(io::Error::other(format!(
+                    "destination entry changed type during sync cleanup: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                fs::remove_file(&path)?;
+                deleted.files = deleted.files.saturating_add(1);
+                deleted.bytes = deleted.bytes.saturating_add(entry.size);
+            }
+            Err(err) if path_was_removed_or_replaced(&err) => {
+                deleted.files = deleted.files.saturating_add(1);
+                deleted.bytes = deleted.bytes.saturating_add(entry.size);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    for rel in &manifest.sync_delete_dirs {
+        let path = destination_root.join(rel);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => fs::remove_dir(&path)?,
+            Ok(_) => remove_path_local_if_exists(&path)?,
+            Err(err) if path_was_removed_or_replaced(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(deleted)
 }
 
 pub(super) fn remove_empty_dirs(path: &Path, remove_root: bool) {

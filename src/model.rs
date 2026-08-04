@@ -121,6 +121,7 @@ pub(super) enum Endpoint {
 pub(super) enum ChangeKind {
     NewFile,
     ModFile,
+    RemovedFile,
     NewDir,
     RemovedDir,
 }
@@ -142,6 +143,12 @@ pub(super) struct ManifestFileEntry {
     pub(super) is_symlink: bool,
 }
 
+#[derive(Default, Clone)]
+pub(super) struct ManifestDeleteEntry {
+    pub(super) rel: Arc<str>,
+    pub(super) size: u64,
+}
+
 #[derive(Clone)]
 pub(super) struct ManifestDirTimeEntry {
     pub(super) rel: String,
@@ -155,6 +162,8 @@ pub(super) struct TransferManifest {
     pub(super) dir_times: Vec<ManifestDirTimeEntry>,
     pub(super) copy_files: Vec<ManifestFileEntry>,
     pub(super) identical_files: Vec<ManifestFileEntry>,
+    pub(super) sync_delete_files: Vec<ManifestDeleteEntry>,
+    pub(super) sync_delete_dirs: Vec<String>,
 }
 
 pub(super) struct PreScan {
