@@ -65,6 +65,7 @@ pub(super) struct TreeNode {
     children: FxHashMap<String, TreeNode>,
     state: Option<String>,
     is_dir: bool,
+    explicit_added_dir: bool,
 }
 
 pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
@@ -72,6 +73,7 @@ pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
         children: FxHashMap::default(),
         state: None,
         is_dir: true,
+        explicit_added_dir: false,
     };
 
     for it in items {
@@ -103,10 +105,14 @@ pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
                     children: FxHashMap::default(),
                     state: None,
                     is_dir: true,
+                    explicit_added_dir: false,
                 });
 
             if is_leaf {
                 node.is_dir = leaf_is_dir;
+                if it.kind == ChangeKind::NewDir {
+                    node.explicit_added_dir = true;
+                }
                 match leaf_state.as_str() {
                     "added" => {
                         if node.state.is_none() {
@@ -129,6 +135,27 @@ pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
         }
     }
 
+    fn normalize_new_directory_states(node: &mut TreeNode) {
+        for child in node.children.values_mut() {
+            normalize_new_directory_states(child);
+        }
+        if node.explicit_added_dir {
+            let all_children_added = node
+                .children
+                .values()
+                .all(|child| child.state.as_deref() == Some("added"));
+            node.state = Some(
+                if all_children_added {
+                    "added"
+                } else {
+                    "modified"
+                }
+                .to_string(),
+            );
+        }
+    }
+
+    normalize_new_directory_states(&mut root);
     root
 }
 
@@ -939,5 +966,56 @@ pub(super) fn format_hidden_top_summary(
         Some(parts.join(" "))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(kind: ChangeKind, rel: &str) -> ChangeItem {
+        ChangeItem {
+            kind,
+            rel: rel.to_string(),
+        }
+    }
+
+    #[test]
+    fn new_directory_with_new_children_stays_added() {
+        let tree = build_change_tree(&[
+            change(ChangeKind::NewDir, "lancedb/"),
+            change(ChangeKind::NewDir, "lancedb/collection.lance/"),
+            change(ChangeKind::NewFile, "lancedb/collection.lance/data"),
+        ]);
+
+        assert_eq!(
+            tree.children
+                .get("lancedb")
+                .and_then(|node| node.state.as_deref()),
+            Some("added")
+        );
+        assert_eq!(
+            tree.children
+                .get("lancedb")
+                .and_then(|node| node.children.get("collection.lance"))
+                .and_then(|node| node.state.as_deref()),
+            Some("added")
+        );
+    }
+
+    #[test]
+    fn new_directory_with_a_collision_stays_modified() {
+        let tree = build_change_tree(&[
+            change(ChangeKind::NewDir, "lancedb/"),
+            change(ChangeKind::NewFile, "lancedb/new"),
+            change(ChangeKind::ModFile, "lancedb/existing"),
+        ]);
+
+        assert_eq!(
+            tree.children
+                .get("lancedb")
+                .and_then(|node| node.state.as_deref()),
+            Some("modified")
+        );
     }
 }

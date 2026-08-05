@@ -1066,11 +1066,10 @@ pub(super) fn print_transfer_progress_bars(
         )
     };
 
-    let object_progress = eta_workload.zip(eta_progress).map(|(workload, progress)| {
+    let file_progress = eta_workload.zip(eta_progress).map(|(workload, progress)| {
         let total_files: u64 = workload.file_bins.iter().copied().sum();
         let completed_files = progress.file_count().min(total_files);
-        let completed_dirs = progress.dirs.min(workload.dirs);
-        (completed_files, total_files, completed_dirs, workload.dirs)
+        (completed_files, total_files)
     });
 
     let transfer_progress_line = |bar_width: usize| {
@@ -1083,14 +1082,9 @@ pub(super) fn print_transfer_progress_bars(
     };
     let progress_line_width = |bar_width: usize| {
         let mut width = transfer_progress_line(bar_width).chars().count();
-        if let Some((completed_files, total_files, completed_dirs, total_dirs)) = object_progress {
+        if let Some((completed_files, total_files)) = file_progress {
             width = width.max(
                 format_object_progress_line("Files", completed_files, total_files, bar_width)
-                    .chars()
-                    .count(),
-            );
-            width = width.max(
-                format_object_progress_line("Dirs", completed_dirs, total_dirs, bar_width)
                     .chars()
                     .count(),
             );
@@ -1105,21 +1099,13 @@ pub(super) fn print_transfer_progress_bars(
     }
 
     let mut lines = vec![clamp(transfer_progress_line(bar_width))];
-    if let Some((completed_files, total_files, completed_dirs, total_dirs)) = object_progress {
-        lines.extend([
-            clamp(format_object_progress_line(
-                "Files",
-                completed_files,
-                total_files,
-                bar_width,
-            )),
-            clamp(format_object_progress_line(
-                "Dirs",
-                completed_dirs,
-                total_dirs,
-                bar_width,
-            )),
-        ]);
+    if let Some((completed_files, total_files)) = file_progress {
+        lines.push(clamp(format_object_progress_line(
+            "Files",
+            completed_files,
+            total_files,
+            bar_width,
+        )));
     }
     lines.push(String::new());
     lines.extend([
@@ -1370,21 +1356,10 @@ mod tests {
     #[test]
     fn object_progress_lines_use_the_shared_bar_format() {
         let line = format_object_progress_line("Files", 3_466, 10_000, 34);
-        let dirs = format_object_progress_line("Dirs", 123, 456, 34);
 
         assert!(line.starts_with("Files     34.66% ["));
         assert!(line.ends_with(" 3,466 / 10,000"));
         assert_eq!(line.matches('=').count() + line.matches('>').count(), 12);
-        assert_eq!(line.find('%'), dirs.find('%'));
-        assert_eq!(line.find('['), dirs.find('['));
-    }
-
-    #[test]
-    fn empty_object_workload_is_rendered_as_complete() {
-        let line = format_object_progress_line("Dirs", 0, 0, 34);
-
-        assert!(line.starts_with("Dirs     100.00% ["));
-        assert!(line.ends_with(" 0 / 0"));
     }
 
     #[test]
