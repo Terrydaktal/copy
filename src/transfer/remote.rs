@@ -1,8 +1,22 @@
 //! Remote endpoint dispatch and remote-transfer user interaction.
+#![allow(clippy::too_many_arguments)]
 
-use super::*;
+use super::cleanup::cleanup_source_dirs;
+use super::orchestrator::flush_destination_writes;
+use super::rsync::run_rsync_transfer;
+use crate::domain::{Endpoint, LogLevel, RemoteSpec, SrcObjKind, TransferMode};
+use crate::output::{
+    fmt_mode_word, log, log_transfer_complete, print_summary_rate_line, ENDC, FAIL, WARNING, WHITE,
+};
+use crate::plan::{
+    endpoint_to_rsync, enrich_remote_spec, resolve_destination_for_dir,
+    resolve_destination_for_file, resolve_source, to_real_path,
+};
+use std::io::{self, Write};
+use std::path::Path;
+use std::time::Instant;
 
-pub(super) fn run_remote_transfer_mode(
+pub(crate) fn run_remote_transfer_mode(
     requested_mode: TransferMode,
     source_input: &str,
     source: &str,
@@ -26,6 +40,14 @@ pub(super) fn run_remote_transfer_mode(
     }
 
     let is_move = requested_mode == TransferMode::Move;
+    if is_move && (source_remote.is_some() || destination_remote.is_some()) {
+        log(
+            requested_mode,
+            "Move with a remote endpoint is disabled because remote durability and source cleanup cannot be verified safely; use copy, verify it, then remove the source explicitly.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
     let mut local_src_kind: Option<SrcObjKind> = None;
     let source_ep = match source_remote {
         Some(r) => Endpoint::Remote(enrich_remote_spec(r)),
@@ -78,9 +100,10 @@ pub(super) fn run_remote_transfer_mode(
     if overwrite {
         log(
             requested_mode,
-            "--overwrite is not supported for remote endpoints; using rsync merge semantics.",
-            LogLevel::Warn,
+            "--overwrite is not supported for remote endpoints; refusing to run with different semantics.",
+            LogLevel::Error,
         );
+        return 1;
     }
     if sync_mode {
         log(
@@ -92,9 +115,10 @@ pub(super) fn run_remote_transfer_mode(
     if backup_requested {
         log(
             requested_mode,
-            "--backup is not supported for remote endpoints; continuing without backup.",
-            LogLevel::Warn,
+            "--backup is not supported for remote endpoints; refusing to run without the requested backup.",
+            LogLevel::Error,
         );
+        return 1;
     }
 
     let contents_active =
@@ -132,15 +156,26 @@ pub(super) fn run_remote_transfer_mode(
     print!("Proceed with {}? [Y/n]: ", requested_mode.word());
     let _ = io::stdout().flush();
     let mut ans = String::new();
-    let _ = io::stdin().read_line(&mut ans);
+    if let Err(err) = io::stdin().read_line(&mut ans) {
+        log(
+            requested_mode,
+            &format!("Could not read confirmation: {err}; refusing to continue."),
+            LogLevel::Error,
+        );
+        return 1;
+    }
+    if ans.is_empty() {
+        log(
+            requested_mode,
+            "Confirmation input ended before approval; refusing to continue.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
     let ans = ans.trim().to_ascii_lowercase();
     if !ans.is_empty() && ans != "y" && ans != "yes" {
         println!("{FAIL}Cancelled.{ENDC}");
         return 0;
-    }
-
-    if use_sudo {
-        let _ = Command::new("sudo").arg("-v").status();
     }
 
     log(
@@ -155,27 +190,38 @@ pub(super) fn run_remote_transfer_mode(
     );
     let start_ts = Instant::now();
     let transfer = run_rsync_transfer(
-        &src_path, &dst_path, 0, use_sudo, is_move, sync_mode, !sync_mode,
+        &src_path, &dst_path, 0, use_sudo, false, sync_mode, !sync_mode,
     );
 
-    if is_move && (transfer.rc == 0 || transfer.rc == 24) && matches!(source_ep, Endpoint::Local(_))
-    {
-        if let (Endpoint::Local(src_local), Some(SrcObjKind::Dir)) = (&source_ep, local_src_kind) {
-            cleanup_source_dirs(src_local, !contents_active, use_sudo, requested_mode);
-        }
-    }
-
     let result = if transfer.rc == 0 {
+        let mut flush_ok = true;
         if let Endpoint::Local(dst_local) = &destination_ep {
-            let _ = flush_destination_writes(
+            flush_ok = flush_destination_writes(
                 dst_local,
                 use_sudo,
                 requested_mode,
                 transfer.progress_snapshot,
-            );
+            )
+            .ok;
         }
-        log_transfer_complete(requested_mode);
-        0
+        if !flush_ok {
+            log(
+                requested_mode,
+                "Transfer completed but destination flush failed; refusing remote source cleanup.",
+                LogLevel::Error,
+            );
+            1
+        } else {
+            if is_move && matches!(source_ep, Endpoint::Local(_)) {
+                if let (Endpoint::Local(src_local), Some(SrcObjKind::Dir)) =
+                    (&source_ep, local_src_kind)
+                {
+                    cleanup_source_dirs(src_local, !contents_active, use_sudo, requested_mode);
+                }
+            }
+            log_transfer_complete(requested_mode);
+            0
+        }
     } else if transfer.rc == 24 {
         log(
             requested_mode,

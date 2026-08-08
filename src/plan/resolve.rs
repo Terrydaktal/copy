@@ -1,15 +1,22 @@
 //! Path, endpoint, mount, and destination-shape resolution.
 
-use super::*;
+use crate::domain::{DstObjKind, Endpoint, LogLevel, RemoteSpec, SrcObjKind, TransferMode};
+use crate::output::log;
+use nix::sys::statvfs::statvfs;
+use std::env;
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
-pub(super) fn existing_probe_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn existing_probe_path(path: &Path) -> Option<PathBuf> {
     let mut probe = if path.as_os_str().is_empty() {
         PathBuf::from(".")
     } else {
         path.to_path_buf()
     };
     loop {
-        if probe.exists() {
+        if fs::symlink_metadata(&probe).is_ok() {
             return Some(probe);
         }
         if !probe.pop() {
@@ -18,26 +25,22 @@ pub(super) fn existing_probe_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-pub(super) fn destination_available_bytes(path: &Path) -> io::Result<(u64, PathBuf)> {
+pub(crate) fn destination_available_bytes(path: &Path) -> io::Result<(u64, PathBuf)> {
     let probe = existing_probe_path(path).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "No existing destination ancestor path found",
         )
     })?;
-    let stats = statvfs(&probe).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("statvfs failed for {}: {e}", probe.display()),
-        )
-    })?;
+    let stats = statvfs(&probe)
+        .map_err(|e| io::Error::other(format!("statvfs failed for {}: {e}", probe.display())))?;
     let avail = stats
         .blocks_available()
         .saturating_mul(stats.fragment_size() as u64);
     Ok((avail, probe))
 }
 
-pub(super) fn can_fast_rename_same_fs(source: &Path, target: &Path) -> bool {
+pub(crate) fn can_fast_rename_same_fs(source: &Path, target: &Path) -> bool {
     source
         .parent()
         .and_then(|p| fs::metadata(p).ok())
@@ -52,7 +55,7 @@ pub(super) fn can_fast_rename_same_fs(source: &Path, target: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub(super) fn expand_user(value: &str) -> String {
+pub(crate) fn expand_user(value: &str) -> String {
     if let Some(rest) = value.strip_prefix("~/") {
         if let Ok(home) = env::var("HOME") {
             return format!("{home}/{rest}");
@@ -66,7 +69,7 @@ pub(super) fn expand_user(value: &str) -> String {
     value.to_string()
 }
 
-pub(super) fn realpath_allow_missing(input: &Path) -> PathBuf {
+pub(crate) fn realpath_allow_missing(input: &Path) -> PathBuf {
     let abs = if input.is_absolute() {
         input.to_path_buf()
     } else {
@@ -75,13 +78,24 @@ pub(super) fn realpath_allow_missing(input: &Path) -> PathBuf {
             .join(input)
     };
 
-    if abs.exists() {
+    // Resolve ancestors, but preserve the final symlink as an object to copy
+    // rather than silently turning `copy link destination` into `copy target`.
+    if let Ok(meta) = fs::symlink_metadata(&abs) {
+        if meta.file_type().is_symlink() {
+            let name = abs.file_name().map(PathBuf::from);
+            let parent = abs.parent().unwrap_or_else(|| Path::new("."));
+            let mut resolved = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            if let Some(name) = name {
+                resolved.push(name);
+            }
+            return resolved;
+        }
         return fs::canonicalize(&abs).unwrap_or(abs);
     }
 
     let mut tail: Vec<PathBuf> = Vec::new();
     let mut cur = abs.clone();
-    while !cur.exists() {
+    while fs::symlink_metadata(&cur).is_err() {
         if let Some(name) = cur.file_name() {
             tail.push(PathBuf::from(name));
         }
@@ -92,7 +106,7 @@ pub(super) fn realpath_allow_missing(input: &Path) -> PathBuf {
         }
     }
 
-    let mut resolved = if cur.exists() {
+    let mut resolved = if fs::symlink_metadata(&cur).is_ok() {
         fs::canonicalize(&cur).unwrap_or(cur)
     } else {
         cur
@@ -103,12 +117,12 @@ pub(super) fn realpath_allow_missing(input: &Path) -> PathBuf {
     resolved
 }
 
-pub(super) fn to_real_path(value: &str) -> PathBuf {
+pub(crate) fn to_real_path(value: &str) -> PathBuf {
     let expanded = expand_user(value);
     realpath_allow_missing(Path::new(&expanded))
 }
 
-pub(super) fn parse_remote_spec(value: &str) -> Option<RemoteSpec> {
+pub(crate) fn parse_remote_spec(value: &str) -> Option<RemoteSpec> {
     if value.contains("://") {
         return None;
     }
@@ -139,7 +153,7 @@ pub(super) fn parse_remote_spec(value: &str) -> Option<RemoteSpec> {
     })
 }
 
-pub(super) fn wildcard_match(pat: &str, text: &str) -> bool {
+pub(crate) fn wildcard_match(pat: &str, text: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let mut pi = 0usize;
@@ -169,7 +183,7 @@ pub(super) fn wildcard_match(pat: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-pub(super) fn ssh_config_user_for_host_from_text(host: &str, txt: &str) -> Option<String> {
+pub(crate) fn ssh_config_user_for_host_from_text(host: &str, txt: &str) -> Option<String> {
     let mut in_match = true;
     let mut found: Option<String> = None;
 
@@ -215,21 +229,21 @@ pub(super) fn ssh_config_user_for_host_from_text(host: &str, txt: &str) -> Optio
     found
 }
 
-pub(super) fn ssh_config_user_for_host(host: &str) -> Option<String> {
+pub(crate) fn ssh_config_user_for_host(host: &str) -> Option<String> {
     let home = env::var("HOME").ok()?;
     let cfg_path = Path::new(&home).join(".ssh/config");
     let txt = fs::read_to_string(cfg_path).ok()?;
     ssh_config_user_for_host_from_text(host, &txt)
 }
 
-pub(super) fn enrich_remote_spec(mut r: RemoteSpec) -> RemoteSpec {
+pub(crate) fn enrich_remote_spec(mut r: RemoteSpec) -> RemoteSpec {
     if r.user.is_none() {
         r.user = ssh_config_user_for_host(&r.host);
     }
     r
 }
 
-pub(super) fn endpoint_to_rsync(
+pub(crate) fn endpoint_to_rsync(
     endpoint: &Endpoint,
     as_source: bool,
     contents_mode: bool,
@@ -264,34 +278,40 @@ pub(super) fn endpoint_to_rsync(
     }
 }
 
-pub(super) fn resolve_source(
+pub(crate) fn resolve_source(
     value: &str,
     mode: TransferMode,
 ) -> Result<(PathBuf, SrcObjKind), i32> {
     let p = to_real_path(value);
-    if !p.exists() {
+    let metadata = match fs::symlink_metadata(&p) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            log(
+                mode,
+                &format!("Source path does not exist: {value}"),
+                LogLevel::Error,
+            );
+            return Err(1);
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok((p, SrcObjKind::File));
+    }
+    if !metadata.is_dir() && !metadata.is_file() {
         log(
             mode,
-            &format!("Source path does not exist: {value}"),
+            &format!("Source path must be a file or directory: {value}"),
             LogLevel::Error,
         );
         return Err(1);
     }
-    if p.is_dir() {
+    if metadata.is_dir() {
         return Ok((p, SrcObjKind::Dir));
     }
-    if p.is_file() {
-        return Ok((p, SrcObjKind::File));
-    }
-    log(
-        mode,
-        &format!("Source path must be a file or directory: {value}"),
-        LogLevel::Error,
-    );
-    Err(1)
+    Ok((p, SrcObjKind::File))
 }
 
-pub(super) fn resolve_destination_for_file(
+pub(crate) fn resolve_destination_for_file(
     value: &str,
     mode: TransferMode,
     replace_dest_symlink: bool,
@@ -322,8 +342,11 @@ pub(super) fn resolve_destination_for_file(
         return Ok((dst_real, DstObjKind::File));
     }
     let dst_real = to_real_path(value);
-    if dst_real.exists() {
-        if dst_real.is_dir() {
+    if fs::symlink_metadata(&dst_real).is_ok() {
+        if fs::metadata(&dst_real)
+            .map(|md| md.is_dir())
+            .unwrap_or(false)
+        {
             return Ok((dst_real, DstObjKind::Dir));
         }
         return Ok((dst_real, DstObjKind::File));
@@ -343,7 +366,7 @@ pub(super) fn resolve_destination_for_file(
     Ok((dst_real, DstObjKind::File))
 }
 
-pub(super) fn create_destination_parents(value: &str, mode: TransferMode) -> Result<(), i32> {
+pub(crate) fn create_destination_parents(value: &str, mode: TransferMode) -> Result<(), i32> {
     let destination = to_real_path(value);
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     if parent.is_dir() {
@@ -363,14 +386,14 @@ pub(super) fn create_destination_parents(value: &str, mode: TransferMode) -> Res
     })
 }
 
-pub(super) fn resolve_destination_for_dir(
+pub(crate) fn resolve_destination_for_dir(
     value: &str,
     mode: TransferMode,
     allow_existing_file: bool,
 ) -> Result<(PathBuf, DstObjKind), i32> {
     let p = to_real_path(value);
-    if p.exists() {
-        if !p.is_dir() {
+    if fs::symlink_metadata(&p).is_ok() {
+        if !fs::metadata(&p).map(|md| md.is_dir()).unwrap_or(false) {
             if allow_existing_file {
                 return Ok((p, DstObjKind::FileExistingForDir));
             }
@@ -396,4 +419,67 @@ pub(super) fn resolve_destination_for_dir(
         return Err(1);
     }
     Ok((p, DstObjKind::DirNew))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parse_remote_spec_accepts_user_host_path() {
+        let spec = parse_remote_spec("alice@nas:/data/photos").expect("remote spec");
+        assert_eq!(spec.user.as_deref(), Some("alice"));
+        assert_eq!(spec.host, "nas");
+        assert_eq!(spec.path, "/data/photos");
+    }
+
+    #[test]
+    fn parse_remote_spec_accepts_host_path_without_user() {
+        let spec = parse_remote_spec("backup:/srv/archive").expect("remote spec");
+        assert_eq!(spec.user, None);
+        assert_eq!(spec.host, "backup");
+        assert_eq!(spec.path, "/srv/archive");
+    }
+
+    #[test]
+    fn parse_remote_spec_rejects_local_path_with_colon() {
+        assert!(parse_remote_spec("/tmp/a:b").is_none());
+        assert!(parse_remote_spec("mtp://phone/path").is_none());
+    }
+    #[test]
+    fn ssh_config_parser_uses_first_matching_user() {
+        let cfg = r#"
+Host box
+  User first
+Host box
+  User second
+"#;
+        assert_eq!(
+            ssh_config_user_for_host_from_text("box", cfg).as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn ssh_config_parser_supports_wildcards_and_negation() {
+        let cfg = r#"
+Host * !blocked
+  User wildcard
+Host blocked
+  User denied
+Host dev-*
+  User devuser
+"#;
+        assert_eq!(
+            ssh_config_user_for_host_from_text("prod-1", cfg).as_deref(),
+            Some("wildcard")
+        );
+        assert_eq!(
+            ssh_config_user_for_host_from_text("dev-a", cfg).as_deref(),
+            Some("wildcard")
+        );
+        assert_eq!(
+            ssh_config_user_for_host_from_text("blocked", cfg).as_deref(),
+            Some("denied")
+        );
+    }
 }

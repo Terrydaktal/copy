@@ -1,8 +1,21 @@
 //! Process, device, mount, and scheduler telemetry collection.
 
-use super::*;
+use super::command::run_command_capture;
+use crate::domain::{
+    DeviceIoDeltas, DeviceIoWindow, LogLevel, ProcIoCounters, ProcIoDeltas, ProcessIoWindow,
+    TransferMode, TransferProgressRates,
+};
+use crate::output::log;
+use crate::plan::{existing_probe_path, realpath_allow_missing};
+use nix::sys::stat::{major, minor};
+use std::collections::{BTreeSet, HashSet};
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-pub(super) fn read_diskstats_bytes_for_keys(
+pub(crate) fn read_diskstats_bytes_for_keys(
     src_keys: &[(u64, u64)],
     dst_keys: &[(u64, u64)],
 ) -> io::Result<(Option<u64>, Option<u64>)> {
@@ -54,7 +67,7 @@ pub(super) fn read_diskstats_bytes_for_keys(
     ))
 }
 
-pub(super) fn unescape_mountinfo_field(raw: &str) -> String {
+pub(crate) fn unescape_mountinfo_field(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -78,7 +91,7 @@ pub(super) fn unescape_mountinfo_field(raw: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-pub(super) fn mount_source_device_for_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn mount_source_device_for_path(path: &Path) -> Option<PathBuf> {
     let probe = existing_probe_path(path)?;
     let probe_real = realpath_allow_missing(&probe);
     let raw = fs::read_to_string("/proc/self/mountinfo").ok()?;
@@ -110,7 +123,7 @@ pub(super) fn mount_source_device_for_path(path: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-pub(super) fn device_key_for_block_device(devnode: &Path) -> Option<(u64, u64)> {
+pub(crate) fn device_key_for_block_device(devnode: &Path) -> Option<(u64, u64)> {
     let md = fs::metadata(devnode).ok()?;
     let rdev = md.rdev();
     if rdev == 0 {
@@ -119,7 +132,7 @@ pub(super) fn device_key_for_block_device(devnode: &Path) -> Option<(u64, u64)> 
     Some((major(rdev), minor(rdev)))
 }
 
-pub(super) fn parse_major_minor(raw: &str) -> Option<(u64, u64)> {
+pub(crate) fn parse_major_minor(raw: &str) -> Option<(u64, u64)> {
     let mut parts = raw.trim().split(':');
     let maj = parts.next()?.trim().parse::<u64>().ok()?;
     let min = parts.next()?.trim().parse::<u64>().ok()?;
@@ -129,13 +142,13 @@ pub(super) fn parse_major_minor(raw: &str) -> Option<(u64, u64)> {
     Some((maj, min))
 }
 
-pub(super) fn device_key_for_sys_block_name(name: &str) -> Option<(u64, u64)> {
+pub(crate) fn device_key_for_sys_block_name(name: &str) -> Option<(u64, u64)> {
     let dev_path = Path::new("/sys/class/block").join(name).join("dev");
     let raw = fs::read_to_string(dev_path).ok()?;
     parse_major_minor(&raw)
 }
 
-pub(super) fn collect_leaf_keys_for_block_name(
+pub(crate) fn collect_leaf_keys_for_block_name(
     name: &str,
     visited: &mut HashSet<String>,
     out: &mut Vec<(u64, u64)>,
@@ -164,7 +177,7 @@ pub(super) fn collect_leaf_keys_for_block_name(
     }
 }
 
-pub(super) fn leaf_device_keys_for_block_device(devnode: &Path) -> Vec<(u64, u64)> {
+pub(crate) fn leaf_device_keys_for_block_device(devnode: &Path) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
 
@@ -184,7 +197,7 @@ pub(super) fn leaf_device_keys_for_block_device(devnode: &Path) -> Vec<(u64, u64
     out
 }
 
-pub(super) fn local_path_from_transfer_arg(arg: &str) -> Option<PathBuf> {
+pub(crate) fn local_path_from_transfer_arg(arg: &str) -> Option<PathBuf> {
     let trimmed = arg.trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
@@ -195,7 +208,7 @@ pub(super) fn local_path_from_transfer_arg(arg: &str) -> Option<PathBuf> {
     None
 }
 
-pub(super) fn device_keys_for_path(path: &Path) -> Vec<(u64, u64)> {
+pub(crate) fn device_keys_for_path(path: &Path) -> Vec<(u64, u64)> {
     if let Some(devnode) = mount_source_device_for_path(path) {
         let keys = leaf_device_keys_for_block_device(&devnode);
         if !keys.is_empty() {
@@ -212,13 +225,13 @@ pub(super) fn device_keys_for_path(path: &Path) -> Vec<(u64, u64)> {
     vec![(major(dev), minor(dev))]
 }
 
-pub(super) fn block_name_for_dev_key(key: (u64, u64)) -> Option<String> {
+pub(crate) fn block_name_for_dev_key(key: (u64, u64)) -> Option<String> {
     let link = PathBuf::from(format!("/sys/dev/block/{}:{}", key.0, key.1));
     let canon = fs::canonicalize(link).ok()?;
     canon.file_name().map(|s| s.to_string_lossy().to_string())
 }
 
-pub(super) fn block_leaf_names_for_path(path: &Path) -> Vec<String> {
+pub(crate) fn block_leaf_names_for_path(path: &Path) -> Vec<String> {
     let mut out: Vec<String> = device_keys_for_path(path)
         .into_iter()
         .filter_map(block_name_for_dev_key)
@@ -228,7 +241,7 @@ pub(super) fn block_leaf_names_for_path(path: &Path) -> Vec<String> {
     out
 }
 
-pub(super) fn block_is_rotational(name: &str) -> Option<bool> {
+pub(crate) fn block_is_rotational(name: &str) -> Option<bool> {
     let p = Path::new("/sys/class/block")
         .join(name)
         .join("queue/rotational");
@@ -240,7 +253,7 @@ pub(super) fn block_is_rotational(name: &str) -> Option<bool> {
     }
 }
 
-pub(super) fn parse_scheduler_info(raw: &str) -> (Option<String>, HashSet<String>) {
+pub(crate) fn parse_scheduler_info(raw: &str) -> (Option<String>, HashSet<String>) {
     let mut active: Option<String> = None;
     let mut available: HashSet<String> = HashSet::new();
     for tok in raw.split_whitespace() {
@@ -257,11 +270,11 @@ pub(super) fn parse_scheduler_info(raw: &str) -> (Option<String>, HashSet<String
     (active, available)
 }
 
-pub(super) fn shell_single_quote(value: &str) -> String {
+pub(crate) fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub(super) fn set_block_scheduler(name: &str, scheduler: &str, use_sudo: bool) -> bool {
+pub(crate) fn set_block_scheduler(name: &str, scheduler: &str, use_sudo: bool) -> bool {
     let p = Path::new("/sys/class/block")
         .join(name)
         .join("queue/scheduler");
@@ -282,7 +295,13 @@ pub(super) fn set_block_scheduler(name: &str, scheduler: &str, use_sudo: bool) -
         .unwrap_or(false)
 }
 
-pub(super) fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mode: TransferMode) {
+pub(crate) fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mode: TransferMode) {
+    // Queue scheduler selection is a system-wide mutation and cannot be
+    // safely restored if the process is killed. Make it an explicit opt-in
+    // instead of changing unrelated workloads for every transfer.
+    if std::env::var_os("COPY_RS_SET_HDD_SCHEDULER").is_none() {
+        return;
+    }
     let mut block_names: BTreeSet<String> = BTreeSet::new();
     for p in paths {
         for name in block_leaf_names_for_path(p) {
@@ -346,7 +365,7 @@ pub(super) fn prefer_hdd_scheduler_for_paths(paths: &[&Path], use_sudo: bool, mo
     }
 }
 
-pub(super) fn read_proc_io_counters(pid: u32) -> Option<ProcIoCounters> {
+pub(crate) fn read_proc_io_counters(pid: u32) -> Option<ProcIoCounters> {
     let path = format!("/proc/{pid}/io");
     let text = fs::read_to_string(path).ok()?;
     let mut counters = ProcIoCounters::default();
@@ -386,14 +405,14 @@ pub(super) fn read_proc_io_counters(pid: u32) -> Option<ProcIoCounters> {
 }
 
 impl ProcessIoWindow {
-    pub(super) fn from_pid(pid: u32) -> Self {
+    pub(crate) fn from_pid(pid: u32) -> Self {
         Self {
             pid,
             ..Self::default()
         }
     }
 
-    pub(super) fn sample(&mut self) -> TransferProgressRates {
+    pub(crate) fn sample(&mut self) -> TransferProgressRates {
         let mut rates = TransferProgressRates::default();
         let now = Instant::now();
         let now_counters = read_proc_io_counters(self.pid);
@@ -415,13 +434,13 @@ impl ProcessIoWindow {
         rates
     }
 
-    pub(super) fn current_totals(&self) -> Option<ProcIoCounters> {
+    pub(crate) fn current_totals(&self) -> Option<ProcIoCounters> {
         read_proc_io_counters(self.pid)
     }
 }
 
 impl DeviceIoWindow {
-    pub(super) fn from_transfer_paths(src_path: &str, dst_path: &str) -> Self {
+    pub(crate) fn from_transfer_paths(src_path: &str, dst_path: &str) -> Self {
         let src_keys = local_path_from_transfer_arg(src_path)
             .as_deref()
             .map(device_keys_for_path)
@@ -433,19 +452,19 @@ impl DeviceIoWindow {
         Self { src_keys, dst_keys }
     }
 
-    pub(super) fn current_totals(&self) -> (Option<u64>, Option<u64>) {
+    pub(crate) fn current_totals(&self) -> (Option<u64>, Option<u64>) {
         read_diskstats_bytes_for_keys(&self.src_keys, &self.dst_keys).unwrap_or((None, None))
     }
 }
 
-pub(super) fn counter_delta(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+pub(crate) fn counter_delta(start: Option<u64>, end: Option<u64>) -> Option<u64> {
     match (start, end) {
         (Some(a), Some(b)) => Some(b.saturating_sub(a)),
         _ => None,
     }
 }
 
-pub(super) fn proc_io_deltas(
+pub(crate) fn proc_io_deltas(
     start: Option<ProcIoCounters>,
     end: Option<ProcIoCounters>,
 ) -> ProcIoDeltas {
@@ -460,7 +479,7 @@ pub(super) fn proc_io_deltas(
     }
 }
 
-pub(super) fn device_io_deltas(
+pub(crate) fn device_io_deltas(
     start: (Option<u64>, Option<u64>),
     end: (Option<u64>, Option<u64>),
 ) -> DeviceIoDeltas {

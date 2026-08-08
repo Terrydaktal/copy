@@ -1,156 +1,66 @@
-//! Application entry flow: validation, planning, execution, and summaries.
+//! Local transfer workflow: destination resolution, preview, planning, and execution.
 
-use super::*;
+use crate::cli::CliArgs;
+use crate::domain::{
+    ChangeItem, ChangeKind, DeleteCleanupOutcome, DstObjKind, LogLevel, PreScan, SrcObjKind,
+    TransferBackend, TransferMode,
+};
+use crate::output::{
+    build_change_tree, collect_source_top_entries, fmt_mode_word, format_bytes_binary,
+    format_number, log, log_transfer_complete, print_changed_top_preview_with_cache,
+    print_copy_duration_summary, print_counts_table, print_preview_counts_table,
+    print_preview_root_line, remap_item_under_prefix, remap_path_set_under_prefix,
+    render_showall_tree_to_string_with_cache, ENDC, FAIL,
+};
+use crate::plan::{
+    can_fast_rename_same_fs, count_tree_any, create_destination_parents,
+    destination_available_bytes, normalize_rel, pre_scan_directory, pre_scan_file,
+    realpath_allow_missing, resolve_destination_for_dir, resolve_destination_for_file,
+    resolve_source, top_level_rel_component,
+};
+use crate::runtime::{configure_rayon_threads_for_media, dev_media_kind, transfer_media_kind};
+use crate::transfer::{
+    backup_base_path, backup_path_with_base, copy_path_to_backup, flush_destination_writes,
+    plan_backup_path, prefer_hdd_scheduler_for_paths, premerge_fast_rename_noncolliding_children,
+    remove_path_recursive, run_command_capture, run_move_cleanup_phase, run_rsync_transfer,
+    run_rust_transfer, run_sync_cleanup_phase,
+};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use tempfile::TempDir;
 
-pub(crate) fn run() -> i32 {
-    let args = match parse_args() {
-        Ok(a) => a,
-        Err(code) => return code,
-    };
+pub(crate) struct LocalTransferRequest<'a> {
+    pub(crate) args: &'a CliArgs,
+    pub(crate) source_input: &'a str,
+    pub(crate) source: &'a str,
+    pub(crate) destination: &'a str,
+    pub(crate) requested_mode: TransferMode,
+    pub(crate) preview_only: bool,
+    pub(crate) contents_mode_requested: bool,
+    pub(crate) force: bool,
+    pub(crate) source_glob_contents: bool,
+}
 
-    let requested_mode = if args.move_mode {
-        TransferMode::Move
-    } else {
-        TransferMode::Copy
-    };
+pub(crate) fn run_local_transfer(request: LocalTransferRequest<'_>) -> i32 {
+    let LocalTransferRequest {
+        args,
+        source_input,
+        source,
+        destination,
+        requested_mode,
+        preview_only,
+        contents_mode_requested,
+        force,
+        source_glob_contents,
+    } = request;
     let is_move = requested_mode == TransferMode::Move;
-
-    let batch_sources: Vec<String> = std::iter::once(args.source.clone())
-        .chain(args.extra.iter().cloned())
-        .collect();
-
-    let source_input = args.source.clone();
-    let mut source = source_input.clone();
-    let destination = args.destination.clone();
     let use_sudo = args.sudo;
-    let preview_lite = args.preview_lite;
-    let preview_only = args.preview_only || preview_lite;
     let backup_requested = args.backup;
     let overwrite = args.overwrite;
-    let force_requested = args.contents_only;
-    let mut source_glob_contents = false;
-
-    if source.ends_with("/*") {
-        source.pop();
-        source_glob_contents = true;
-    }
-
-    let force = force_requested || source_glob_contents;
-    let contents_mode_requested = force_requested || source_glob_contents;
-    let source_remote = parse_remote_spec(&source);
-    let destination_remote = parse_remote_spec(&destination).map(enrich_remote_spec);
-
-    if args.create_destination_parents && (source_remote.is_some() || destination_remote.is_some())
-    {
-        log(
-            requested_mode,
-            "--create-destination-parents is currently supported for local transfers only.",
-            LogLevel::Error,
-        );
-        return 1;
-    }
-
-    if (args.replace_dest_symlink || args.merge_collision_policy != MergeCollisionPolicy::default())
-        && (use_sudo || source_remote.is_some() || destination_remote.is_some())
-    {
-        log(
-            requested_mode,
-            "Collision and symlink replacement flags are only supported with the local Rust backend.",
-            LogLevel::Error,
-        );
-        return 1;
-    }
-
-    if args.sync_mode && args.overwrite {
-        log(
-            requested_mode,
-            "--sync cannot be combined with --overwrite. Use one mode.",
-            LogLevel::Error,
-        );
-        return 1;
-    }
-    if args.sync_mode && is_move {
-        log(
-            requested_mode,
-            "--sync currently supports copy mode only (no --move).",
-            LogLevel::Error,
-        );
-        return 1;
-    }
-    if args.sync_mode
-        && (args.replace_dest_symlink
-            || args.merge_collision_policy != MergeCollisionPolicy::default())
-    {
-        log(
-            requested_mode,
-            "--sync cannot be combined with collision/symlink replacement flags.",
-            LogLevel::Error,
-        );
-        return 1;
-    }
-
-    if !args.extra.is_empty() {
-        if source_remote.is_some() || destination_remote.is_some() {
-            log(
-                requested_mode,
-                "Multiple source paths are only supported for local filesystem transfers.",
-                LogLevel::Error,
-            );
-            return 1;
-        }
-        if args.contents_only {
-            log(
-                requested_mode,
-                "Multiple source paths do not support --contents-only.",
-                LogLevel::Error,
-            );
-            return 1;
-        }
-        if args.sync_mode {
-            log(
-                requested_mode,
-                "Multiple source paths do not support --sync.",
-                LogLevel::Error,
-            );
-            return 1;
-        }
-        if args.create_destination_parents {
-            if let Err(code) = create_destination_parents(&args.destination, requested_mode) {
-                return code;
-            }
-        }
-        return run_multi_source_file_batch(
-            requested_mode,
-            &batch_sources,
-            &args.destination,
-            args.sudo,
-            args.preview_only || args.preview_lite,
-            is_move,
-            args.tree_trunc,
-            args.showall,
-            args.replace_dest_symlink,
-            args.merge_collision_policy,
-        );
-    }
-
-    if source_remote.is_some() || destination_remote.is_some() {
-        return run_remote_transfer_mode(
-            requested_mode,
-            &source_input,
-            &source,
-            &destination,
-            source_remote.map(enrich_remote_spec),
-            destination_remote,
-            use_sudo,
-            contents_mode_requested,
-            overwrite,
-            backup_requested,
-            args.sync_mode,
-            preview_only,
-        );
-    }
-
-    let (src_mnt, src_obj_kind) = match resolve_source(&source, requested_mode) {
+    let (src_mnt, src_obj_kind) = match resolve_source(source, requested_mode) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -164,14 +74,14 @@ pub(crate) fn run() -> i32 {
     }
 
     if args.create_destination_parents {
-        if let Err(code) = create_destination_parents(&destination, requested_mode) {
+        if let Err(code) = create_destination_parents(destination, requested_mode) {
             return code;
         }
     }
 
     let (dst_mnt, dst_obj_kind) = match src_obj_kind {
         SrcObjKind::File => match resolve_destination_for_file(
-            &destination,
+            destination,
             requested_mode,
             args.replace_dest_symlink,
         ) {
@@ -179,7 +89,7 @@ pub(crate) fn run() -> i32 {
             Err(code) => return code,
         },
         SrcObjKind::Dir => {
-            match resolve_destination_for_dir(&destination, requested_mode, overwrite) {
+            match resolve_destination_for_dir(destination, requested_mode, overwrite) {
                 Ok(v) => v,
                 Err(code) => return code,
             }
@@ -215,7 +125,7 @@ pub(crate) fn run() -> i32 {
     let dest_tail_raw = destination
         .trim_end_matches('/')
         .split('/')
-        .last()
+        .next_back()
         .unwrap_or("");
     let destination_is_dir_ref = destination.ends_with('/')
         || dest_tail_raw.is_empty()
@@ -280,9 +190,7 @@ pub(crate) fn run() -> i32 {
     let mut overwrite_rename_dir_target = false;
     let mut overwrite_replace_file_target = false;
 
-    if overwrite_parent_from_child {
-        overwrite_rename_dir_target = true;
-    } else if overwrite && force && rename_style_existing_dir_target {
+    if overwrite_parent_from_child || (overwrite && force && rename_style_existing_dir_target) {
         overwrite_rename_dir_target = true;
     }
 
@@ -396,9 +304,7 @@ pub(crate) fn run() -> i32 {
             {
                 rename_dir_to_new_path = true;
                 format!("{}/", src_s.trim_end_matches('/'))
-            } else if effective_source_contents_mode {
-                format!("{}/", src_s.trim_end_matches('/'))
-            } else if force_merge_dir_target && !effective_source_contents_mode {
+            } else if effective_source_contents_mode || force_merge_dir_target {
                 format!("{}/", src_s.trim_end_matches('/'))
             } else if dst_obj_kind == DstObjKind::DirNew && !effective_source_contents_mode {
                 if !force {
@@ -529,10 +435,6 @@ pub(crate) fn run() -> i32 {
         .join(" ")
     );
     println!();
-
-    if use_sudo && !preview_only {
-        let _ = Command::new("sudo").arg("-v").status();
-    }
 
     let source_media = dev_media_kind(&src_mnt);
     let destination_media = dev_media_kind(&dst_mnt);
@@ -1051,6 +953,15 @@ pub(crate) fn run() -> i32 {
     }
     println!();
 
+    if !prescan.scan_complete {
+        log(
+            requested_mode,
+            "Transfer plan is incomplete because one or more paths could not be scanned; refusing to execute or delete anything.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
+
     if preview_only {
         return 0;
     }
@@ -1096,10 +1007,27 @@ pub(crate) fn run() -> i32 {
     print!("Proceed with {}? [Y/n]: ", requested_mode.word());
     let _ = io::stdout().flush();
     let mut ans = String::new();
-    let _ = io::stdin().read_line(&mut ans);
+    if let Err(err) = io::stdin().read_line(&mut ans) {
+        log(
+            requested_mode,
+            &format!("Could not read confirmation: {err}; refusing to continue."),
+            LogLevel::Error,
+        );
+        return 1;
+    }
+    if ans.is_empty() {
+        log(
+            requested_mode,
+            "Confirmation input ended before approval; refusing to continue.",
+            LogLevel::Error,
+        );
+        return 1;
+    }
     let ans = ans.trim().to_ascii_lowercase();
     if !ans.is_empty() && ans != "y" && ans != "yes" {
         println!("{FAIL}Cancelled.{ENDC}");
+        // An explicit negative answer is a successful, non-mutating
+        // cancellation. EOF and input errors above remain failures.
         return 0;
     }
 
@@ -1160,34 +1088,40 @@ pub(crate) fn run() -> i32 {
         })
         .unwrap_or(false);
 
-    if planned_bytes > 0 && !fast_rename_possible {
+    let backup_bytes = if backup_requested {
+        backup_source_path
+            .as_ref()
+            .and_then(|path| fs::symlink_metadata(path).ok())
+            .map(|meta| {
+                if meta.is_dir() {
+                    count_tree_any(
+                        backup_source_path.as_deref().unwrap_or(Path::new(".")),
+                        false,
+                    )
+                    .bytes
+                } else {
+                    meta.len()
+                }
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let required_space = planned_bytes.saturating_add(backup_bytes);
+    if required_space > 0 && !fast_rename_possible {
         match destination_available_bytes(&dst_mnt) {
             Ok((available_bytes, probe_path)) => {
-                if available_bytes < planned_bytes {
+                if available_bytes < required_space {
                     let msg = format!(
                         "Insufficient free space on destination filesystem (probe: {}). Need: {} ({}), available: {} ({}).",
                         probe_path.display(),
-                        format_number(planned_bytes),
-                        format_bytes_binary(planned_bytes, 2),
+                        format_number(required_space),
+                        format_bytes_binary(required_space, 2),
                         format_number(available_bytes),
                         format_bytes_binary(available_bytes, 2)
                     );
-                    if overwrite_target_path.is_some()
-                        && !backup_requested
-                        && !overwrite_parent_from_child
-                    {
-                        log(
-                            requested_mode,
-                            &format!(
-                                "{} Continuing because overwrite will remove destination data before transfer.",
-                                msg
-                            ),
-                            LogLevel::Warn,
-                        );
-                    } else {
-                        log(requested_mode, &msg, LogLevel::Error);
-                        return 1;
-                    }
+                    log(requested_mode, &msg, LogLevel::Error);
+                    return 1;
                 }
             }
             Err(err) => {
@@ -1201,27 +1135,29 @@ pub(crate) fn run() -> i32 {
     }
 
     if let Some(rename_target) = maybe_fast_rename_target {
-        if fast_rename_possible {
-            if fs::rename(&src_mnt, &rename_target).is_ok() {
-                let _ = flush_destination_writes(&rename_target, use_sudo, requested_mode, None);
+        if fast_rename_possible && fs::rename(&src_mnt, &rename_target).is_ok() {
+            let flush = flush_destination_writes(&rename_target, use_sudo, requested_mode, None);
+            if !flush.ok {
                 log(
-                    requested_mode,
-                    &format!(
-                        "Fast-path rename on same filesystem: {} -> {}",
-                        src_mnt.display(),
-                        rename_target.display()
-                    ),
-                    LogLevel::Info,
-                );
-                println!();
-                log_transfer_complete(requested_mode);
-                return 0;
+                        requested_mode,
+                        "Fast-path rename completed but destination flush failed; durability is unconfirmed.",
+                        LogLevel::Error,
+                    );
+                return 1;
             }
+            log(
+                requested_mode,
+                &format!(
+                    "Fast-path rename on same filesystem: {} -> {}",
+                    src_mnt.display(),
+                    rename_target.display()
+                ),
+                LogLevel::Info,
+            );
+            println!();
+            log_transfer_complete(requested_mode);
+            return 0;
         }
-    }
-
-    if use_sudo {
-        let _ = Command::new("sudo").arg("-v").status();
     }
 
     prefer_hdd_scheduler_for_paths(&[&src_mnt, &dst_mnt], use_sudo, requested_mode);
@@ -1352,7 +1288,7 @@ pub(crate) fn run() -> i32 {
                 transferred_elapsed_total_s += transfer.elapsed_s;
                 let rc_transfer = transfer.rc;
 
-                if rc_transfer == 0 || rc_transfer == 24 {
+                if rc_transfer == 0 {
                     if backup_requested {
                         println!();
                         log(
@@ -1425,6 +1361,14 @@ pub(crate) fn run() -> i32 {
                         if let Some(b) = flush_stats.flushed_bytes {
                             transfer_flush_bytes_total =
                                 transfer_flush_bytes_total.saturating_add(b);
+                        }
+                        if !flush_stats.ok {
+                            log(
+                                requested_mode,
+                                "Transfer completed but destination flush failed; refusing source cleanup.",
+                                LogLevel::Error,
+                            );
+                            return 1;
                         }
                         log_transfer_complete(requested_mode);
                         if is_move {
@@ -1676,6 +1620,37 @@ pub(crate) fn run() -> i32 {
             if let Some(b) = flush_stats.flushed_bytes {
                 transfer_flush_bytes_total = transfer_flush_bytes_total.saturating_add(b);
             }
+            if !flush_stats.ok {
+                log(
+                    requested_mode,
+                    "Transfer completed but destination flush failed; refusing source cleanup.",
+                    LogLevel::Error,
+                );
+                return 1;
+            }
+            if src_obj_kind == SrcObjKind::Dir {
+                if let Some(manifest) = transfer_manifest.as_ref() {
+                    let source_base = src_path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default();
+                    if let Err(err) = crate::transfer::preserve_directory_times_tree(
+                        Path::new(src_path.trim_end_matches('/')),
+                        Path::new(dst_path.trim_end_matches('/')),
+                        !src_path.ends_with('/'),
+                        source_base,
+                        Some(&manifest.dir_times),
+                    ) {
+                        log(
+                            requested_mode,
+                            &format!("Failed to restore directory timestamps: {err}"),
+                            LogLevel::Error,
+                        );
+                        return 1;
+                    }
+                }
+            }
             log_transfer_complete(requested_mode);
             if is_move {
                 let cleanup = run_move_cleanup_phase(
@@ -1703,6 +1678,9 @@ pub(crate) fn run() -> i32 {
                 cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
                 if let Some(b) = cleanup.flush.flushed_bytes {
                     cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
+                }
+                if !cleanup.success {
+                    return 1;
                 }
             }
             if args.sync_mode && matches!(backend, TransferBackend::Rust) {
@@ -1733,34 +1711,6 @@ pub(crate) fn run() -> i32 {
             return 0;
         }
         if rc_transfer == 24 {
-            if is_move {
-                let cleanup = run_move_cleanup_phase(
-                    &src_path,
-                    &dst_path,
-                    &src_mnt,
-                    src_obj_kind,
-                    effective_contents_mode_requested,
-                    effective_source_contents_mode,
-                    descendant_target_exclude_rel.as_deref(),
-                    rename_dir_to_new_path,
-                    use_sudo,
-                    requested_mode,
-                    transfer_manifest.as_ref(),
-                    likely_cleanup_files,
-                    likely_cleanup_bytes,
-                );
-                deleted_cleanup_total.files = deleted_cleanup_total
-                    .files
-                    .saturating_add(cleanup.deleted.files);
-                deleted_cleanup_total.bytes = deleted_cleanup_total
-                    .bytes
-                    .saturating_add(cleanup.deleted.bytes);
-                cleanup_elapsed_total_s += cleanup.cleanup_elapsed_s;
-                cleanup_flush_elapsed_s += cleanup.flush.elapsed_s;
-                if let Some(b) = cleanup.flush.flushed_bytes {
-                    cleanup_flush_bytes_total = cleanup_flush_bytes_total.saturating_add(b);
-                }
-            }
             log(
                 requested_mode,
                 &format!(
@@ -1834,622 +1784,4 @@ pub(crate) fn run() -> i32 {
         total_elapsed_s,
     );
     result
-}
-
-pub(super) fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    for (i, ch) in chars.iter().enumerate() {
-        out.push(*ch);
-        let rem = chars.len() - i - 1;
-        if rem > 0 && rem % 3 == 0 {
-            out.push(',');
-        }
-    }
-    out
-}
-
-pub(super) fn count_col_width(label: &str, values: &[u64]) -> usize {
-    let value_width = values
-        .iter()
-        .map(|v| format_number(*v).len())
-        .max()
-        .unwrap_or(1);
-    value_width.max(label.len())
-}
-
-pub(super) fn print_counts_table(
-    file_row: Option<(u64, u64, u64, u64, u64, u64)>,
-    dir_row: Option<(u64, u64, u64, u64, u64, u64)>,
-) {
-    let mut new_vals = Vec::new();
-    let mut mod_vals = Vec::new();
-    let mut ident_vals = Vec::new();
-    let mut uncol_vals = Vec::new();
-    let mut del_src_vals = Vec::new();
-    let mut del_dst_vals = Vec::new();
-
-    for row in [file_row, dir_row].into_iter().flatten() {
-        new_vals.push(row.0);
-        mod_vals.push(row.1);
-        ident_vals.push(row.2);
-        uncol_vals.push(row.3);
-        del_src_vals.push(row.4);
-        del_dst_vals.push(row.5);
-    }
-
-    let type_w = 5usize;
-    let new_w = count_col_width("New", &new_vals);
-    let mod_w = count_col_width("Mod", &mod_vals);
-    let ident_w = count_col_width("Ident", &ident_vals);
-    let uncol_w = count_col_width("Uncol", &uncol_vals);
-    let del_src_w = count_col_width("Del(src)", &del_src_vals);
-    let del_dst_w = count_col_width("Del(dest)", &del_dst_vals);
-
-    println!(
-        "{:<type_w$} | {:>new_w$} | {:>mod_w$} | {:>ident_w$} | {:>uncol_w$} | {:>del_src_w$} | {:>del_dst_w$}",
-        "Type",
-        "New",
-        "Mod",
-        "Ident",
-        "Uncol",
-        "Del(src)",
-        "Del(dest)",
-    );
-    if let Some((new_v, mod_v, ident_v, uncol_v, del_src_v, del_dst_v)) = file_row {
-        println!(
-            "{:<type_w$} | {:>new_w$} | {:>mod_w$} | {:>ident_w$} | {:>uncol_w$} | {:>del_src_w$} | {:>del_dst_w$}",
-            "Files",
-            format_number(new_v),
-            format_number(mod_v),
-            format_number(ident_v),
-            format_number(uncol_v),
-            format_number(del_src_v),
-            format_number(del_dst_v),
-        );
-    }
-    if let Some((new_v, mod_v, ident_v, uncol_v, del_src_v, del_dst_v)) = dir_row {
-        println!(
-            "{:<type_w$} | {:>new_w$} | {:>mod_w$} | {:>ident_w$} | {:>uncol_w$} | {:>del_src_w$} | {:>del_dst_w$}",
-            "Dirs",
-            format_number(new_v),
-            format_number(mod_v),
-            format_number(ident_v),
-            format_number(uncol_v),
-            format_number(del_src_v),
-            format_number(del_dst_v),
-        );
-    }
-}
-
-pub(super) fn print_preview_counts_table(
-    file_row: Option<(u64, u64, u64, u64, u64, u64)>,
-    dir_row: Option<(u64, u64, u64, u64, u64, u64)>,
-    breakdown: FileRelationBreakdown,
-) {
-    let mut new_vals = Vec::new();
-    let mut uncol_vals = Vec::new();
-    let mut del_src_vals = Vec::new();
-    let mut del_dst_vals = Vec::new();
-    let mut time_eq_size_eq_vals = Vec::new();
-    let mut time_eq_src_gt_vals = Vec::new();
-    let mut time_eq_src_lt_vals = Vec::new();
-    let mut size_eq_new_vals = Vec::new();
-    let mut size_eq_old_vals = Vec::new();
-    let mut old_src_lt_vals = Vec::new();
-    let mut old_src_gt_vals = Vec::new();
-    let mut new_src_lt_vals = Vec::new();
-    let mut new_src_gt_vals = Vec::new();
-
-    for row in [file_row, dir_row].into_iter().flatten() {
-        new_vals.push(row.0);
-        uncol_vals.push(row.3);
-        del_src_vals.push(row.4);
-        del_dst_vals.push(row.5);
-    }
-    time_eq_size_eq_vals.push(breakdown.same_time_same_size);
-    time_eq_src_gt_vals.push(breakdown.same_time_source_larger);
-    time_eq_src_lt_vals.push(breakdown.same_time_source_smaller);
-    size_eq_new_vals.push(breakdown.same_size_source_newer);
-    size_eq_old_vals.push(breakdown.same_size_source_older);
-    old_src_lt_vals.push(breakdown.source_older_smaller);
-    old_src_gt_vals.push(breakdown.source_older_larger);
-    new_src_lt_vals.push(breakdown.source_newer_smaller);
-    new_src_gt_vals.push(breakdown.source_newer_larger);
-    time_eq_size_eq_vals.push(0);
-    time_eq_src_gt_vals.push(0);
-    time_eq_src_lt_vals.push(0);
-    size_eq_new_vals.push(0);
-    size_eq_old_vals.push(0);
-    old_src_lt_vals.push(0);
-    old_src_gt_vals.push(0);
-    new_src_lt_vals.push(0);
-    new_src_gt_vals.push(0);
-
-    let type_w = 5usize;
-    let new_w = count_col_width("New", &new_vals);
-    let uncol_w = count_col_width("Uncol", &uncol_vals);
-    let del_src_w = count_col_width("Del(src)", &del_src_vals);
-    let del_dst_w = count_col_width("Del(dest)", &del_dst_vals);
-    let time_eq_size_eq_w = count_col_width("Time=Size=", &time_eq_size_eq_vals);
-    let time_eq_src_gt_w = count_col_width("Time=Size+", &time_eq_src_gt_vals);
-    let time_eq_src_lt_w = count_col_width("Time=Size-", &time_eq_src_lt_vals);
-    let size_eq_new_w = count_col_width("Time+Size=", &size_eq_new_vals);
-    let size_eq_old_w = count_col_width("Time-Size=", &size_eq_old_vals);
-    let old_src_lt_w = count_col_width("Time-Size-", &old_src_lt_vals);
-    let old_src_gt_w = count_col_width("Time-Size+", &old_src_gt_vals);
-    let new_src_lt_w = count_col_width("Time+Size-", &new_src_lt_vals);
-    let new_src_gt_w = count_col_width("Time+Size+", &new_src_gt_vals);
-
-    println!(
-        "{:<type_w$} | {:>new_w$} | {:>uncol_w$} | {:>time_eq_size_eq_w$} | {:>time_eq_src_gt_w$} | {:>time_eq_src_lt_w$} | {:>size_eq_new_w$}",
-        "Type",
-        "New",
-        "Uncol",
-        "Time=Size=",
-        "Time=Size+",
-        "Time=Size-",
-        "Time+Size=",
-    );
-    if let Some((new_v, _mod_v, _ident_v, uncol_v, del_src_v, del_dst_v)) = file_row {
-        println!(
-            "{:<type_w$} | {:>new_w$} | {:>uncol_w$} | {:>time_eq_size_eq_w$} | {:>time_eq_src_gt_w$} | {:>time_eq_src_lt_w$} | {:>size_eq_new_w$}",
-            "Files",
-            format_number(new_v),
-            format_number(uncol_v),
-            format_number(breakdown.same_time_same_size),
-            format_number(breakdown.same_time_source_larger),
-            format_number(breakdown.same_time_source_smaller),
-            format_number(breakdown.same_size_source_newer),
-        );
-        let _ = (del_src_v, del_dst_v);
-    }
-    if let Some((new_v, _mod_v, _ident_v, uncol_v, del_src_v, del_dst_v)) = dir_row {
-        println!(
-            "{:<type_w$} | {:>new_w$} | {:>uncol_w$} | {:>time_eq_size_eq_w$} | {:>time_eq_src_gt_w$} | {:>time_eq_src_lt_w$} | {:>size_eq_new_w$}",
-            "Dirs",
-            format_number(new_v),
-            format_number(uncol_v),
-            "0",
-            "0",
-            "0",
-            "0",
-        );
-        let _ = (del_src_v, del_dst_v);
-    }
-
-    println!();
-    println!(
-        "{:<type_w$} | {:>size_eq_old_w$} | {:>old_src_lt_w$} | {:>old_src_gt_w$} | {:>new_src_lt_w$} | {:>new_src_gt_w$} | {:>del_src_w$} | {:>del_dst_w$}",
-        "Type",
-        "Time-Size=",
-        "Time-Size-",
-        "Time-Size+",
-        "Time+Size-",
-        "Time+Size+",
-        "Del(src)",
-        "Del(dest)",
-    );
-    if let Some((_new_v, _mod_v, _ident_v, _uncol_v, del_src_v, del_dst_v)) = file_row {
-        println!(
-            "{:<type_w$} | {:>size_eq_old_w$} | {:>old_src_lt_w$} | {:>old_src_gt_w$} | {:>new_src_lt_w$} | {:>new_src_gt_w$} | {:>del_src_w$} | {:>del_dst_w$}",
-            "Files",
-            format_number(breakdown.same_size_source_older),
-            format_number(breakdown.source_older_smaller),
-            format_number(breakdown.source_older_larger),
-            format_number(breakdown.source_newer_smaller),
-            format_number(breakdown.source_newer_larger),
-            format_number(del_src_v),
-            format_number(del_dst_v),
-        );
-    }
-    if let Some((_new_v, _mod_v, _ident_v, _uncol_v, del_src_v, del_dst_v)) = dir_row {
-        println!(
-            "{:<type_w$} | {:>size_eq_old_w$} | {:>old_src_lt_w$} | {:>old_src_gt_w$} | {:>new_src_lt_w$} | {:>new_src_gt_w$} | {:>del_src_w$} | {:>del_dst_w$}",
-            "Dirs",
-            "0",
-            "0",
-            "0",
-            "0",
-            "0",
-            format_number(del_src_v),
-            format_number(del_dst_v),
-        );
-    }
-    println!();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn parse_remote_spec_accepts_user_host_path() {
-        let spec = parse_remote_spec("alice@nas:/data/photos").expect("remote spec");
-        assert_eq!(spec.user.as_deref(), Some("alice"));
-        assert_eq!(spec.host, "nas");
-        assert_eq!(spec.path, "/data/photos");
-    }
-
-    #[test]
-    fn parse_remote_spec_accepts_host_path_without_user() {
-        let spec = parse_remote_spec("backup:/srv/archive").expect("remote spec");
-        assert_eq!(spec.user, None);
-        assert_eq!(spec.host, "backup");
-        assert_eq!(spec.path, "/srv/archive");
-    }
-
-    #[test]
-    fn parse_remote_spec_rejects_local_path_with_colon() {
-        assert!(parse_remote_spec("/tmp/a:b").is_none());
-        assert!(parse_remote_spec("mtp://phone/path").is_none());
-    }
-
-    #[test]
-    fn transfer_media_uses_conservative_endpoint_kind() {
-        assert_eq!(
-            transfer_media_kind(MediaKind::Nvme, MediaKind::Hdd),
-            MediaKind::Hdd
-        );
-        assert_eq!(
-            transfer_media_kind(MediaKind::Hdd, MediaKind::Nvme),
-            MediaKind::Hdd
-        );
-        assert_eq!(
-            transfer_media_kind(MediaKind::Nvme, MediaKind::Nvme),
-            MediaKind::Nvme
-        );
-        assert_eq!(
-            transfer_media_kind(MediaKind::Nvme, MediaKind::Other),
-            MediaKind::Other
-        );
-    }
-
-    #[test]
-    fn dev_media_kind_probes_existing_parent_for_missing_target() {
-        let td = tempdir().expect("tempdir");
-        let existing = dev_media_kind(td.path());
-        let missing = dev_media_kind(&td.path().join("not-created").join("target"));
-        assert_eq!(missing, existing);
-    }
-
-    #[test]
-    fn ssh_config_parser_uses_first_matching_user() {
-        let cfg = r#"
-Host box
-  User first
-Host box
-  User second
-"#;
-        assert_eq!(
-            ssh_config_user_for_host_from_text("box", cfg).as_deref(),
-            Some("first")
-        );
-    }
-
-    #[test]
-    fn ssh_config_parser_supports_wildcards_and_negation() {
-        let cfg = r#"
-Host * !blocked
-  User wildcard
-Host blocked
-  User denied
-Host dev-*
-  User devuser
-"#;
-        assert_eq!(
-            ssh_config_user_for_host_from_text("prod-1", cfg).as_deref(),
-            Some("wildcard")
-        );
-        assert_eq!(
-            ssh_config_user_for_host_from_text("dev-a", cfg).as_deref(),
-            Some("wildcard")
-        );
-        assert_eq!(
-            ssh_config_user_for_host_from_text("blocked", cfg).as_deref(),
-            Some("denied")
-        );
-    }
-
-    #[test]
-    fn handle_rsync_stream_line_emits_progress_event() {
-        let (tx, rx) = mpsc::channel();
-        handle_rsync_stream_line(&tx, "   1,024  10%   1.00MB/s    0:00:00");
-        match rx.recv().expect("event") {
-            RsyncStreamEvent::Progress(bytes) => assert_eq!(bytes, 1024),
-            RsyncStreamEvent::Text(line) => panic!("expected progress, got text: {line}"),
-        }
-    }
-
-    #[test]
-    fn handle_rsync_stream_line_emits_text_event() {
-        let (tx, rx) = mpsc::channel();
-        handle_rsync_stream_line(&tx, "building file list ...");
-        match rx.recv().expect("event") {
-            RsyncStreamEvent::Text(line) => assert_eq!(line, "building file list ..."),
-            RsyncStreamEvent::Progress(bytes) => panic!("expected text, got progress: {bytes}"),
-        }
-    }
-
-    #[test]
-    fn format_hidden_top_summary_uses_requested_order_with_deleted_suffix() {
-        let line = format_hidden_top_summary(1, 1, 1, 1, 1, false).expect("summary");
-        assert_eq!(
-            line,
-            "1 more new 1 more modified 1 more identical 1 more uncollided 1 more deleted"
-        );
-    }
-
-    #[test]
-    fn format_hidden_top_summary_omits_zero_categories() {
-        let line = format_hidden_top_summary(0, 0, 0, 4, 0, false).expect("summary");
-        assert_eq!(line, "4 more uncollided");
-    }
-
-    #[test]
-    fn format_hidden_top_summary_combines_identical_and_unchanged_when_requested() {
-        let line = format_hidden_top_summary(0, 0, 3, 4, 0, true).expect("summary");
-        assert_eq!(line, "7 more identical/uncollided");
-    }
-
-    #[test]
-    fn pre_scan_file_counts_uncollided_siblings_for_file_target() {
-        let td = tempdir().expect("tempdir");
-        let src = td.path().join("src").join("auth.json");
-        let dst_dir = td.path().join("dst").join("accounts");
-        let dst_file = dst_dir.join("personal2.json");
-        fs::create_dir_all(src.parent().expect("src parent")).expect("mkdir src");
-        fs::create_dir_all(&dst_dir).expect("mkdir dst");
-        fs::write(&src, b"token\n").expect("write src");
-        fs::write(dst_dir.join("other.json"), b"other\n").expect("write sibling");
-
-        let mut src_rel_files = HashSet::new();
-        src_rel_files.insert("personal2.json".to_string());
-        let (_total, uncollided) = destination_file_counts(&dst_dir, &src_rel_files);
-        assert_eq!(uncollided, 1);
-
-        let ps = pre_scan_file(
-            &src,
-            &dst_file.display().to_string(),
-            DstObjKind::File,
-            false,
-            false,
-            false,
-            MergeCollisionPolicy::default(),
-            None,
-        );
-        assert_eq!(ps.uncollided_files, 1);
-    }
-
-    #[test]
-    fn eta_estimator_tracks_stable_throughput() {
-        let mut estimator = TransferEtaEstimator::default();
-        let mib = 1024.0 * 1024.0;
-        let rate = 100.0 * mib;
-        let total = 20 * 1024 * 1024 * 1024u64;
-        let mut eta = None;
-
-        for tick in 1..=60 {
-            let elapsed = tick as f64 * 0.2;
-            let done = (elapsed * rate) as u64;
-            eta = estimator.update(Some(done), total, Some(rate), elapsed, false, None, None);
-        }
-
-        let eta = eta.expect("ETA should be available after warmup");
-        assert!(eta > 150.0 && eta < 250.0, "unexpected stable ETA: {eta}");
-    }
-
-    #[test]
-    fn eta_estimator_uses_remaining_file_composition_after_small_file_phase() {
-        let mut estimator = TransferEtaEstimator::default();
-        let mib = 1024.0 * 1024.0;
-        let kib = 1024u64;
-        let fast_rate = 100.0 * mib;
-        let mut workload = EtaWorkload::default();
-        workload.file_bins[0] = 1_000;
-        workload.file_bytes[0] = workload.file_bins[0] * 4 * kib;
-        workload.file_bins[7] = 10;
-        workload.file_bytes[7] = workload.file_bins[7] * 1024 * 1024 * 1024;
-        let total = workload.file_bytes.iter().sum::<u64>();
-        let mut progress = EtaProgressTotals::default();
-        let mut done = 0u64;
-
-        for tick in 1..=50 {
-            let elapsed = tick as f64 * 0.2;
-            done = (elapsed * fast_rate) as u64;
-            let _ = estimator.update(
-                Some(done),
-                total,
-                Some(fast_rate),
-                elapsed,
-                false,
-                Some(workload),
-                Some(progress),
-            );
-        }
-
-        let mut eta = None;
-        for tick in 51..=100 {
-            let elapsed = tick as f64 * 0.2;
-            done = done.saturating_add(4 * kib * 2);
-            progress.file_bins[0] += 2;
-            progress.file_bytes[0] += 4 * kib * 2;
-            eta = estimator.update(
-                Some(done),
-                total,
-                Some((4 * kib * 2) as f64 / 0.2),
-                elapsed,
-                false,
-                Some(workload),
-                Some(progress),
-            );
-        }
-
-        let eta = eta.expect("ETA should remain available during small-file phase");
-        assert!(
-            eta > 100.0 && eta < 1_000.0,
-            "unexpected composition ETA: {eta}"
-        );
-    }
-
-    #[test]
-    fn eta_estimator_reacts_to_cache_to_disk_slowdown() {
-        let mut estimator = TransferEtaEstimator::default();
-        let mib = 1024.0 * 1024.0;
-        let fast_rate = 800.0 * mib;
-        let slow_rate = 9.726 * mib;
-        let total = 100 * 1024 * 1024 * 1024u64;
-
-        for tick in 1..=50 {
-            let elapsed = tick as f64 * 0.2;
-            let done = (elapsed * fast_rate) as u64;
-            let _ = estimator.update(
-                Some(done),
-                total,
-                Some(fast_rate),
-                elapsed,
-                false,
-                None,
-                None,
-            );
-        }
-
-        let mut eta_after_slowdown = None;
-        for tick in 51..=80 {
-            let elapsed = tick as f64 * 0.2;
-            let done = (10.0 * fast_rate + (elapsed - 10.0) * slow_rate) as u64;
-            eta_after_slowdown = estimator.update(
-                Some(done),
-                total,
-                Some(slow_rate),
-                elapsed,
-                false,
-                None,
-                None,
-            );
-        }
-
-        let eta = eta_after_slowdown.expect("ETA should remain available after slowdown");
-        assert!(eta > 5_000.0, "slowdown was not detected quickly: {eta}s");
-    }
-
-    #[test]
-    fn eta_estimator_freezes_short_stalls_and_reports_long_stalls() {
-        let mut estimator = TransferEtaEstimator::default();
-        let rate = 100.0 * 1024.0 * 1024.0;
-        let total = 20 * 1024 * 1024 * 1024u64;
-        let mut eta_before_stall = None;
-
-        for tick in 1..=60 {
-            let elapsed = tick as f64 * 0.2;
-            let done = (elapsed * rate) as u64;
-            eta_before_stall =
-                estimator.update(Some(done), total, Some(rate), elapsed, false, None, None);
-        }
-
-        let eta_before_stall = eta_before_stall.expect("ETA should be available before stall");
-        let done = (60.0 * 0.2 * rate) as u64;
-        let mut eta_after_short_stall = None;
-        for tick in 61..=68 {
-            let elapsed = tick as f64 * 0.2;
-            eta_after_short_stall =
-                estimator.update(Some(done), total, Some(0.0), elapsed, false, None, None);
-        }
-        let eta_after_short_stall =
-            eta_after_short_stall.expect("short stall should retain the current ETA");
-        assert!(
-            (eta_after_short_stall - eta_before_stall).abs() <= 1.0,
-            "short stall changed ETA: before={eta_before_stall}, after={eta_after_short_stall}"
-        );
-
-        let mut long_stall_eta = Some(0.0);
-        for tick in 69..=90 {
-            let elapsed = tick as f64 * 0.2;
-            long_stall_eta =
-                estimator.update(Some(done), total, Some(0.0), elapsed, false, None, None);
-        }
-        assert!(
-            long_stall_eta.is_none(),
-            "long stall should report an unavailable ETA"
-        );
-    }
-
-    #[test]
-    fn eta_estimator_exposes_ordered_percentiles_for_mixed_workload() {
-        let mut estimator = TransferEtaEstimator::default();
-        let kib = 1024u64;
-        let mut workload = EtaWorkload::default();
-        workload.file_bins[0] = 2_000;
-        workload.file_bytes[0] = workload.file_bins[0] * 4 * kib;
-        workload.file_bins[7] = 2;
-        workload.file_bytes[7] = 2 * 1024 * 1024 * 1024;
-        let total = workload.file_bytes.iter().sum::<u64>();
-        let mut progress = EtaProgressTotals::default();
-        let mut done = 0u64;
-
-        for tick in 1..=80 {
-            let elapsed = tick as f64 * 0.2;
-            done = done.saturating_add(4 * 4 * kib);
-            progress.file_bins[0] += 4;
-            progress.file_bytes[0] += 4 * 4 * kib;
-            let _ = estimator.update(
-                Some(done),
-                total,
-                Some(16.0 * kib as f64 / 0.2),
-                elapsed,
-                false,
-                Some(workload),
-                Some(progress),
-            );
-        }
-
-        let estimate = estimator.last_estimate().expect("mixed-workload estimate");
-        let p10 = estimate.p10_s.expect("p10");
-        let p50 = estimate.p50_s.expect("p50");
-        let p90 = estimate.p90_s.expect("p90");
-        assert!(p10 <= p50 && p50 <= p90);
-        assert!(p90.is_finite() && p90 > 0.0);
-        assert!(estimate.confidence > 0.0);
-    }
-
-    #[test]
-    fn eta_estimator_accounts_for_downstream_pipeline_backlog() {
-        let mut estimator = TransferEtaEstimator::default();
-        let mib = 1024.0 * 1024.0;
-        let total = 10 * 1024 * 1024 * 1024u64;
-        let mut estimate = None;
-
-        for tick in 1..=50 {
-            let elapsed = tick as f64 * 0.2;
-            let done = (elapsed * 100.0 * mib) as u64;
-            let write_complete = (elapsed * mib) as u64;
-            estimate = estimator.update_with_telemetry(
-                Some(done),
-                total,
-                Some(100.0 * mib),
-                elapsed,
-                false,
-                None,
-                None,
-                EtaTelemetry {
-                    write_bytes: Some(done),
-                    write_complete: Some(write_complete),
-                    ..EtaTelemetry::default()
-                },
-                TransferProgressRates {
-                    write_complete_bps: Some(mib),
-                    ..TransferProgressRates::default()
-                },
-            );
-        }
-
-        assert!(estimate.expect("pipeline estimate") > 300.0);
-        assert!(estimator
-            .last_estimate()
-            .map(|value| value.activity == EtaActivity::PipelineBound)
-            .unwrap_or(false));
-    }
 }

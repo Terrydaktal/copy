@@ -1,8 +1,23 @@
 //! Rsync subprocess integration and progress-stream translation.
 
-use super::*;
+use super::telemetry::{counter_delta, device_io_deltas, proc_io_deltas};
+use crate::domain::{
+    DeviceIoWindow, ProcessIoWindow, ProgressSnapshot, RsyncStreamEvent, TransferOutcome,
+    TransferProgressRates,
+};
+use crate::output::{
+    finish_progress_render_state, print_transfer_columns_header, print_transfer_progress_bars,
+    TransferEtaEstimator,
+};
+use regex::Regex;
+use std::io::Read;
+use std::io::{self, BufRead};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-pub(super) fn parse_progress2_bytes(line: &str) -> Option<u64> {
+pub(crate) fn parse_progress2_bytes(line: &str) -> Option<u64> {
     let re = Regex::new(r"^\s*([0-9][0-9,]*(?:\.[0-9]+)?)([kKmMgGtTpPeE]?)\s+[0-9]{1,3}%").ok()?;
     let caps = re.captures(line)?;
     let num_txt = caps.get(1)?.as_str().replace(',', "");
@@ -24,7 +39,7 @@ pub(super) fn parse_progress2_bytes(line: &str) -> Option<u64> {
     Some(val as u64)
 }
 
-pub(super) fn handle_rsync_stream_line(tx: &mpsc::Sender<RsyncStreamEvent>, line: &str) {
+pub(crate) fn handle_rsync_stream_line(tx: &mpsc::Sender<RsyncStreamEvent>, line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return;
@@ -36,19 +51,27 @@ pub(super) fn handle_rsync_stream_line(tx: &mpsc::Sender<RsyncStreamEvent>, line
     }
 }
 
-pub(super) fn spawn_rsync_stdout_reader(
+pub(crate) fn spawn_rsync_stdout_reader(
     stdout: impl Read + Send + 'static,
     tx: mpsc::Sender<RsyncStreamEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let reader = io::BufReader::new(stdout);
-        for line in reader.lines().flatten() {
-            handle_rsync_stream_line(&tx, &line);
+        for result in reader.lines() {
+            match result {
+                Ok(line) => handle_rsync_stream_line(&tx, &line),
+                Err(err) => {
+                    let _ = tx.send(RsyncStreamEvent::Text(format!(
+                        "rsync stdout read error: {err}"
+                    )));
+                    break;
+                }
+            }
         }
     })
 }
 
-pub(super) fn spawn_rsync_stderr_reader(
+pub(crate) fn spawn_rsync_stderr_reader(
     stderr: impl Read + Send + 'static,
     tx: mpsc::Sender<RsyncStreamEvent>,
 ) -> thread::JoinHandle<()> {
@@ -61,7 +84,12 @@ pub(super) fn spawn_rsync_stderr_reader(
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                Err(_) => break,
+                Err(err) => {
+                    let _ = tx.send(RsyncStreamEvent::Text(format!(
+                        "rsync stderr read error: {err}"
+                    )));
+                    break;
+                }
             };
             pending.extend_from_slice(&buf[..n]);
 
@@ -89,7 +117,7 @@ pub(super) fn spawn_rsync_stderr_reader(
     })
 }
 
-pub(super) fn run_rsync_transfer(
+pub(crate) fn run_rsync_transfer(
     src_path: &str,
     dst_path: &str,
     planned_bytes: u64,
@@ -102,6 +130,7 @@ pub(super) fn run_rsync_transfer(
         "rsync".to_string(),
         "-aH".to_string(),
         "--partial".to_string(),
+        "--protect-args".to_string(),
     ];
     if size_only {
         cmd.push("--size-only".to_string());
@@ -114,13 +143,14 @@ pub(super) fn run_rsync_transfer(
     }
     cmd.extend([
         "--info=progress2,stats2,name0".to_string(),
+        "--".to_string(),
         src_path.to_string(),
         dst_path.to_string(),
     ]);
 
     let mut full_cmd = Vec::new();
     if use_sudo {
-        full_cmd.push("sudo".to_string());
+        full_cmd.push("pkexec".to_string());
     }
     full_cmd.extend(cmd);
 
@@ -131,13 +161,14 @@ pub(super) fn run_rsync_transfer(
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => {
+        Err(err) => {
+            eprintln!("copy-rs: failed to start rsync: {err}");
             return TransferOutcome {
                 rc: 1,
                 bytes_done: 0,
                 elapsed_s: 0.0,
                 progress_snapshot: None,
-            }
+            };
         }
     };
 
@@ -251,7 +282,7 @@ pub(super) fn run_rsync_transfer(
         let _ = h.join();
     }
 
-    let final_done = if planned_bytes > 0 && (rc == 0 || rc == 24) {
+    let final_done = if planned_bytes > 0 && rc == 0 {
         planned_bytes.max(done_bytes)
     } else {
         done_bytes
@@ -319,7 +350,7 @@ pub(super) fn run_rsync_transfer(
     }
 }
 
-pub(super) fn run_rsync_transfer_sources(
+pub(crate) fn run_rsync_transfer_sources(
     src_paths: &[String],
     dst_path: &str,
     planned_bytes: u64,
@@ -364,9 +395,37 @@ pub(super) fn run_rsync_transfer_sources(
         aggregate.bytes_done = aggregate.bytes_done.saturating_add(transfer.bytes_done);
         aggregate.elapsed_s += transfer.elapsed_s;
         aggregate.progress_snapshot = transfer.progress_snapshot;
-        if transfer.rc != 0 && transfer.rc != 24 {
+        // Rsync status 24 means that files vanished during transfer. It is a
+        // partial result, not a successful batch that may be committed or
+        // followed by move cleanup.
+        if transfer.rc != 0 {
             break;
         }
     }
     aggregate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    #[test]
+    fn handle_rsync_stream_line_emits_progress_event() {
+        let (tx, rx) = mpsc::channel();
+        handle_rsync_stream_line(&tx, "   1,024  10%   1.00MB/s    0:00:00");
+        match rx.recv().expect("event") {
+            RsyncStreamEvent::Progress(bytes) => assert_eq!(bytes, 1024),
+            RsyncStreamEvent::Text(line) => panic!("expected progress, got text: {line}"),
+        }
+    }
+
+    #[test]
+    fn handle_rsync_stream_line_emits_text_event() {
+        let (tx, rx) = mpsc::channel();
+        handle_rsync_stream_line(&tx, "building file list ...");
+        match rx.recv().expect("event") {
+            RsyncStreamEvent::Text(line) => assert_eq!(line, "building file list ..."),
+            RsyncStreamEvent::Progress(bytes) => panic!("expected text, got progress: {bytes}"),
+        }
+    }
 }

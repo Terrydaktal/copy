@@ -1,23 +1,12 @@
 //! Collision-policy parsing and source/destination relation decisions.
 
-use super::*;
+use crate::domain::{
+    ChangeKind, CollisionCombineMode, CollisionPredicates, CollisionWinner, FileRelationBreakdown,
+    MergeCollisionPolicy,
+};
+use std::time::SystemTime;
 
-pub(super) fn set_merge_collision_policy(
-    args: &mut CliArgs,
-    policy: MergeCollisionPolicy,
-) -> Result<(), i32> {
-    if args.merge_collision_policy != MergeCollisionPolicy::default()
-        && args.merge_collision_policy != policy
-    {
-        usage();
-        eprintln!("copy: error: collision policy options are mutually exclusive");
-        return Err(1);
-    }
-    args.merge_collision_policy = policy;
-    Ok(())
-}
-
-pub(super) fn parse_merge_collision_policy(raw: &str) -> Result<MergeCollisionPolicy, String> {
+pub(crate) fn parse_merge_collision_policy(raw: &str) -> Result<MergeCollisionPolicy, String> {
     let (winner_raw, expr_raw) = raw
         .split_once(':')
         .ok_or_else(|| "expected winner:rule".to_string())?;
@@ -69,7 +58,7 @@ pub(super) fn parse_merge_collision_policy(raw: &str) -> Result<MergeCollisionPo
     })
 }
 
-pub(super) fn regular_file_collision_change(
+pub(crate) fn regular_file_collision_change(
     policy: MergeCollisionPolicy,
     src_size: u64,
     src_mtime: Option<SystemTime>,
@@ -161,17 +150,10 @@ pub(super) fn regular_file_collision_change(
                     .any(|r| matches!(r, PredicateResult::Unknown))
             }
         }
-        CollisionCombineMode::All => {
-            if predicate_results
-                .iter()
-                .flatten()
-                .any(|r| matches!(r, PredicateResult::False))
-            {
-                false
-            } else {
-                true
-            }
-        }
+        CollisionCombineMode::All => !predicate_results
+            .iter()
+            .flatten()
+            .any(|r| matches!(r, PredicateResult::False)),
     };
 
     let source_wins = match_selected_winner == matches!(policy.winner, CollisionWinner::Source);
@@ -182,7 +164,7 @@ pub(super) fn regular_file_collision_change(
     }
 }
 
-pub(super) fn sync_regular_file_change(
+pub(crate) fn sync_regular_file_change(
     src_size: u64,
     src_mtime: Option<SystemTime>,
     dst_is_regular_file: bool,
@@ -202,7 +184,7 @@ pub(super) fn sync_regular_file_change(
     }
 }
 
-pub(super) fn classify_file_relation(
+pub(crate) fn classify_file_relation(
     src_size: u64,
     src_mtime: Option<SystemTime>,
     dst_size: Option<u64>,

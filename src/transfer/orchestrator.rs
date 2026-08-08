@@ -1,8 +1,52 @@
 //! Transfer orchestration, batching, flush phases, and move cleanup phases.
+#![allow(clippy::too_many_arguments)]
 
-use super::*;
+use super::cleanup::{
+    cleanup_source_dirs, cleanup_source_dirs_from_manifest, delete_sync_destination_extras,
+    prune_move_source_duplicates, remove_single_file,
+};
+use super::command::run_command_capture;
+use super::copy_engine::{
+    copy_file_preserve_with_progress_buffer, copy_symlink, preserve_directory_times_tree,
+    remove_path_local_if_exists,
+};
+use super::rsync::run_rsync_transfer_sources;
+use super::telemetry::{counter_delta, device_io_deltas, proc_io_deltas, read_proc_io_counters};
+use crate::domain::{
+    AtomicEtaProgress, ChangeItem, DeleteCleanupOutcome, DeviceIoDeltas, DeviceIoWindow,
+    DstObjKind, EtaWorkload, FileRelationBreakdown, InflightWriteLimiter, LogLevel, MediaKind,
+    MergeCollisionPolicy, ProcIoCounters, ProcIoDeltas, ProcessIoWindow, ProgressSnapshot,
+    SrcObjKind, TransferBackend, TransferManifest, TransferMode, TransferOutcome,
+    TransferProgressRates, TransferRateSmoother,
+};
+use crate::output::{
+    format_bytes_binary, format_number, log, log_transfer_complete, print_changed_top_preview,
+    print_copy_duration_summary, print_counts_table, print_preview_counts_table,
+    print_preview_root_line, print_transfer_progress_bars, reset_progress_render_state,
+    TransferEtaEstimator,
+};
+use crate::plan::{
+    build_destination_index, can_fast_rename_same_fs, pre_scan_file, realpath_allow_missing,
+    resolve_destination_for_dir, resolve_source, DestinationKind,
+};
+use crate::runtime::{
+    acquire_file_write_permit, configure_rayon_threads_for_media, dev_media_kind,
+    inflight_max_bytes_for_media, option_u64_saturating_add, symlink_targets_equal,
+    transfer_media_kind, transfer_profile_key,
+};
+use rayon::prelude::*;
+use rustc_hash::FxHashSet;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-pub(super) fn run_rust_file_batch(
+pub(crate) fn run_rust_file_batch(
     items: &[(PathBuf, u64, bool)],
     destination: &Path,
     planned_bytes: u64,
@@ -12,19 +56,25 @@ pub(super) fn run_rust_file_batch(
 ) -> TransferOutcome {
     let done = Arc::new(AtomicU64::new(0));
     let eta_progress = Arc::new(AtomicEtaProgress::default());
-    let mut eta_workload = EtaWorkload::default();
+    let mut file_sizes = Vec::new();
+    let mut eta_item_indices = vec![None; items.len()];
 
-    for (source, _, needs_copy) in items {
+    for (item_index, (source, _, needs_copy)) in items.iter().enumerate() {
         if !*needs_copy {
             continue;
         }
         if let Ok(meta) = fs::symlink_metadata(source) {
-            let size = meta.is_file().then_some(meta.len()).unwrap_or(0);
-            let bin = eta_file_bin(size);
-            eta_workload.file_bins[bin] = eta_workload.file_bins[bin].saturating_add(1);
-            eta_workload.file_bytes[bin] = eta_workload.file_bytes[bin].saturating_add(size);
+            let size = if meta.is_file() { meta.len() } else { 0 };
+            eta_item_indices[item_index] = Some(file_sizes.len());
+            file_sizes.push(size);
         }
     }
+    let profile_key = items
+        .first()
+        .map(|(source, _, _)| transfer_profile_key(source, destination))
+        .unwrap_or(0);
+    let eta_workload = EtaWorkload::from_file_sizes(&file_sizes, media, profile_key);
+    let eta_item_indices = Arc::new(eta_item_indices);
 
     let limiter =
         inflight_max_bytes_for_media(media).map(|max| Arc::new(InflightWriteLimiter::new(max)));
@@ -48,6 +98,7 @@ pub(super) fn run_rust_file_batch(
     let progress_for_ticker = Arc::clone(&eta_progress);
     let rates_for_ticker = Arc::clone(&rates_shared);
     let destination_for_ticker = destination_text.clone();
+    let eta_workload_for_ticker = eta_workload.clone();
     let ticker = collect_telemetry.then(|| {
         thread::spawn(move || {
             let mut process = ProcessIoWindow::from_pid(std::process::id());
@@ -102,7 +153,7 @@ pub(super) fn run_rust_file_batch(
                             rates,
                             proc_delta,
                             device_delta,
-                            Some(eta_workload),
+                            Some(eta_workload_for_ticker.clone()),
                             Some(progress_for_ticker.snapshot()),
                             Some(&mut estimator),
                             false,
@@ -115,52 +166,57 @@ pub(super) fn run_rust_file_batch(
     });
 
     let cancelled = AtomicBool::new(false);
-    let copy_result: Result<(), String> =
-        items
-            .par_iter()
-            .try_for_each_init(Vec::new, |buffer, (source, _, needs_copy)| {
-                if !*needs_copy {
-                    return Ok(());
-                }
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err("transfer cancelled after another worker failed".to_string());
-                }
+    let copy_result: Result<(), String> = items.par_iter().enumerate().try_for_each_init(
+        Vec::new,
+        |buffer, (item_index, (source, _, needs_copy))| {
+            if !*needs_copy {
+                return Ok(());
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Err("transfer cancelled after another worker failed".to_string());
+            }
 
-                let source_meta = fs::symlink_metadata(source)
-                    .map_err(|err| format!("read source metadata '{}': {err}", source.display()))?;
-                let name = source.file_name().ok_or_else(|| {
-                    format!(
-                        "resolve destination name for '{}': source has no filename",
-                        source.display()
-                    )
-                })?;
-                let target = destination.join(name);
-                if source_meta.file_type().is_symlink() {
-                    copy_symlink(source, &target)
-                        .map_err(|err| format!("copy symlink '{}': {err}", source.display()))?;
-                    eta_progress.mark_file(0);
-                    return Ok(());
+            let source_meta = fs::symlink_metadata(source)
+                .map_err(|err| format!("read source metadata '{}': {err}", source.display()))?;
+            let name = source.file_name().ok_or_else(|| {
+                format!(
+                    "resolve destination name for '{}': source has no filename",
+                    source.display()
+                )
+            })?;
+            let target = destination.join(name);
+            if source_meta.file_type().is_symlink() {
+                copy_symlink(source, &target)
+                    .map_err(|err| format!("copy symlink '{}': {err}", source.display()))?;
+                eta_progress.mark_file(0);
+                if let Some(operation_index) = eta_item_indices[item_index] {
+                    eta_workload.mark_operation(operation_index);
                 }
+                return Ok(());
+            }
 
-                let size = source_meta.len();
-                let _permit = acquire_file_write_permit(limiter.as_ref(), size, media);
-                if replace_dest_symlink
-                    && fs::symlink_metadata(&target)
-                        .map(|meta| meta.file_type().is_symlink())
-                        .unwrap_or(false)
-                {
-                    remove_path_local_if_exists(&target).map_err(|err| {
-                        format!("remove destination '{}': {err}", target.display())
-                    })?;
-                }
+            let size = source_meta.len();
+            let _permit = acquire_file_write_permit(limiter.as_ref(), size, media);
+            if replace_dest_symlink
+                && fs::symlink_metadata(&target)
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                remove_path_local_if_exists(&target)
+                    .map_err(|err| format!("remove destination '{}': {err}", target.display()))?;
+            }
 
-                copy_file_preserve_with_progress_buffer(source, &target, media, buffer, |count| {
-                    done.fetch_add(count, Ordering::Relaxed);
-                })
-                .map_err(|err| format!("copy file '{}': {err}", source.display()))?;
-                eta_progress.mark_file(size);
-                Ok(())
-            });
+            copy_file_preserve_with_progress_buffer(source, &target, media, buffer, |count| {
+                done.fetch_add(count, Ordering::Relaxed);
+            })
+            .map_err(|err| format!("copy file '{}': {err}", source.display()))?;
+            eta_progress.mark_file(size);
+            if let Some(operation_index) = eta_item_indices[item_index] {
+                eta_workload.mark_operation(operation_index);
+            }
+            Ok(())
+        },
+    );
 
     if copy_result.is_err() {
         cancelled.store(true, Ordering::Relaxed);
@@ -191,7 +247,7 @@ pub(super) fn run_rust_file_batch(
         rates,
         process_delta,
         device_delta,
-        Some(eta_workload),
+        Some(eta_workload.clone()),
         Some(eta_progress.snapshot()),
         None,
         true,
@@ -222,7 +278,7 @@ pub(super) fn run_rust_file_batch(
         }),
     }
 }
-pub(super) fn run_multi_source_file_batch(
+pub(crate) fn run_multi_source_file_batch(
     requested_mode: TransferMode,
     source_paths: &[String],
     destination: &str,
@@ -715,26 +771,13 @@ pub(super) fn run_multi_source_file_batch(
     0
 }
 
-pub(super) fn run_command_capture(cmd: &[String], sudo: bool) -> io::Result<CmdOutput> {
-    let mut full: Vec<String> = Vec::new();
-    if sudo {
-        full.push("sudo".to_string());
-    }
-    full.extend(cmd.iter().cloned());
-
-    let output = Command::new(&full[0]).args(&full[1..]).output()?;
-    Ok(CmdOutput {
-        code: output.status.code().unwrap_or(1),
-    })
-}
-
-pub(super) fn fsync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn fsync_directory(path: &Path) -> io::Result<()> {
     let directory = File::open(path)?;
     directory.sync_all()
 }
 
 #[allow(dead_code)]
-pub(super) fn flush_rename_metadata(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn flush_rename_metadata(src: &Path, dst: &Path) -> io::Result<()> {
     let src_parent = src.parent().unwrap_or_else(|| Path::new("/"));
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("/"));
     fsync_directory(dst_parent)?;
@@ -744,45 +787,32 @@ pub(super) fn flush_rename_metadata(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn run_flush_command(target: &Path, use_sudo: bool) -> bool {
-    let mut ok = false;
+pub(crate) fn run_flush_command(target: &Path, use_sudo: bool) -> bool {
     if use_sudo {
         let cmd = vec![
             "sync".to_string(),
             "-f".to_string(),
             target.display().to_string(),
         ];
-        ok = run_command_capture(&cmd, true)
+        return run_command_capture(&cmd, true)
             .map(|o| o.code == 0)
             .unwrap_or(false);
-    } else if let Ok(f) = fs::File::open(target) {
-        let rc = unsafe { nix::libc::syncfs(f.as_raw_fd()) };
-        ok = rc == 0;
     }
-
-    if !ok {
-        if use_sudo {
-            let cmd = vec!["sync".to_string()];
-            ok = run_command_capture(&cmd, true)
-                .map(|o| o.code == 0)
-                .unwrap_or(false);
-        } else {
-            unsafe {
-                nix::libc::sync();
-            }
-            ok = true;
-        }
-    }
-    ok
+    let file = match fs::File::open(target) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    unsafe { nix::libc::syncfs(file.as_raw_fd()) == 0 }
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct FlushStats {
-    pub(super) elapsed_s: f64,
-    pub(super) flushed_bytes: Option<u64>,
+pub(crate) struct FlushStats {
+    pub(crate) elapsed_s: f64,
+    pub(crate) flushed_bytes: Option<u64>,
+    pub(crate) ok: bool,
 }
 
-pub(super) fn flush_destination_writes(
+pub(crate) fn flush_destination_writes(
     dst_path: &Path,
     use_sudo: bool,
     mode: TransferMode,
@@ -821,7 +851,7 @@ pub(super) fn flush_destination_writes(
     let mut last_proc_sample = proc_start;
     let mut last_device_sample = flush_device_start;
     let mut last_sample_at = flush_start;
-    let mut last_progress_rates = progress.map(|p| p.rates).unwrap_or_default();
+    let mut last_progress_rates = progress.as_ref().map(|p| p.rates).unwrap_or_default();
 
     loop {
         match flush_rx.recv_timeout(Duration::from_millis(200)) {
@@ -830,7 +860,7 @@ pub(super) fn flush_destination_writes(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(snapshot) = progress {
+                if let Some(snapshot) = progress.as_ref() {
                     let now = Instant::now();
                     let proc_now = read_proc_io_counters(std::process::id());
                     let proc_extra = proc_io_deltas(proc_start, proc_now);
@@ -909,7 +939,7 @@ pub(super) fn flush_destination_writes(
                         display_rates,
                         merged_proc_deltas,
                         merged_device_deltas,
-                        snapshot.eta_workload,
+                        snapshot.eta_workload.clone(),
                         snapshot.eta_progress,
                         None,
                         false,
@@ -995,9 +1025,10 @@ pub(super) fn flush_destination_writes(
     FlushStats {
         elapsed_s: flush_elapsed_s,
         flushed_bytes,
+        ok: flush_ok,
     }
 }
-pub(super) fn flush_source_cleanup_writes(
+pub(crate) fn flush_source_cleanup_writes(
     src_path: &Path,
     use_sudo: bool,
     mode: TransferMode,
@@ -1035,19 +1066,21 @@ pub(super) fn flush_source_cleanup_writes(
     FlushStats {
         elapsed_s,
         flushed_bytes,
+        ok,
     }
 }
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct CleanupPhaseStats {
-    pub(super) deleted: DeleteCleanupOutcome,
-    pub(super) cleanup_elapsed_s: f64,
-    pub(super) flush: FlushStats,
+pub(crate) struct CleanupPhaseStats {
+    pub(crate) deleted: DeleteCleanupOutcome,
+    pub(crate) cleanup_elapsed_s: f64,
+    pub(crate) flush: FlushStats,
+    pub(crate) success: bool,
 }
 
-pub(super) struct SyncCleanupPhaseResult {
-    pub(super) stats: CleanupPhaseStats,
-    pub(super) success: bool,
+pub(crate) struct SyncCleanupPhaseResult {
+    pub(crate) stats: CleanupPhaseStats,
+    pub(crate) success: bool,
 }
 
 fn render_cleanup_phase_completion(
@@ -1115,7 +1148,7 @@ fn render_cleanup_phase_completion(
     );
 }
 
-pub(super) fn run_move_cleanup_phase(
+pub(crate) fn run_move_cleanup_phase(
     src_path: &str,
     dst_path: &str,
     src_mnt: &Path,
@@ -1152,16 +1185,18 @@ pub(super) fn run_move_cleanup_phase(
         expected_files,
         expected_bytes,
     );
+    let mut directory_cleanup_ok = true;
     if src_obj_kind == SrcObjKind::Dir {
         let remove_root = (!source_contents_mode) || rename_dir_to_new_path;
         if !use_sudo {
             if let Some(manifest) = transfer_manifest {
-                cleanup_source_dirs_from_manifest(src_mnt, manifest, remove_root, exclude_rel);
+                directory_cleanup_ok =
+                    cleanup_source_dirs_from_manifest(src_mnt, manifest, remove_root, exclude_rel);
             } else {
-                cleanup_source_dirs(src_mnt, remove_root, false, mode);
+                directory_cleanup_ok = cleanup_source_dirs(src_mnt, remove_root, false, mode);
             }
         } else {
-            cleanup_source_dirs(src_mnt, remove_root, true, mode);
+            directory_cleanup_ok = cleanup_source_dirs(src_mnt, remove_root, true, mode);
         }
     }
     let cleanup_elapsed_s = cleanup_start.elapsed().as_secs_f64();
@@ -1177,18 +1212,28 @@ pub(super) fn run_move_cleanup_phase(
         &device_window,
         device_start,
         flush,
-        true,
+        deleted.success && directory_cleanup_ok && flush.ok,
     );
 
-    log(mode, "Cleanup complete.", LogLevel::Info);
+    let success = deleted.success && directory_cleanup_ok && flush.ok;
+    if success {
+        log(mode, "Cleanup complete.", LogLevel::Info);
+    } else {
+        log(
+            mode,
+            "Cleanup completed but source flush failed; source durability is unconfirmed.",
+            LogLevel::Error,
+        );
+    }
     CleanupPhaseStats {
         deleted,
         cleanup_elapsed_s,
         flush,
+        success,
     }
 }
 
-pub(super) fn run_sync_cleanup_phase(
+pub(crate) fn run_sync_cleanup_phase(
     src_path: &str,
     dst_path: &str,
     mode: TransferMode,
@@ -1227,15 +1272,16 @@ pub(super) fn run_sync_cleanup_phase(
         Ok(deleted) => (deleted, None),
         Err(err) => (DeleteCleanupOutcome::default(), Some(err)),
     };
-    let success = cleanup_error.is_none();
+    let deletion_ok = cleanup_error.is_none();
 
-    preserve_directory_times_tree(
+    let metadata_ok = preserve_directory_times_tree(
         src_root,
         dst_base,
         include_root,
         &src_base,
         Some(&manifest.dir_times),
-    );
+    )
+    .is_ok();
     let flush = flush_source_cleanup_writes(&destination_root, false, mode);
     let total_elapsed_s = (cleanup_elapsed_s + flush.elapsed_s).max(1e-6);
     render_cleanup_phase_completion(
@@ -1247,9 +1293,10 @@ pub(super) fn run_sync_cleanup_phase(
         &device_window,
         device_start,
         flush,
-        success,
+        deletion_ok && flush.ok,
     );
 
+    let success = deletion_ok && metadata_ok && flush.ok;
     if success {
         log(mode, "Sync cleanup complete.", LogLevel::Info);
     } else {
@@ -1270,6 +1317,7 @@ pub(super) fn run_sync_cleanup_phase(
             deleted,
             cleanup_elapsed_s,
             flush,
+            success,
         },
         success,
     }

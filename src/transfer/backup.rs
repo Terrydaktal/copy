@@ -1,6 +1,14 @@
 //! Destination backup naming and backup-copy operations.
 
-use super::*;
+use super::command::run_command_capture;
+use super::copy_engine::copy_path_recursive;
+use crate::domain::{LogLevel, TransferMode};
+use crate::output::log;
+use std::ffi::CString;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod libc_time {
     use nix::libc::{localtime_r, time_t, tm};
@@ -32,8 +40,8 @@ mod libc_time {
                 #[cfg(any(target_env = "gnu", target_env = "musl"))]
                 tm_zone: std::ptr::null(),
             };
-            let mut t: time_t = secs as time_t;
-            let ptr = unsafe { localtime_r(&mut t, &mut out) };
+            let t: time_t = secs as time_t;
+            let ptr = unsafe { localtime_r(&t, &mut out) };
             if ptr.is_null() {
                 return None;
             }
@@ -61,7 +69,7 @@ mod libc_time {
     }
 }
 
-pub(super) fn backup_base_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn backup_base_path(path: &Path) -> Option<PathBuf> {
     let src = if path == Path::new("/") {
         return None;
     } else {
@@ -73,7 +81,7 @@ pub(super) fn backup_base_path(path: &Path) -> Option<PathBuf> {
     Some(parent.join(format!("{name}.{now}")))
 }
 
-pub(super) fn chrono_like_stamp() -> String {
+pub(crate) fn chrono_like_stamp() -> String {
     // YYYYMMDD-HHMMSS localtime without external crates.
     // Falls back to unix seconds formatting if conversion fails.
     let now = SystemTime::now();
@@ -89,26 +97,26 @@ pub(super) fn chrono_like_stamp() -> String {
     )
 }
 
-pub(super) fn next_backup_candidate_from_base(base: &Path) -> Option<PathBuf> {
+pub(crate) fn next_backup_candidate_from_base(base: &Path) -> Option<PathBuf> {
     for idx in 0..1000 {
         let candidate = if idx == 0 {
             base.to_path_buf()
         } else {
             PathBuf::from(format!("{}.{}", base.display(), idx))
         };
-        if !candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_err() {
             return Some(candidate);
         }
     }
     None
 }
 
-pub(super) fn plan_backup_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn plan_backup_path(path: &Path) -> Option<PathBuf> {
     let base = backup_base_path(path)?;
     next_backup_candidate_from_base(&base)
 }
 
-pub(super) fn backup_path_with_base(
+pub(crate) fn backup_path_with_base(
     path: &Path,
     use_sudo: bool,
     base: &Path,
@@ -125,7 +133,7 @@ pub(super) fn backup_path_with_base(
         } else {
             PathBuf::from(format!("{}.{}", base.display(), idx))
         };
-        if candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_ok() {
             continue;
         }
 
@@ -140,7 +148,7 @@ pub(super) fn backup_path_with_base(
                 .map(|o| o.code == 0)
                 .unwrap_or(false)
         } else {
-            fs::rename(path, &candidate).is_ok()
+            rename_noreplace(path, &candidate).is_ok()
         };
 
         if ok {
@@ -159,25 +167,109 @@ pub(super) fn backup_path_with_base(
     None
 }
 
-pub(super) fn copy_path_to_backup(
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let source_path = source.to_path_buf();
+        let destination_path = destination.to_path_buf();
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let rc = unsafe {
+            nix::libc::renameat2(
+                nix::libc::AT_FDCWD,
+                source.as_ptr(),
+                nix::libc::AT_FDCWD,
+                destination.as_ptr(),
+                1,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            let err = std::io::Error::last_os_error();
+            if matches!(
+                err.raw_os_error(),
+                Some(nix::libc::EINVAL | nix::libc::ENOSYS | nix::libc::EOPNOTSUPP)
+            ) {
+                if fs::symlink_metadata(&destination_path).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "backup destination already exists",
+                    ));
+                }
+                return fs::rename(source_path, destination_path);
+            }
+            Err(err)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if fs::symlink_metadata(destination).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "backup destination already exists",
+            ));
+        }
+        fs::rename(source, destination)
+    }
+}
+
+pub(crate) fn copy_path_to_backup(
     path: &Path,
     backup_path: &Path,
     use_sudo: bool,
     mode: TransferMode,
 ) -> Option<PathBuf> {
+    let parent = backup_path.parent().unwrap_or_else(|| Path::new("."));
+    let staging_dir = match tempfile::Builder::new()
+        .prefix(".copy-rs-backup-")
+        .tempdir_in(parent)
+    {
+        Ok(dir) => dir,
+        Err(_) => {
+            log(
+                mode,
+                &format!(
+                    "Failed to allocate backup staging area: {}",
+                    backup_path.display()
+                ),
+                LogLevel::Error,
+            );
+            return None;
+        }
+    };
+    let staged = staging_dir.path().join("payload");
     let ok = if use_sudo {
         let cmd = vec![
             "cp".to_string(),
             "-a".to_string(),
             "--".to_string(),
             path.display().to_string(),
-            backup_path.display().to_string(),
+            staged.display().to_string(),
         ];
-        run_command_capture(&cmd, true)
+        let copied = run_command_capture(&cmd, true)
             .map(|o| o.code == 0)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if copied {
+            let mv = vec![
+                "mv".to_string(),
+                "--no-clobber".to_string(),
+                "--".to_string(),
+                staged.display().to_string(),
+                backup_path.display().to_string(),
+            ];
+            run_command_capture(&mv, true)
+                .map(|o| o.code == 0 && fs::symlink_metadata(backup_path).is_ok())
+                .unwrap_or(false)
+        } else {
+            false
+        }
     } else {
-        copy_path_recursive(path, backup_path).is_ok()
+        copy_path_recursive(path, &staged)
+            .and_then(|_| rename_noreplace(&staged, backup_path))
+            .is_ok()
     };
 
     if !ok {

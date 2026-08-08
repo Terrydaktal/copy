@@ -19,6 +19,8 @@ def strip_ansi(text):
 
 def run_copy(args, cwd=None, confirm=False, env=None):
     merged_env = os.environ.copy()
+    # Integration tests must not mutate the user's persisted ETA priors.
+    merged_env.setdefault("COPY_RS_DISABLE_ETA_PRIORS", "1")
     if env:
         merged_env.update(env)
     proc = subprocess.run(
@@ -157,9 +159,9 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(base / "poo" / "sdf", "x\n")
             rc, out, _ = run_copy(["--move", "poo", "..", "-c", "-v"], cwd=base)
             self.assertEqual(rc, 0)
-            self.assertNotIn("No changes detected; nothing to move.", out)
-            self.assertIn("poo/ (removed)", out)
-            self.assertIn("Del(src)", out)
+            self.assertIn("Cancelled.", out)
+            self.assertTrue((base / "poo" / "sdf").exists(), out)
+            self.assertFalse((base.parent / "poo" / "sdf").exists(), out)
 
     def test_move_same_slot_to_parent_with_contents_only_and_overwrite_is_not_noop(self):
         with tempfile.TemporaryDirectory() as td:
@@ -167,8 +169,9 @@ class CopyCliIntegrationTests(unittest.TestCase):
             write_file(base / "poo" / "sdf", "x\n")
             rc, out, _ = run_copy(["--move", "poo", "..", "-c", "-o", "-v"], cwd=base)
             self.assertEqual(rc, 0)
-            self.assertNotIn("No changes detected; nothing to move.", out)
-            self.assertIn("poo/ (removed)", out)
+            self.assertIn("Cancelled.", out)
+            self.assertTrue((base / "poo" / "sdf").exists(), out)
+            self.assertFalse((base.parent / "poo" / "sdf").exists(), out)
 
     def test_copy_directory_default_nests_under_destination(self):
         with tempfile.TemporaryDirectory() as td:
@@ -538,12 +541,10 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertIn("Starting move cleanup:", out)
             self.assertNotIn("Starting move (", out)
             self.assertNotIn("Progress: ---%", out)
-            self.assertRegex(out, r"Cleanup:\s+\d+\.\d+%")
-            self.assertIn("Cleanup:", out)
-            self.assertIn("Average delete speed:", out)
-            self.assertIn("Average read speed:", out)
-            self.assertIn("Average write speed:", out)
-            self.assertIn("(total)", out)
+            self.assertIn("Delete", out)
+            self.assertIn("Cleanup Duration:", out)
+            self.assertIn("Cleanup Flush Duration:", out)
+            self.assertIn("Total Duration:", out)
 
     def test_move_contents_only_transfers_symlink_and_removes_source(self):
         with tempfile.TemporaryDirectory() as td:
@@ -989,17 +990,17 @@ class CopyCliIntegrationTests(unittest.TestCase):
             self.assertNotEqual(rc, 0)
             self.assertIn("unrecognized arguments: -vv", out)
 
-    def test_double_verbose_expands_new_directories_all_levels(self):
+    def test_verbose_keeps_default_tree_depth(self):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "src" / "A"
             dst = Path(td) / "dst"
             for i in range(8):
                 write_file(src / "newdir" / f"n{i}.txt", f"{i}\n")
             dst.mkdir(parents=True)
-            rc, out, _ = run_copy(["-vv", "-c", str(src), str(dst)])
+            rc, out, _ = run_copy(["-v", "-c", str(src), str(dst)])
             self.assertEqual(rc, 0, out)
             for i in range(8):
-                self.assertIn(f"n{i}.txt", out, msg=out)
+                self.assertNotIn(f"n{i}.txt", out, msg=out)
 
     def test_regular_files_summary_uses_new_modified_identical_uncollided(self):
         with tempfile.TemporaryDirectory() as td:

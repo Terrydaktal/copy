@@ -1,74 +1,23 @@
 //! Preview trees, change summaries, and terminal tree rendering.
+#![allow(clippy::too_many_arguments)]
 
-use super::*;
-
-pub(super) fn dev_media_kind(path: &Path) -> MediaKind {
-    let mut probe = path;
-    let md = loop {
-        if let Ok(md) = fs::metadata(probe) {
-            break md;
-        }
-        probe = match probe.parent() {
-            Some(parent) if parent != probe => parent,
-            _ => return MediaKind::Other,
-        };
-    };
-    let dev = md.dev();
-    let maj = major(dev);
-    let min = minor(dev);
-    let sys_link = PathBuf::from(format!("/sys/dev/block/{maj}:{min}"));
-    let canon = match fs::canonicalize(&sys_link) {
-        Ok(c) => c,
-        Err(_) => return MediaKind::Other,
-    };
-
-    let mut rotational: Option<bool> = None;
-    let mut saw_nvme = false;
-
-    for anc in canon.ancestors() {
-        if let Some(name) = anc.file_name() {
-            let n = name.to_string_lossy();
-            if n.starts_with("nvme") {
-                saw_nvme = true;
-            }
-            let q = Path::new("/sys/class/block")
-                .join(n.as_ref())
-                .join("queue/rotational");
-            if let Ok(s) = fs::read_to_string(&q) {
-                let t = s.trim();
-                if t == "0" {
-                    rotational = Some(false);
-                    if n.starts_with("nvme") {
-                        saw_nvme = true;
-                    }
-                    break;
-                }
-                if t == "1" {
-                    rotational = Some(true);
-                    break;
-                }
-            }
-        }
-    }
-
-    match rotational {
-        Some(true) => MediaKind::Hdd,
-        Some(false) if saw_nvme => MediaKind::Nvme,
-        Some(false) => MediaKind::Other,
-        None if canon.to_string_lossy().contains("/nvme") => MediaKind::Nvme,
-        _ => MediaKind::Other,
-    }
-}
+use crate::domain::{ChangeItem, ChangeKind, SrcObjKind};
+use crate::output::{ENDC, FAIL, LIGHT_TEAL, OKGREEN, WARNING, WHITE};
+use rustc_hash::FxHashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Default, Clone)]
-pub(super) struct TreeNode {
+pub(crate) struct TreeNode {
     children: FxHashMap<String, TreeNode>,
     state: Option<String>,
     is_dir: bool,
     explicit_added_dir: bool,
 }
 
-pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
+pub(crate) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
     let mut root = TreeNode {
         children: FxHashMap::default(),
         state: None,
@@ -160,7 +109,7 @@ pub(super) fn build_change_tree(items: &[ChangeItem]) -> TreeNode {
 }
 
 #[derive(Clone)]
-pub(super) struct LevelEntry<'a> {
+pub(crate) struct LevelEntry<'a> {
     name: String,
     state: String,
     is_dir: bool,
@@ -168,7 +117,7 @@ pub(super) struct LevelEntry<'a> {
 }
 
 #[derive(Default, Clone, Copy)]
-pub(super) struct HiddenStateCounts {
+pub(crate) struct HiddenStateCounts {
     new_count: usize,
     modified_count: usize,
     identical_count: usize,
@@ -186,7 +135,7 @@ impl HiddenStateCounts {
     }
 }
 
-pub(super) fn join_rel(parent: &str, name: &str) -> String {
+pub(crate) fn join_rel(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()
     } else {
@@ -194,7 +143,7 @@ pub(super) fn join_rel(parent: &str, name: &str) -> String {
     }
 }
 
-pub(super) fn remap_item_under_prefix(item: &str, prefix: &str) -> String {
+pub(crate) fn remap_item_under_prefix(item: &str, prefix: &str) -> String {
     if item.is_empty() {
         return format!("{prefix}/");
     }
@@ -205,7 +154,7 @@ pub(super) fn remap_item_under_prefix(item: &str, prefix: &str) -> String {
     }
 }
 
-pub(super) fn remap_path_set_under_prefix(
+pub(crate) fn remap_path_set_under_prefix(
     paths: &HashSet<String>,
     prefix: &str,
 ) -> HashSet<String> {
@@ -219,7 +168,7 @@ pub(super) fn remap_path_set_under_prefix(
         .collect()
 }
 
-pub(super) fn state_sort_priority(state: &str) -> u8 {
+pub(crate) fn state_sort_priority(state: &str) -> u8 {
     match state {
         "modified" | "replaced" => 0,
         "added" => 1,
@@ -230,7 +179,7 @@ pub(super) fn state_sort_priority(state: &str) -> u8 {
     }
 }
 
-pub(super) fn collect_level_entries<'a>(
+pub(crate) fn collect_level_entries<'a>(
     abs_dir: &Path,
     node: Option<&'a TreeNode>,
     extra: &HashMap<String, String>,
@@ -282,15 +231,13 @@ pub(super) fn collect_level_entries<'a>(
             state = child.and_then(|c| c.state.clone());
         }
         let mut state = state.unwrap_or_else(|| "unchanged".to_string());
-        if state == "unchanged" {
-            if !source_display_paths.is_empty() {
-                let rel = join_rel(rel_prefix, &name);
-                state = if source_display_paths.contains(rel.as_str()) {
-                    "identical".to_string()
-                } else {
-                    "uncollided".to_string()
-                };
-            }
+        if state == "unchanged" && !source_display_paths.is_empty() {
+            let rel = join_rel(rel_prefix, &name);
+            state = if source_display_paths.contains(rel.as_str()) {
+                "identical".to_string()
+            } else {
+                "uncollided".to_string()
+            };
         }
         let full = abs_dir.join(&name);
         let is_dir = child
@@ -307,7 +254,7 @@ pub(super) fn collect_level_entries<'a>(
     out
 }
 
-pub(super) fn select_level_entries<'a>(
+pub(crate) fn select_level_entries<'a>(
     entries: &[LevelEntry<'a>],
     max_entries: usize,
     include_unchanged: bool,
@@ -358,7 +305,7 @@ pub(super) fn select_level_entries<'a>(
     (selected, hidden)
 }
 
-pub(super) fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
+pub(crate) fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String {
     let suffix = if entry.is_dir { "/" } else { "" };
     if row_kind == Some("replaced_old") {
         return format!("{FAIL}{}{} (old){ENDC}", entry.name, suffix);
@@ -376,7 +323,7 @@ pub(super) fn format_entry(entry: &LevelEntry, row_kind: Option<&str>) -> String
     }
 }
 
-pub(super) fn render_showall_level(
+pub(crate) fn render_showall_level(
     abs_dir: &Path,
     node: Option<&TreeNode>,
     prefix: &str,
@@ -481,7 +428,7 @@ pub(super) fn render_showall_level(
     true
 }
 
-pub(super) fn render_showall_tree_to_string_with_cache(
+pub(crate) fn render_showall_tree_to_string_with_cache(
     preview_root: &Path,
     tree: &TreeNode,
     source_display_paths: &HashSet<String>,
@@ -535,7 +482,7 @@ pub(super) fn render_showall_tree_to_string_with_cache(
     Some(out)
 }
 
-pub(super) struct TopPreviewData {
+pub(crate) struct TopPreviewData {
     root: PathBuf,
     top_states: HashMap<String, String>,
     top_is_dir: HashMap<String, bool>,
@@ -684,7 +631,7 @@ fn collect_top_level_preview_with_cache(
     }
 }
 
-pub(super) fn collect_source_top_entries(
+pub(crate) fn collect_source_top_entries(
     src_mnt: &Path,
     src_obj_kind: SrcObjKind,
     include_root: bool,
@@ -695,9 +642,9 @@ pub(super) fn collect_source_top_entries(
     let mut out = HashSet::new();
     let rename_target_name = simple_rename_dst
         .or_else(|| {
-            if src_obj_kind == SrcObjKind::Dir && rename_target_is_dir {
-                rename_target_only
-            } else if src_obj_kind == SrcObjKind::File {
+            if (src_obj_kind == SrcObjKind::Dir && rename_target_is_dir)
+                || src_obj_kind == SrcObjKind::File
+            {
                 rename_target_only
             } else {
                 None
@@ -735,7 +682,7 @@ pub(super) fn collect_source_top_entries(
     out
 }
 
-pub(super) fn render_changed_top_preview_to_string_with_cache(
+pub(crate) fn render_changed_top_preview_to_string_with_cache(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
@@ -759,11 +706,7 @@ pub(super) fn render_changed_top_preview_to_string_with_cache(
         dir_cache.take(),
     );
 
-    let mut visible_ordered_names: Vec<(&String, &String)> = d
-        .top_states
-        .iter()
-        .map(|(name, state)| (name, state))
-        .collect();
+    let mut visible_ordered_names: Vec<(&String, &String)> = d.top_states.iter().collect();
     let compare_top = |(name_a, state_a): &(&String, &String),
                        (name_b, state_b): &(&String, &String)| {
         state_sort_priority(state_a.as_str())
@@ -814,7 +757,7 @@ pub(super) fn render_changed_top_preview_to_string_with_cache(
         ) {
             let _ = writeln!(out, "... and {summary}");
         }
-        return out;
+        out
     } else {
         let mut out = String::new();
         let mut rows: Vec<(String, String, bool)> = Vec::new();
@@ -874,11 +817,11 @@ pub(super) fn render_changed_top_preview_to_string_with_cache(
         ) {
             let _ = writeln!(out, "... and {summary}");
         }
-        return out;
+        out
     }
 }
 
-pub(super) fn print_changed_top_preview(
+pub(crate) fn print_changed_top_preview(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
@@ -903,7 +846,7 @@ pub(super) fn print_changed_top_preview(
     );
 }
 
-pub(super) fn print_changed_top_preview_with_cache(
+pub(crate) fn print_changed_top_preview_with_cache(
     preview_root: &Path,
     preview_items: &[ChangeItem],
     source_top_entries: &HashSet<String>,
@@ -931,7 +874,7 @@ pub(super) fn print_changed_top_preview_with_cache(
     println!();
 }
 
-pub(super) fn format_hidden_top_summary(
+pub(crate) fn format_hidden_top_summary(
     hidden_new: usize,
     hidden_modified: usize,
     hidden_identical: usize,
@@ -1017,5 +960,30 @@ mod tests {
                 .and_then(|node| node.state.as_deref()),
             Some("modified")
         );
+    }
+}
+
+#[cfg(test)]
+mod hidden_summary_tests {
+    use super::*;
+    #[test]
+    fn format_hidden_top_summary_uses_requested_order_with_deleted_suffix() {
+        let line = format_hidden_top_summary(1, 1, 1, 1, 1, false).expect("summary");
+        assert_eq!(
+            line,
+            "1 more new 1 more modified 1 more identical 1 more uncollided 1 more deleted"
+        );
+    }
+
+    #[test]
+    fn format_hidden_top_summary_omits_zero_categories() {
+        let line = format_hidden_top_summary(0, 0, 0, 4, 0, false).expect("summary");
+        assert_eq!(line, "4 more uncollided");
+    }
+
+    #[test]
+    fn format_hidden_top_summary_combines_identical_and_unchanged_when_requested() {
+        let line = format_hidden_top_summary(0, 0, 3, 4, 0, true).expect("summary");
+        assert_eq!(line, "7 more identical/uncollided");
     }
 }

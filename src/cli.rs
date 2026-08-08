@@ -1,34 +1,50 @@
 //! Command-line parsing and help text.
 
-use super::*;
+use crate::domain::MergeCollisionPolicy;
+use crate::plan::parse_merge_collision_policy;
+use std::env;
+use std::ffi::OsString;
 
 #[derive(Default)]
-pub(super) struct CliArgs {
-    pub(super) source: String,
-    pub(super) destination: String,
-    pub(super) extra: Vec<String>,
-    pub(super) move_mode: bool,
-    pub(super) sudo: bool,
-    pub(super) overwrite: bool,
-    pub(super) contents_only: bool,
-    pub(super) create_destination_parents: bool,
-    pub(super) backup: bool,
-    pub(super) sync_mode: bool,
-    pub(super) showall: bool,
-    pub(super) tree_depth: Option<usize>,
-    pub(super) tree_trunc: usize,
-    pub(super) preview_only: bool,
-    pub(super) preview_lite: bool,
-    pub(super) replace_dest_symlink: bool,
-    pub(super) merge_collision_policy: MergeCollisionPolicy,
+pub(crate) struct CliArgs {
+    pub(crate) source: String,
+    pub(crate) destination: String,
+    pub(crate) extra: Vec<String>,
+    pub(crate) move_mode: bool,
+    pub(crate) sudo: bool,
+    pub(crate) overwrite: bool,
+    pub(crate) contents_only: bool,
+    pub(crate) create_destination_parents: bool,
+    pub(crate) backup: bool,
+    pub(crate) sync_mode: bool,
+    pub(crate) showall: bool,
+    pub(crate) tree_depth: Option<usize>,
+    pub(crate) tree_trunc: usize,
+    pub(crate) preview_only: bool,
+    pub(crate) preview_lite: bool,
+    pub(crate) replace_dest_symlink: bool,
+    pub(crate) merge_collision_policy: MergeCollisionPolicy,
 }
-pub(super) fn usage() {
+pub(crate) fn usage() {
     eprintln!(
         "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
 }
 
-pub(super) fn print_help() {
+fn set_merge_collision_policy(args: &mut CliArgs, policy: MergeCollisionPolicy) -> Result<(), i32> {
+    if args.merge_collision_policy != MergeCollisionPolicy::default()
+        && args.merge_collision_policy != policy
+    {
+        usage();
+        eprintln!("copy: error: collision policy options are mutually exclusive");
+        return Err(1);
+    }
+    args.merge_collision_policy = policy;
+    Ok(())
+}
+
+#[allow(clippy::print_literal)]
+pub(crate) fn print_help() {
     println!(
         "usage: copy [-h] [-m] [-s] [-o] [-c] [--create-destination-parents] [-b] [--sync] [--replace-dest-symlink] [-v|--verbose|--showall] [-L depth] [-T trunc] [--preview] [--preview-lite] source... destination"
     );
@@ -47,7 +63,7 @@ pub(super) fn print_help() {
     println!("options:");
     println!("  -h, --help            show this help message and exit");
     println!("  -m, --move            Move mode: transfer then remove source data (equivalent to move behavior).");
-    println!("  -s, --sudo            Run transfer commands with sudo");
+    println!("  -s, --sudo            Run privileged transfer commands through pkexec");
     println!(
         "  -o, --overwrite       Replace the destination target itself instead of merging it."
     );
@@ -74,7 +90,7 @@ pub(super) fn print_help() {
     println!("                        Examples: --collision source:always");
     println!("                                  --collision source:newer,larger");
     println!("                                  --collision dest:newer+larger");
-    println!("  -L depth              Max depth of preview tree (default: auto-fit deepest level within 27 lines, up to 20).");
+    println!("  -L depth              Max depth of preview tree (default: 1).");
     println!("  -T trunc              Max entries per folder before truncation (default: 25).");
     println!("  --replace-dest-symlink");
     println!(
@@ -82,6 +98,9 @@ pub(super) fn print_help() {
     );
     println!("  --preview             Run preview only (no prompt, no transfer).");
     println!("  --preview-lite        Faster preview-only mode; skips exact byte scan on brand-new destination trees.");
+    println!(
+        "  --                    End options; paths beginning with '-' are treated as operands."
+    );
     println!();
     println!("decision tree:");
     println!(
@@ -154,18 +173,32 @@ What is S?
     );
 }
 
-pub(super) fn parse_args() -> Result<CliArgs, i32> {
+pub(crate) fn parse_args() -> Result<CliArgs, i32> {
     let mut args = CliArgs {
         tree_trunc: 25,
         ..CliArgs::default()
     };
     let mut positional: Vec<String> = Vec::new();
-    let argv: Vec<String> = env::args().skip(1).collect();
+    let argv: Vec<OsString> = env::args_os().skip(1).collect();
     let mut i = 0usize;
+    let mut options_done = false;
 
     while i < argv.len() {
-        let raw = &argv[i];
-        match raw.as_str() {
+        let raw = match argv[i].to_str() {
+            Some(raw) => raw,
+            None => {
+                usage();
+                eprintln!("copy: error: non-UTF-8 command-line paths are not supported; refusing to continue");
+                return Err(1);
+            }
+        };
+        if options_done {
+            positional.push(raw.to_string());
+            i += 1;
+            continue;
+        }
+        match raw {
+            "--" => options_done = true,
             "-h" | "--help" => {
                 print_help();
                 return Err(0);
@@ -186,14 +219,19 @@ pub(super) fn parse_args() -> Result<CliArgs, i32> {
                     eprintln!("copy: error: --collision requires an argument");
                     return Err(1);
                 }
-                let policy = match parse_merge_collision_policy(&argv[i]) {
+                let value = match argv[i].to_str() {
+                    Some(value) => value,
+                    None => {
+                        usage();
+                        eprintln!("copy: error: --collision value is not valid UTF-8");
+                        return Err(1);
+                    }
+                };
+                let policy = match parse_merge_collision_policy(value) {
                     Ok(v) => v,
                     Err(msg) => {
                         usage();
-                        eprintln!(
-                            "copy: error: invalid --collision value '{}': {msg}",
-                            argv[i]
-                        );
+                        eprintln!("copy: error: invalid --collision value '{}': {msg}", value);
                         return Err(1);
                     }
                 };
@@ -206,9 +244,12 @@ pub(super) fn parse_args() -> Result<CliArgs, i32> {
                     eprintln!("copy: error: -L requires an argument");
                     return Err(1);
                 }
-                match argv[i].parse::<usize>() {
-                    Ok(v) => args.tree_depth = Some(v),
-                    Err(_) => {
+                match argv[i]
+                    .to_str()
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    Some(v) => args.tree_depth = Some(v),
+                    None => {
                         usage();
                         eprintln!("copy: error: -L argument must be a positive integer");
                         return Err(1);
@@ -222,9 +263,12 @@ pub(super) fn parse_args() -> Result<CliArgs, i32> {
                     eprintln!("copy: error: -T requires an argument");
                     return Err(1);
                 }
-                match argv[i].parse::<usize>() {
-                    Ok(v) => args.tree_trunc = v,
-                    Err(_) => {
+                match argv[i]
+                    .to_str()
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    Some(v) => args.tree_trunc = v,
+                    None => {
                         usage();
                         eprintln!("copy: error: -T argument must be a positive integer");
                         return Err(1);
@@ -238,7 +282,7 @@ pub(super) fn parse_args() -> Result<CliArgs, i32> {
                 eprintln!("copy: error: unrecognized arguments: {raw}");
                 return Err(1);
             }
-            _ => positional.push(raw.clone()),
+            _ => positional.push(raw.to_string()),
         }
         i += 1;
     }

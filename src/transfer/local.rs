@@ -1,6 +1,38 @@
 //! Local Rust-backend transfer execution and worker coordination.
+#![allow(clippy::too_many_arguments)]
 
-use super::*;
+use super::copy_engine::{
+    copy_file_preserve_atomic_with_progress_buf, copy_file_preserve_with_progress_buf,
+    copy_hardlink_atomic, copy_symlink_atomic, ensure_directory_target,
+    preserve_directory_times_tree,
+};
+use super::telemetry::{counter_delta, device_io_deltas, proc_io_deltas};
+use crate::domain::{
+    AtomicEtaProgress, DeviceIoWindow, EtaWorkload, InflightWriteLimiter, LogLevel, MediaKind,
+    MergeCollisionPolicy, ProcessIoWindow, ProgressSnapshot, SrcObjKind, TransferManifest,
+    TransferMode, TransferOutcome, TransferProgressRates,
+};
+use crate::output::{
+    log, print_transfer_columns_header, print_transfer_progress_bars, TransferEtaEstimator,
+};
+use crate::plan::{
+    map_dir_dest, normalize_rel, regular_file_collision_change, rel_matches_prefix,
+    sync_regular_file_change,
+};
+use crate::runtime::{
+    acquire_file_write_permit, copy_chunk_bytes_for_media, inflight_max_bytes_for_media,
+    symlink_targets_equal, transfer_profile_key,
+};
+use jwalk::WalkDir;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn remember_transfer_error(
     errors: &Arc<Mutex<Option<String>>>,
@@ -16,7 +48,7 @@ fn remember_transfer_error(
     }
 }
 
-pub(super) fn run_rust_transfer(
+pub(crate) fn run_rust_transfer(
     src_path: &str,
     dst_path: &str,
     src_obj_kind: SrcObjKind,
@@ -41,14 +73,20 @@ pub(super) fn run_rust_transfer(
             EtaWorkload::from_manifest(
                 m,
                 src_obj_kind == SrcObjKind::Dir && !src_path.ends_with('/'),
+                media,
+                transfer_profile_key(Path::new(src_path), Path::new(dst_path)),
             )
         })
         .or_else(|| {
             (src_obj_kind == SrcObjKind::File)
                 .then(|| {
-                    fs::symlink_metadata(src_path)
-                        .ok()
-                        .map(|meta| EtaWorkload::from_file(meta.len()))
+                    fs::symlink_metadata(src_path).ok().map(|meta| {
+                        EtaWorkload::from_file(
+                            meta.len(),
+                            media,
+                            transfer_profile_key(Path::new(src_path), Path::new(dst_path)),
+                        )
+                    })
                 })
                 .flatten()
         });
@@ -64,7 +102,7 @@ pub(super) fn run_rust_transfer(
     let device_start_totals_for_ticker = device_start_totals;
     let src_path_for_ticker = src_path.to_string();
     let dst_path_for_ticker = dst_path.to_string();
-    let eta_workload_for_ticker = eta_workload;
+    let eta_workload_for_ticker = eta_workload.clone();
     let eta_progress_for_ticker = Arc::clone(&eta_progress);
 
     let done_for_ticker = Arc::clone(&done);
@@ -118,7 +156,7 @@ pub(super) fn run_rust_transfer(
                         io_rates,
                         io_delta,
                         device_delta,
-                        eta_workload_for_ticker,
+                        eta_workload_for_ticker.clone(),
                         Some(eta_progress_for_ticker.snapshot()),
                         Some(&mut eta_estimator),
                         false,
@@ -171,7 +209,7 @@ pub(super) fn run_rust_transfer(
                 final_io_rates,
                 io_delta,
                 device_delta,
-                eta_workload,
+                eta_workload.clone(),
                 Some(eta_progress.snapshot()),
                 None,
                 true,
@@ -198,7 +236,7 @@ pub(super) fn run_rust_transfer(
                     rates: final_io_rates,
                     proc_deltas: io_delta,
                     device_deltas: device_delta,
-                    eta_workload,
+                    eta_workload: eta_workload.clone(),
                     eta_progress: Some(eta_progress.snapshot()),
                 }),
             };
@@ -230,12 +268,15 @@ pub(super) fn run_rust_transfer(
             if src_lmd.file_type().is_symlink() {
                 let needs_copy = !symlink_targets_equal(src, dst);
                 if needs_copy {
-                    if let Err(err) = copy_symlink(src, dst) {
+                    if let Err(err) = copy_symlink_atomic(src, dst) {
                         remember_transfer_error(&transfer_errors, "copy symlink", src, &err);
                         finish_transfer!(1);
                     }
                 }
                 eta_progress.mark_file(0);
+                if let Some(workload) = eta_workload.as_ref() {
+                    workload.mark_operation(0);
+                }
                 finish_transfer!(0);
             }
             let src_meta = match fs::metadata(src) {
@@ -247,6 +288,16 @@ pub(super) fn run_rust_transfer(
             };
             let src_mtime = src_meta.modified().ok();
             let dst_lmd = fs::symlink_metadata(dst).ok();
+            if dst_lmd
+                .as_ref()
+                .map(|meta| meta.file_type().is_dir())
+                .unwrap_or(false)
+                && !sync_mode
+            {
+                let err = io::Error::new(io::ErrorKind::IsADirectory, "Is a directory");
+                remember_transfer_error(&transfer_errors, "copy file", dst, &err);
+                finish_transfer!(1);
+            }
             let dst_is_symlink = dst_lmd
                 .as_ref()
                 .map(|md| md.file_type().is_symlink())
@@ -271,31 +322,30 @@ pub(super) fn run_rust_transfer(
             if needs_copy {
                 let _permit =
                     acquire_file_write_permit(inflight_limiter.as_ref(), src_meta.len(), media);
-                if replace_dest_symlink
-                    && fs::symlink_metadata(dst)
-                        .map(|md| md.file_type().is_symlink())
-                        .unwrap_or(false)
-                {
-                    if let Err(err) = fs::remove_file(dst) {
-                        remember_transfer_error(
-                            &transfer_errors,
-                            "remove destination symlink",
-                            dst,
-                            &err,
-                        );
-                    }
-                    finish_transfer!(1);
-                }
-                if let Err(err) =
+                let copy_result = if dst_is_symlink && !replace_dest_symlink {
                     copy_file_preserve_with_progress_buf(src, dst, copy_buf_bytes, |n| {
                         done.fetch_add(n, Ordering::Relaxed);
                     })
-                {
+                } else {
+                    copy_file_preserve_atomic_with_progress_buf(
+                        src,
+                        dst,
+                        media,
+                        copy_buf_bytes,
+                        |n| {
+                            done.fetch_add(n, Ordering::Relaxed);
+                        },
+                    )
+                };
+                if let Err(err) = copy_result {
                     remember_transfer_error(&transfer_errors, "copy file", src, &err);
                     finish_transfer!(1);
                 }
             }
             eta_progress.mark_file(src_meta.len());
+            if let Some(workload) = eta_workload.as_ref() {
+                workload.mark_operation(0);
+            }
         }
         SrcObjKind::Dir => {
             let src_no_trailing = src_path.trim_end_matches('/');
@@ -319,20 +369,21 @@ pub(super) fn run_rust_transfer(
                     finish_transfer!(1);
                 }
                 eta_progress.mark_dir();
-            } else {
-                if let Err(err) = ensure_directory_target(dst_base, sync_mode) {
-                    remember_transfer_error(
-                        &transfer_errors,
-                        "create destination directory",
-                        dst_base,
-                        &err,
-                    );
-                    finish_transfer!(1);
+                if let Some(workload) = eta_workload.as_ref() {
+                    workload.mark_operation(0);
                 }
+            } else if let Err(err) = ensure_directory_target(dst_base, sync_mode) {
+                remember_transfer_error(
+                    &transfer_errors,
+                    "create destination directory",
+                    dst_base,
+                    &err,
+                );
+                finish_transfer!(1);
             }
 
             if let Some(m) = manifest {
-                for rel in &m.dirs {
+                for (dir_index, rel) in m.dirs.iter().enumerate() {
                     let (dst_dir, _) = map_dir_dest(include_root, &src_base, rel, dst_base);
                     if let Err(err) = ensure_directory_target(&dst_dir, sync_mode) {
                         remember_transfer_error(
@@ -344,11 +395,18 @@ pub(super) fn run_rust_transfer(
                         finish_transfer!(1);
                     }
                     eta_progress.mark_dir();
+                    if let Some(workload) = eta_workload.as_ref() {
+                        workload.mark_operation(usize::from(include_root) + dir_index);
+                    }
                 }
+                let hardlink_anchors =
+                    Arc::new(Mutex::new(FxHashMap::<(u64, u64), PathBuf>::default()));
+                let hardlink_copy_lock = Arc::new(Mutex::new(()));
                 let copy_ok = m
                     .copy_files
                     .par_iter()
-                    .map(|entry| {
+                    .enumerate()
+                    .map(|(file_index, entry)| {
                         let src_file = src_root.join(&*entry.rel);
                         let (dst_item, _) =
                             map_dir_dest(include_root, &src_base, &entry.rel, dst_base);
@@ -364,15 +422,62 @@ pub(super) fn run_rust_transfer(
                                 return false;
                             }
                         };
+                        if fs::symlink_metadata(&dst_item)
+                            .map(|meta| meta.file_type().is_dir())
+                            .unwrap_or(false)
+                            && !sync_mode
+                        {
+                            let err = io::Error::new(io::ErrorKind::IsADirectory, "Is a directory");
+                            remember_transfer_error(&transfer_errors, "copy file", &src_file, &err);
+                            return false;
+                        }
+                        let hardlink_key = (!entry.is_symlink && entry.nlink > 1)
+                            .then_some((entry.dev, entry.ino));
+                        // A hardlink anchor must be published before another
+                        // member is copied. Serialize only hardlinked files;
+                        // unrelated files remain parallel.
+                        let _hardlink_guard =
+                            hardlink_key.and_then(|_| hardlink_copy_lock.lock().ok());
+                        if let Some(key) = hardlink_key {
+                            let anchor = hardlink_anchors
+                                .lock()
+                                .ok()
+                                .and_then(|anchors| anchors.get(&key).cloned());
+                            if let Some(anchor) = anchor {
+                                match copy_hardlink_atomic(&anchor, &dst_item) {
+                                    Ok(()) => {
+                                        eta_progress.mark_file(0);
+                                        if let Some(workload) = eta_workload.as_ref() {
+                                            workload.mark_operation(
+                                                usize::from(include_root)
+                                                    + m.dirs.len()
+                                                    + file_index,
+                                            );
+                                        }
+                                        return true;
+                                    }
+                                    Err(err) => {
+                                        remember_transfer_error(
+                                            &transfer_errors,
+                                            "create hardlink",
+                                            &dst_item,
+                                            &err,
+                                        );
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
                         if src_md.file_type().is_symlink() {
-                            let result = if sync_mode {
-                                copy_symlink_atomic(&src_file, &dst_item)
-                            } else {
-                                copy_symlink(&src_file, &dst_item)
-                            };
+                            let result = copy_symlink_atomic(&src_file, &dst_item);
                             match result {
                                 Ok(()) => {
                                     eta_progress.mark_file(0);
+                                    if let Some(workload) = eta_workload.as_ref() {
+                                        workload.mark_operation(
+                                            usize::from(include_root) + m.dirs.len() + file_index,
+                                        );
+                                    }
                                     true
                                 }
                                 Err(err) => {
@@ -426,6 +531,11 @@ pub(super) fn run_rust_transfer(
                             };
                             if !needs_copy {
                                 eta_progress.mark_file(src_md.len());
+                                if let Some(workload) = eta_workload.as_ref() {
+                                    workload.mark_operation(
+                                        usize::from(include_root) + m.dirs.len() + file_index,
+                                    );
+                                }
                                 return true;
                             }
                             let _permit = acquire_file_write_permit(
@@ -433,22 +543,7 @@ pub(super) fn run_rust_transfer(
                                 src_md.len(),
                                 media,
                             );
-                            if replace_dest_symlink
-                                && fs::symlink_metadata(&dst_item)
-                                    .map(|md| md.file_type().is_symlink())
-                                    .unwrap_or(false)
-                            {
-                                if let Err(err) = fs::remove_file(&dst_item) {
-                                    remember_transfer_error(
-                                        &transfer_errors,
-                                        "remove destination symlink",
-                                        &dst_item,
-                                        &err,
-                                    );
-                                    return false;
-                                }
-                            }
-                            let result = if sync_mode {
+                            let result = if sync_mode || replace_dest_symlink || !dst_is_symlink {
                                 copy_file_preserve_atomic_with_progress_buf(
                                     &src_file,
                                     &dst_item,
@@ -472,7 +567,17 @@ pub(super) fn run_rust_transfer(
                             };
                             match result {
                                 Ok(()) => {
+                                    if let Some(key) = hardlink_key {
+                                        if let Ok(mut anchors) = hardlink_anchors.lock() {
+                                            anchors.entry(key).or_insert_with(|| dst_item.clone());
+                                        }
+                                    }
                                     eta_progress.mark_file(src_md.len());
+                                    if let Some(workload) = eta_workload.as_ref() {
+                                        workload.mark_operation(
+                                            usize::from(include_root) + m.dirs.len() + file_index,
+                                        );
+                                    }
                                     true
                                 }
                                 Err(err) => {
@@ -493,13 +598,29 @@ pub(super) fn run_rust_transfer(
                 if !copy_ok {
                     finish_transfer!(1);
                 }
-                preserve_directory_times_tree(
+                if let Err(err) = preserve_directory_times_tree(
                     src_root,
                     dst_base,
                     include_root,
                     &src_base,
                     manifest.map(|m| m.dir_times.as_slice()),
-                );
+                ) {
+                    remember_transfer_error(
+                        &transfer_errors,
+                        "preserve directory metadata",
+                        src_root,
+                        &err,
+                    );
+                    finish_transfer!(1);
+                }
+                eta_progress.mark_metadata(m.dir_times.len() as u64);
+                if let Some(workload) = eta_workload.as_ref() {
+                    let metadata_start =
+                        usize::from(include_root) + m.dirs.len() + m.copy_files.len();
+                    for index in 0..m.dir_times.len() {
+                        workload.mark_operation(metadata_start + index);
+                    }
+                }
             } else {
                 let mut entries: Vec<PathBuf> = WalkDir::new(src_root)
                     .sort(false)
@@ -538,7 +659,7 @@ pub(super) fn run_rust_transfer(
                     }
                     if md.file_type().is_symlink() {
                         let needs_copy = !symlink_targets_equal(&p, &dst_item);
-                        if needs_copy && copy_symlink(&p, &dst_item).is_err() {
+                        if needs_copy && copy_symlink_atomic(&p, &dst_item).is_err() {
                             finish_transfer!(1);
                         }
                         eta_progress.mark_file(0);
@@ -573,36 +694,47 @@ pub(super) fn run_rust_transfer(
                     if needs_copy {
                         let _permit =
                             acquire_file_write_permit(inflight_limiter.as_ref(), md.len(), media);
-                        if replace_dest_symlink
-                            && fs::symlink_metadata(&dst_item)
-                                .map(|meta| meta.file_type().is_symlink())
-                                .unwrap_or(false)
-                            && fs::remove_file(&dst_item).is_err()
-                        {
-                            finish_transfer!(1);
-                        }
-                        if copy_file_preserve_with_progress_buf(
-                            &p,
-                            &dst_item,
-                            copy_buf_bytes,
-                            |n| {
-                                done.fetch_add(n, Ordering::Relaxed);
-                            },
-                        )
-                        .is_err()
-                        {
+                        let copy_result = if dst_is_symlink && !replace_dest_symlink {
+                            copy_file_preserve_with_progress_buf(
+                                &p,
+                                &dst_item,
+                                copy_buf_bytes,
+                                |n| {
+                                    done.fetch_add(n, Ordering::Relaxed);
+                                },
+                            )
+                        } else {
+                            copy_file_preserve_atomic_with_progress_buf(
+                                &p,
+                                &dst_item,
+                                media,
+                                copy_buf_bytes,
+                                |n| {
+                                    done.fetch_add(n, Ordering::Relaxed);
+                                },
+                            )
+                        };
+                        if copy_result.is_err() {
                             finish_transfer!(1);
                         }
                     }
                     eta_progress.mark_file(md.len());
                 }
-                preserve_directory_times_tree(
+                if let Err(err) = preserve_directory_times_tree(
                     src_root,
                     dst_base,
                     include_root,
                     &src_base,
                     manifest.map(|m| m.dir_times.as_slice()),
-                );
+                ) {
+                    remember_transfer_error(
+                        &transfer_errors,
+                        "preserve directory metadata",
+                        src_root,
+                        &err,
+                    );
+                    finish_transfer!(1);
+                }
             }
         }
     }

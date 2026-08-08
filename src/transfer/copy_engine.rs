@@ -3,9 +3,21 @@
 //! The engine handles data movement and metadata preservation only; planning,
 //! collision decisions, progress policy, and cleanup remain in their modules.
 
-use super::*;
+use crate::domain::{ManifestDirTimeEntry, MediaKind};
+use crate::plan::{map_dir_dest_path, normalize_rel};
+use crate::runtime::copy_chunk_bytes_for_file;
+use filetime::{set_file_times, FileTime};
+use jwalk::WalkDir;
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub(super) fn open_source_noatime(path: &Path) -> io::Result<File> {
+pub(crate) fn open_source_noatime(path: &Path) -> io::Result<File> {
     match OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOATIME)
@@ -15,7 +27,14 @@ pub(super) fn open_source_noatime(path: &Path) -> io::Result<File> {
         Err(err)
             if matches!(
                 err.raw_os_error(),
-                Some(nix::libc::EPERM | nix::libc::EACCES)
+                Some(code)
+                    if matches!(
+                        code,
+                        nix::libc::EPERM
+                            | nix::libc::EACCES
+                            | nix::libc::EINVAL
+                            | nix::libc::EOPNOTSUPP
+                    )
             ) =>
         {
             File::open(path)
@@ -24,7 +43,46 @@ pub(super) fn open_source_noatime(path: &Path) -> io::Result<File> {
     }
 }
 
-pub(super) fn apply_file_metadata_fd(file: &File, meta: &fs::Metadata) -> io::Result<()> {
+pub(crate) fn ensure_no_symlink_ancestors(path: &Path) -> io::Result<()> {
+    let mut current = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(".")
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "parent traversal is not allowed for transfer paths",
+                ));
+            }
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::Prefix(_) => continue,
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("symlink ancestor is not allowed: {}", current.display()),
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("path ancestor is not a directory: {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_file_metadata_fd(file: &File, meta: &fs::Metadata) -> io::Result<()> {
     let mode = meta.mode() & 0o7777;
     if unsafe { nix::libc::fchmod(file.as_raw_fd(), mode as nix::libc::mode_t) } != 0 {
         return Err(io::Error::last_os_error());
@@ -45,24 +103,24 @@ pub(super) fn apply_file_metadata_fd(file: &File, meta: &fs::Metadata) -> io::Re
     Ok(())
 }
 
-pub(super) fn try_reflink(src: &File, dst: &File) -> bool {
+pub(crate) fn try_reflink(src: &File, dst: &File) -> bool {
     const FICLONE: nix::libc::c_ulong = 0x4004_9409;
     unsafe { nix::libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) == 0 }
 }
 
-pub(super) fn advise_sequential(file: &File) {
+pub(crate) fn advise_sequential(file: &File) {
     unsafe {
         let _ = nix::libc::posix_fadvise(file.as_raw_fd(), 0, 0, nix::libc::POSIX_FADV_SEQUENTIAL);
     }
 }
 
-pub(super) fn advise_drop_cache(file: &File) {
+pub(crate) fn advise_drop_cache(file: &File) {
     unsafe {
         let _ = nix::libc::posix_fadvise(file.as_raw_fd(), 0, 0, nix::libc::POSIX_FADV_DONTNEED);
     }
 }
 
-pub(super) fn pace_hdd_writeback(file: &File, total: u64, next_pace_at: &mut u64) {
+pub(crate) fn pace_hdd_writeback(file: &File, total: u64, next_pace_at: &mut u64) {
     const STEP: u64 = 32 * 1024 * 1024;
     const WINDOW: u64 = 96 * 1024 * 1024;
     if total < *next_pace_at {
@@ -82,7 +140,7 @@ pub(super) fn pace_hdd_writeback(file: &File, total: u64, next_pace_at: &mut u64
     *next_pace_at = total.saturating_add(STEP);
 }
 
-pub(super) fn copy_sparse_extents<F>(
+pub(crate) fn copy_sparse_extents<F>(
     src: &mut File,
     dst: &mut File,
     size: u64,
@@ -184,7 +242,7 @@ where
     Ok(Some(logical_done.min(size)))
 }
 
-pub(super) fn copy_file_range_all<F>(
+pub(crate) fn copy_file_range_all<F>(
     src: &File,
     dst: &File,
     size: u64,
@@ -243,7 +301,7 @@ where
     Ok(Some(total))
 }
 
-pub(super) fn copy_file_preserve_with_progress_buffer<F>(
+pub(crate) fn copy_file_preserve_with_progress_buffer<F>(
     src: &Path,
     dst: &Path,
     media: MediaKind,
@@ -264,7 +322,7 @@ where
     )
 }
 
-pub(super) fn copy_file_preserve_atomic_with_progress_buf<F>(
+pub(crate) fn copy_file_preserve_atomic_with_progress_buf<F>(
     src: &Path,
     dst: &Path,
     media: MediaKind,
@@ -275,7 +333,9 @@ where
     F: FnMut(u64),
 {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    ensure_no_symlink_ancestors(parent)?;
     fs::create_dir_all(parent)?;
+    ensure_no_symlink_ancestors(parent)?;
     let staged = tempfile::Builder::new()
         .prefix(".copy-rs-partial-")
         .tempfile_in(parent)?
@@ -301,7 +361,7 @@ where
     Ok(copied)
 }
 
-pub(super) fn copy_file_preserve_with_progress_buffer_inner<F>(
+pub(crate) fn copy_file_preserve_with_progress_buffer_inner<F>(
     src: &Path,
     dst: &Path,
     media: MediaKind,
@@ -322,7 +382,9 @@ where
     let meta = fs::symlink_metadata(src)?;
     if !parent_ready {
         if let Some(parent) = dst.parent() {
+            ensure_no_symlink_ancestors(parent)?;
             fs::create_dir_all(parent)?;
+            ensure_no_symlink_ancestors(parent)?;
         }
     }
     let mut in_file = open_source_noatime(src)?;
@@ -403,7 +465,7 @@ where
     Ok(total)
 }
 
-pub(super) fn copy_buffered<F>(
+pub(crate) fn copy_buffered<F>(
     src: &mut File,
     dst: &mut File,
     buf: &mut [u8],
@@ -438,7 +500,7 @@ where
     Ok(total)
 }
 
-pub(super) fn copy_file_preserve_with_progress_buf<F>(
+pub(crate) fn copy_file_preserve_with_progress_buf<F>(
     src: &Path,
     dst: &Path,
     buf_bytes: usize,
@@ -451,7 +513,7 @@ where
     copy_file_preserve_with_progress_buffer(src, dst, MediaKind::Other, &mut buf, on_bytes)
 }
 
-pub(super) fn copy_file_preserve_with_progress<F>(
+pub(crate) fn copy_file_preserve_with_progress<F>(
     src: &Path,
     dst: &Path,
     on_bytes: F,
@@ -462,11 +524,11 @@ where
     copy_file_preserve_with_progress_buf(src, dst, 1024 * 1024, on_bytes)
 }
 
-pub(super) fn copy_file_preserve(src: &Path, dst: &Path) -> io::Result<u64> {
+pub(crate) fn copy_file_preserve(src: &Path, dst: &Path) -> io::Result<u64> {
     copy_file_preserve_with_progress(src, dst, |_| {})
 }
 
-pub(super) fn remove_path_local_if_exists(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_path_local_if_exists(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(md) => {
             if md.file_type().is_dir() {
@@ -481,7 +543,7 @@ pub(super) fn remove_path_local_if_exists(path: &Path) -> io::Result<()> {
 }
 
 #[allow(dead_code)]
-pub(super) fn unlinkat_file_if_exists(path: &Path) -> io::Result<()> {
+pub(crate) fn unlinkat_file_if_exists(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -509,18 +571,14 @@ pub(super) fn unlinkat_file_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-pub(super) fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
-    let target = fs::read_link(src)?;
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    remove_path_local_if_exists(dst)?;
-    symlink(target, dst)
+pub(crate) fn copy_symlink(src: &Path, dst: &Path) -> io::Result<()> {
+    copy_symlink_atomic(src, dst)
 }
 
-pub(super) fn copy_symlink_atomic(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn copy_symlink_atomic(src: &Path, dst: &Path) -> io::Result<()> {
     let target = fs::read_link(src)?;
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    ensure_no_symlink_ancestors(parent)?;
     fs::create_dir_all(parent)?;
     let staged = tempfile::Builder::new()
         .prefix(".copy-rs-partial-")
@@ -540,7 +598,31 @@ pub(super) fn copy_symlink_atomic(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn ensure_directory_target(path: &Path, replace_conflict: bool) -> io::Result<()> {
+pub(crate) fn copy_hardlink_atomic(existing: &Path, dst: &Path) -> io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    ensure_no_symlink_ancestors(parent)?;
+    fs::create_dir_all(parent)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".copy-rs-partial-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    let staged_path: &Path = staged.as_ref();
+    fs::remove_file(staged_path)?;
+    fs::hard_link(existing, staged_path)?;
+    if fs::symlink_metadata(dst)
+        .map(|meta| meta.file_type().is_dir())
+        .unwrap_or(false)
+    {
+        fs::remove_dir_all(dst)?;
+    }
+    staged.persist(dst).map_err(|err| err.error)?;
+    Ok(())
+}
+
+pub(crate) fn ensure_directory_target(path: &Path, replace_conflict: bool) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_no_symlink_ancestors(parent)?;
+    }
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_dir() => Ok(()),
         Ok(_) if replace_conflict => {
@@ -553,26 +635,10 @@ pub(super) fn ensure_directory_target(path: &Path, replace_conflict: bool) -> io
     }
 }
 
-pub(super) fn symlink_targets_equal(src: &Path, dst: &Path) -> bool {
-    let src_md = match fs::symlink_metadata(src) {
-        Ok(m) if m.file_type().is_symlink() => m,
-        _ => return false,
-    };
-    let dst_md = match fs::symlink_metadata(dst) {
-        Ok(m) if m.file_type().is_symlink() => m,
-        _ => return false,
-    };
-    let _ = (src_md, dst_md);
-    match (fs::read_link(src), fs::read_link(dst)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-pub(super) fn copy_path_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn copy_path_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(src)?;
     if meta.file_type().is_symlink() {
-        copy_symlink(src, dst)?;
+        copy_symlink_atomic(src, dst)?;
         return Ok(());
     }
     if meta.is_file() {
@@ -580,6 +646,7 @@ pub(super) fn copy_path_recursive(src: &Path, dst: &Path) -> io::Result<()> {
         return Ok(());
     }
 
+    ensure_no_symlink_ancestors(dst.parent().unwrap_or_else(|| Path::new(".")))?;
     fs::create_dir_all(dst)?;
     fs::set_permissions(dst, fs::Permissions::from_mode(meta.permissions().mode()))?;
     for ent in fs::read_dir(src)? {
@@ -594,41 +661,65 @@ pub(super) fn copy_path_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn preserve_directory_times_tree(
+pub(crate) fn preserve_directory_times_tree(
     src_root: &Path,
     dst_base: &Path,
     include_root: bool,
     src_base: &str,
     dir_times: Option<&[ManifestDirTimeEntry]>,
-) {
+) -> io::Result<()> {
     if let Some(entries) = dir_times {
         // Manifest entries are stored in postorder so child timestamps are set first.
         for entry in entries {
             let dst_dir = map_dir_dest_path(include_root, src_base, &entry.rel, dst_base);
-            let _ = set_file_times(&dst_dir, entry.atime, entry.mtime);
+            set_directory_times_checked(&dst_dir, entry.atime, entry.mtime)?;
         }
-        return;
+        return Ok(());
     }
 
-    let mut dirs: Vec<PathBuf> = WalkDir::new(src_root)
+    let mut dirs: Vec<(PathBuf, FileTime, FileTime)> = Vec::new();
+    for entry in WalkDir::new(src_root)
         .sort(false)
         .skip_hidden(false)
         .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_dir())
-        .map(|e| e.path().to_path_buf())
-        .collect();
-    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    {
+        let entry = entry.map_err(|err| io::Error::other(err.to_string()))?;
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        // Read metadata while the walker still owns the entry. Looking up all
+        // directories after traversal can observe atime after read_dir has
+        // already updated it.
+        let metadata = entry
+            .metadata()
+            .or_else(|_| fs::symlink_metadata(entry.path()))?;
+        dirs.push((
+            entry.path().to_path_buf(),
+            FileTime::from_last_access_time(&metadata),
+            FileTime::from_last_modification_time(&metadata),
+        ));
+    }
+    dirs.sort_by_key(|(path, _, _)| std::cmp::Reverse(path.components().count()));
 
-    for src_dir in dirs {
+    for (src_dir, atime, mtime) in dirs {
         let rel = normalize_rel(src_dir.strip_prefix(src_root).unwrap_or(Path::new("")));
         let dst_dir = map_dir_dest_path(include_root, src_base, &rel, dst_base);
-        let src_meta = match fs::metadata(&src_dir) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let atime = FileTime::from_last_access_time(&src_meta);
-        let mtime = FileTime::from_last_modification_time(&src_meta);
-        let _ = set_file_times(&dst_dir, atime, mtime);
+        set_directory_times_checked(&dst_dir, atime, mtime)?;
     }
+    Ok(())
+}
+
+fn set_directory_times_checked(path: &Path, atime: FileTime, mtime: FileTime) -> io::Result<()> {
+    ensure_no_symlink_ancestors(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!(
+                "directory timestamp target is not a directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    set_file_times(path, atime, mtime)
 }
